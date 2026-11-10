@@ -290,13 +290,13 @@ def update_tw_prices(trading_days: list[str], universe: list[str]) -> dict[str, 
     # Stocks that only just entered the universe have no history on file. Back-fill a
     # few of them per run, month by month (13 requests each), unless this run was
     # already a bulk catch-up.
-    budget = 0 if QUICK or len(need) > 30 else 4
+    budget = 0 if QUICK or len(todo) > 30 else 4
     for code in dict.fromkeys(list(stored) + universe):
         rows = day_rows.get(code)
         new = pd.DataFrame([r[1:] for r in rows], columns=prices.COLS,
                            index=pd.to_datetime([r[0] for r in rows])) if rows else None
         df = prices.merge(stored.get(code), new)
-        if code in universe and len(df) < 200 and budget > 0:
+        if code in universe and len(df) < 60 and budget > 0 and not twse.THROTTLED:
             budget -= 1
             end = dt.date.fromisoformat(trading_days[-1])
             got = twse.fetch_days(months_between(end - dt.timedelta(days=365), end),
@@ -388,24 +388,40 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         meta[sym] = {"name": quotes.get(code, {}).get("name") or load_store(sym)[1].get("name") or code,
                      "market": "TW", "kind": "stock", "code": code, "scored": code in tw_codes,
                      "industry": revenue.get(code, {}).get("industry") or "其他"}
-    fails = 0
-    for tkr, name, industry in us_list:
+    def us_prices(tkr: str) -> pd.DataFrame:
+        raw = []
         try:
-            raw = []
-            try:
-                raw = prices.cboe_intraday_raw(tkr)
-            except Exception:  # noqa: BLE001 - intraday is optional
-                pass
-            df = prices.append_session(prices.cboe_daily(tkr), raw)
-            intraday[tkr] = prices.intraday_5m(raw)
+            raw = prices.cboe_intraday_raw(tkr)
+        except Exception:  # noqa: BLE001 - intraday is optional
+            pass
+        df = prices.append_session(prices.cboe_daily(tkr), raw)
+        intraday[tkr] = prices.intraday_5m(raw)
+        return df
+
+    us_frames: dict[str, pd.DataFrame] = {}
+    later: list[str] = []
+    for tkr, _, _ in us_list:
+        try:
+            us_frames[tkr] = us_prices(tkr)
+        except Exception as e:  # noqa: BLE001 - usually a 429 burst limit: try again at the end
+            log(f"  price {tkr}: {e} (will retry)")
+            later.append(tkr)
+    fails = 0
+    if later:
+        time.sleep(45)
+    for tkr in later:
+        try:
+            us_frames[tkr] = us_prices(tkr)
         except Exception as e:  # noqa: BLE001
             fails += 1
             log(f"  price {tkr}: {e}")
             df, _ = load_store(tkr)
             if len(df):
+                us_frames[tkr] = df
                 stale.append(tkr)
-        if len(df) >= 120:
-            frames[tkr] = df
+    for tkr, name, industry in us_list:
+        if len(us_frames.get(tkr, [])) >= 120:
+            frames[tkr] = us_frames[tkr]
             meta[tkr] = {"name": name, "market": "US", "kind": "stock", "code": tkr, "industry": industry,
                          "scored": True}
     # Never score a stock on stale prices: its last bar must be within a week of the

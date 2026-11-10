@@ -259,10 +259,17 @@ def test_merge_prefers_new_rows_and_append_session():
             "volume": {"stock_volume": 7}},
            {"datetime": "2026-11-10T09:32:00", "price": {"open": 6, "high": 8, "low": 6, "close": 7},
             "volume": {"stock_volume": 3}}]
-    out = prices.append_session(m, raw)
+    import datetime
+    assert not prices.session_complete(raw, now=datetime.datetime(2026, 11, 10, 9, 40))   # still trading
+    assert prices.session_complete(raw, now=datetime.datetime(2026, 11, 11, 8, 0))        # next morning
+    closing = [{**raw[1], "datetime": "2026-11-10T15:59:00"}]
+    assert prices.session_complete(closing, now=datetime.datetime(2026, 11, 10, 16, 5))
+    after = datetime.datetime(2026, 11, 11, 8, 0)
+    assert len(prices.append_session(m, raw, now=datetime.datetime(2026, 11, 10, 9, 40))) == len(m)  # unfinished
+    out = prices.append_session(m, raw, now=after)
     assert out.index[-1] == pd.Timestamp("2026-11-10")
     assert list(out.iloc[-1]) == [5, 8, 5, 7, 10]
-    assert len(prices.append_session(out, raw)) == len(out)  # already present -> unchanged
+    assert len(prices.append_session(out, raw, now=after)) == len(out)  # already present -> unchanged
     assert prices.intraday_5m(raw)[0][1:] == [5, 8, 5, 7, 10]
 
 
@@ -293,3 +300,30 @@ def test_monthly_bars_are_not_accepted_as_daily_history():
     monthly = daily.resample("MS").first().dropna()
     assert prices.is_daily(daily) and not prices.is_daily(monthly)
     assert not prices.is_daily(pd.concat([monthly.iloc[:40], daily.iloc[-40:]]).sort_index())
+
+
+def test_fetch_days_backs_off_and_stops_when_throttled(monkeypatch):
+    monkeypatch.setattr(twse.time, "sleep", lambda s: None)
+    monkeypatch.setattr(twse, "THROTTLED", False)
+    calls = []
+
+    def flaky(d):
+        calls.append(d)
+        if d == "d2":
+            raise twse.NoData("holiday")
+        if d == "d3" and calls.count("d3") == 1:
+            raise RuntimeError("HTTP 307")
+        return d.upper()
+
+    assert twse.fetch_days(["d1", "d2", "d3"], flaky, log=lambda m: None) == {"d1": "D1", "d3": "D3"}
+    assert calls == ["d1", "d2", "d3", "d3"] and twse.THROTTLED is False
+
+    def blocked(d):
+        calls.append(d)
+        raise RuntimeError("HTTP 307")
+
+    calls.clear()
+    assert twse.fetch_days([f"x{i}" for i in range(10)], blocked, log=lambda m: None) == {}
+    assert len(calls) == 6 and twse.THROTTLED is True      # 3 refusals per pass, then give up
+    calls.clear()
+    assert twse.fetch_days(["y1"], blocked, log=lambda m: None) == {} and calls == []  # no more requests

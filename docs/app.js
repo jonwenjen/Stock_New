@@ -219,10 +219,11 @@
       const t = typeof r[0] === "number" ? new Date(r[0] * 1000).toISOString().slice(0, 16).replace("T", " ") : r[0];
       const prev = rowsByTime.get("prev:" + r[0]);
       const chg = prev ? r[4] / prev - 1 : null;
-      readout.replaceChildren(h("span", {}, t),
+      // replaceChildren() would print a null argument as the text "null", hence the filter.
+      readout.replaceChildren(...[h("span", {}, t),
         ...[["開", r[1]], ["高", r[2]], ["低", r[3]], ["收", r[4]]].map(([k, v]) => h("span", {}, k + " ", h("b", {}, px(v)))),
         chg != null ? h("span", {}, "漲跌 ", h("b", { class: cls(chg) }, pct(chg, 2))) : null,
-        r[5] ? h("span", {}, "量 ", h("b", {}, nf(0).format(r[5]))) : null);
+        r[5] ? h("span", {}, "量 ", h("b", {}, nf(0).format(r[5]))) : null].filter(Boolean));
     };
     function draw() {
       const { rows, unit, intraday, fallback } = selectBars(state.data, state.range);
@@ -282,8 +283,9 @@
     const byDate = new Map(rows.map((r) => [r.date, r]));
     const show = (r) => {
       if (!r) return;
-      readout.replaceChildren(h("span", {}, r.date), h("span", {}, label + " ", h("b", { class: isLine ? "" : cls(r[series]) },
-        (isLine ? num(r[series], 0) : signed(r[series], 1)) + " " + unit)), ok(r.twii) ? h("span", {}, "加權 ", h("b", {}, num(r.twii, 0))) : null);
+      readout.replaceChildren(...[h("span", {}, r.date), h("span", {}, label + " ", h("b", { class: isLine ? "" : cls(r[series]) },
+        (isLine ? num(r[series], 0) : signed(r[series], 1)) + " " + unit)),
+        ok(r.twii) ? h("span", {}, "加權 ", h("b", {}, num(r.twii, 0))) : null].filter(Boolean));
     };
     const applyTheme = () => { c1.applyOptions(themeOpts()); c2.applyOptions(themeOpts()); draw(); };
     function draw() {

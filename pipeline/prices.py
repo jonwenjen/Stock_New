@@ -10,8 +10,10 @@ run after the first refusal instead of retrying.
 """
 from __future__ import annotations
 
+import datetime as dt
 import io
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -59,9 +61,21 @@ def cboe_daily(ticker: str, scale: float = 1.0) -> pd.DataFrame:
     return _finish(df)
 
 
-def append_session(df: pd.DataFrame, raw: list[dict], scale: float = 1.0) -> pd.DataFrame:
+def session_complete(raw: list[dict], now: dt.datetime | None = None) -> bool:
+    """False while the session in the intraday file is still trading (New York time).
+
+    A half-finished day must not be stored as a daily bar; early closes are covered
+    because any session dated before today counts as complete.
+    """
+    last = dt.datetime.fromisoformat(raw[-1]["datetime"])
+    now = now or dt.datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
+    return last.date() < now.date() or last.time() >= dt.time(15, 55)
+
+
+def append_session(df: pd.DataFrame, raw: list[dict], scale: float = 1.0,
+                   now: dt.datetime | None = None) -> pd.DataFrame:
     """Add the session covered by intraday bars when the daily file has not caught up yet."""
-    if not raw:
+    if not raw or not session_complete(raw, now):
         return df
     day = pd.Timestamp(raw[0]["datetime"][:10])
     if len(df) and day <= df.index[-1]:

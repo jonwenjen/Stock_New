@@ -35,6 +35,9 @@ def roc_to_iso(s: str) -> str | None:
     return f"{int(digits[:3]) + 1911}-{digits[3:5]}-{digits[5:7]}"
 
 
+THROTTLED = False  # set once TWSE keeps refusing; later fetch_days() calls then skip the network
+
+
 class NoData(Exception):
     """TWSE answered, but has nothing for that date (holiday / not published yet)."""
 
@@ -56,7 +59,11 @@ def fetch_days(dates: list[str], fn, label: str = "", log=print, cooldown: float
     Three refusals in a row end the pass: whatever is still missing is simply
     picked up by the next run, because every caller persists what it got.
     """
+    global THROTTLED
     out, retry = {}, []
+    if THROTTLED and dates:
+        log(f"  {label}: TWSE is throttling this run, leaving {len(dates)} requests for later")
+        return out
     for pass_no, todo in enumerate((list(dates), retry)):
         if pass_no and todo:
             log(f"  {label}: retrying {len(todo)} throttled requests after a pause")
@@ -80,6 +87,8 @@ def fetch_days(dates: list[str], fn, label: str = "", log=print, cooldown: float
                     log(f"  {label}: still throttled, leaving {len(left)} requests for later")
                     if pass_no == 0:
                         retry.extend(left)
+                    else:
+                        THROTTLED = True  # second refusal streak: stop asking for the rest of the run
                     break
                 time.sleep(cooldown)
             if i and i % 40 == 0:

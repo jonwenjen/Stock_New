@@ -204,9 +204,33 @@ def test_feed_parsing_and_mentions():
     assert "<p>" not in eps[0]["summary"] and "https://" not in eps[0]["summary"]
     m = media.build_matchers({"2330.TW": ["台積電"], "NVDA": ["NVDA", "輝達"], "AMD": ["AMD"],
                               "MU": ["MU"], "MA": ["MA"], "ARM": ["ARM"]})
-    found = media.find_mentions(eps[0]["_text"], m)
+    found = media.find_mentions(media.episode_texts(eps)[0], m)
     assert set(found) == {"2330.TW", "NVDA", "AMD", "MU"}
     assert media.find_mentions("the MUSEUM and ARMY are MAD", m) == []  # word boundaries
+
+
+def test_repeated_sponsor_blocks_are_not_mentions():
+    def ep(title, notes):
+        return {"title": title, "_chunks": media.chunks(notes)}
+    footer = "<p>贊助：AI 財報摘要： Microsoft： Google： Amazon：</p><p>追蹤我們的 IG</p>"
+    eps = [ep("EP1 聊 Google 財報", "<p>本集談搜尋廣告。</p>" + footer),
+           ep("EP2 航運展望", "<p>長榮與貨櫃運價。</p>" + footer),
+           ep("EP3 雲端資本支出", "<p>Amazon 的 AWS 成長加速。</p>" + footer)]
+    m = media.build_matchers({"GOOGL": ["Google"], "AMZN": ["Amazon"], "MSFT": ["Microsoft"], "2603": ["長榮"]})
+    got = [set(media.find_mentions(t, m)) for t in media.episode_texts(eps)]
+    assert got == [{"GOOGL"}, {"2603"}, {"AMZN"}]
+
+
+def test_ttm_derives_q4_for_consecutive_fiscal_years():
+    units = []
+    for year, vals, fy in ((2024, (1.0, 1.1, 1.2), 4.6), (2025, (1.5, 1.6, 1.7), 6.6)):
+        for (s, e), v in zip((("01-01", "03-31"), ("04-01", "06-30"), ("07-01", "09-30")), vals):
+            units.append(q(f"{year}-{s}", f"{year}-{e}", v))
+        units.append(q(f"{year}-01-01", f"{year}-12-31", fy))
+    r = us_data.ttm_and_yoy(units)
+    assert r["period"] == "2025-12-31" and r["latest"] == pytest.approx(1.8)   # 6.6 - 4.8
+    assert r["ttm"] == pytest.approx(6.6)
+    assert r["yoy"] == pytest.approx((1.8 - 1.3) / 1.3 * 100)                   # vs derived 2024 Q4
 
 
 # ---------------- price store ----------------
@@ -240,3 +264,32 @@ def test_merge_prefers_new_rows_and_append_session():
     assert list(out.iloc[-1]) == [5, 8, 5, 7, 10]
     assert len(prices.append_session(out, raw)) == len(out)  # already present -> unchanged
     assert prices.intraday_5m(raw)[0][1:] == [5, 8, 5, 7, 10]
+
+
+def test_yahoo_only_fills_older_history():
+    from pipeline import build, prices
+    official = prices.rows_to_frame([["2026-11-09", 10, 11, 9, 10, 5], ["2026-11-10", 10, 12, 10, 12, 6]])
+    yahoo = prices.rows_to_frame([["2026-11-01", 1, 1, 1, 1, 1],   # a Sunday: bogus row
+                                  ["2026-11-06", 8, 9, 8, 9, 4], ["2026-11-09", 99, 99, 99, 99, 9],
+                                  ["2026-11-11", 50, 50, 50, 50, 1]])
+    out = build.with_older_history(official, yahoo)
+    assert list(out.index.strftime("%m-%d")) == ["11-01", "11-06", "11-09", "11-10"]
+    assert out.loc["2026-11-09", "close"] == 10           # official bar wins, later Yahoo rows ignored
+    seeded = build.with_older_history(None, yahoo)
+    assert "2026-11-01" not in seeded.index.strftime("%Y-%m-%d")  # weekend row dropped when seeding
+
+
+def test_13f_values_reported_in_thousands_are_rescaled():
+    rows = "".join(ROW.format(n=f"CO{i}", c=f"{i:09d}", v=50 * (i + 1), s=1000 * (i + 1)) for i in range(5))
+    table = us_data.parse_13f(f"<informationTable>{rows}</informationTable>")   # $0.05 a share -> thousands
+    assert table["000000000"]["value"] == 50_000
+    rows = "".join(ROW.format(n=f"CO{i}", c=f"{i:09d}", v=50_000 * (i + 1), s=1000 * (i + 1)) for i in range(5))
+    assert us_data.parse_13f(f"<informationTable>{rows}</informationTable>")["000000000"]["value"] == 50_000
+
+
+def test_monthly_bars_are_not_accepted_as_daily_history():
+    from pipeline import prices
+    daily = make_df(trend(300))
+    monthly = daily.resample("MS").first().dropna()
+    assert prices.is_daily(daily) and not prices.is_daily(monthly)
+    assert not prices.is_daily(pd.concat([monthly.iloc[:40], daily.iloc[-40:]]).sort_index())

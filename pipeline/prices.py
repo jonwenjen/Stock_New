@@ -17,7 +17,7 @@ import pandas as pd
 
 from . import http
 
-http.HOST_INTERVAL.setdefault("cdn.cboe.com", 0.4)
+http.HOST_INTERVAL.setdefault("cdn.cboe.com", 1.2)  # it answers 429 when polled faster
 http.HOST_INTERVAL.setdefault("fred.stlouisfed.org", 0.5)
 
 CBOE = "https://cdn.cboe.com/api/global/delayed_quotes/charts"
@@ -130,13 +130,15 @@ class Yahoo:
 
     @classmethod
     def daily(cls, symbol: str) -> pd.DataFrame | None:
-        res = cls._chart(symbol, "max", "1d")
+        # range=max silently degrades to monthly bars, so ask for ten years and verify.
+        res = cls._chart(symbol, "10y", "1d")
         if not res:
             return None
         df = cls._frame(res)
         off = int(res["meta"].get("gmtoffset") or 0)
         df.index = pd.to_datetime(df["ts"] + off, unit="s").dt.normalize()
-        return _finish(df)
+        df = _finish(df)
+        return df if is_daily(df) else None
 
     @classmethod
     def intraday(cls, symbol: str) -> list[list]:
@@ -147,6 +149,14 @@ class Yahoo:
         off = int(res["meta"].get("gmtoffset") or 0)
         return [[int(t + off), _r(o), _r(h), _r(l), _r(c), int(v or 0)]
                 for t, o, h, l, c, v in df[["ts"] + COLS].itertuples(index=False)]
+
+
+def is_daily(df: pd.DataFrame) -> bool:
+    """True when the rows really are daily bars (typical gap of a few days at most)."""
+    if len(df) < 30:
+        return False
+    gaps = df.index.to_series().diff().dt.days.dropna()
+    return float(gaps.median()) <= 4 and float((gaps > 10).mean()) < 0.02
 
 
 # ----------------------------- on-disk store / chart payload ----------------------------- #

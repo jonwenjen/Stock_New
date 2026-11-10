@@ -70,6 +70,12 @@ def parse_13f(xml_text: str) -> dict[str, dict]:
         a = out.setdefault(cusip, {"name": rec.get("nameOfIssuer", ""), "value": 0.0, "shares": 0.0})
         a["value"] += float(rec.get("value") or 0)
         a["shares"] += float(rec.get("sshPrnamt") or 0)
+    # 13F values have been in dollars since 2023, but some filers still report thousands.
+    # A median "price" under $2 a share gives that away.
+    px = sorted(v["value"] / v["shares"] for v in out.values() if v["shares"] > 0)
+    if px and px[len(px) // 2] < 2:
+        for v in out.values():
+            v["value"] *= 1000
     return out
 
 
@@ -164,9 +170,10 @@ def ttm_and_yoy(units: list[dict]) -> dict:
     for end, (start, val) in a.items():  # derive missing Q4
         if end in q:
             continue
-        inside = [v for e, (s, v) in q.items() if start <= s and e < end]
+        # Derived quarters carry start=None so they are never counted inside a later year.
+        inside = [v for e, (s, v) in q.items() if s and start <= s and e < end]
         if len(inside) == 3:
-            q[end] = ("derived", val - sum(inside))
+            q[end] = (None, val - sum(inside))
     ends = sorted(q)
     if not ends:
         return {}

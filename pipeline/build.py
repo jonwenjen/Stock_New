@@ -190,7 +190,7 @@ def fetch_index(ix: dict, intraday: dict) -> pd.DataFrame:
     if len(old) < 250 or not payload.get("deep"):
         y = prices.Yahoo.daily("^TWII")  # optional: deep history in one request
         if y is not None:
-            old = prices.merge(y, old)
+            old = with_older_history(old, y)
             DEEP[sym] = True
     # Ask only for months the store does not already hold in full (always the current one).
     back = 7 if QUICK else CFG["taiex_months"]
@@ -206,6 +206,17 @@ def fetch_index(ix: dict, intraday: dict) -> pd.DataFrame:
     if df.empty:
         raise RuntimeError("no TAIEX data")
     return df
+
+
+def with_older_history(official: pd.DataFrame | None, yahoo: pd.DataFrame) -> pd.DataFrame:
+    """Use Yahoo only for what the official store lacks.
+
+    With official bars on file, Yahoo contributes strictly older dates. Without any,
+    it seeds the store (weekend-stamped rows are dropped; official bars later override).
+    """
+    if official is not None and len(official):
+        return prices.merge(yahoo[yahoo.index < official.index[0]], official)
+    return yahoo[yahoo.index.dayofweek < 5]
 
 
 DAY_CACHE = ROOT / ".cache" / "twse_days"  # local only (git-ignored); speeds up re-runs
@@ -243,7 +254,7 @@ def update_tw_prices(trading_days: list[str], universe: list[str]) -> dict[str, 
             continue
         y = prices.Yahoo.daily(f"{code}.TW")
         if y is not None and len(y):
-            stored[code] = prices.merge(y, stored.get(code))
+            stored[code] = with_older_history(stored.get(code), y)
             DEEP[f"{code}.TW"] = True
 
     window = trading_days[-(125 if QUICK else CFG["tw_price_days"]):]
@@ -252,12 +263,27 @@ def update_tw_prices(trading_days: list[str], universe: list[str]) -> dict[str, 
         for d in f.index[-len(window):].strftime("%Y-%m-%d"):
             if d in have:
                 have[d] += 1
-    need = [d for d in window if not stored or have[d] < 0.8 * len(stored)]
+    # A day is "covered" only when the stocks we are about to score have it too - otherwise a
+    # handful of well-stocked names would hide the fact that the rest of the universe lacks it.
+    uni = [c for c in universe if c in stored]
+    uni_have = {d: 0 for d in window}
+    for c in uni:
+        for d in stored[c].index[-len(window):].strftime("%Y-%m-%d"):
+            if d in uni_have:
+                uni_have[d] += 1
+    recent = set(window[-10:])
+    need = [d for d in window if not stored or have[d] < 0.8 * len(stored)
+            or (d in recent and uni_have[d] < len(universe))]
     max_days = 20 if QUICK else int(os.environ.get("TW_MAX_DAYS", 120))
     log(f"tw prices: {len(stored)} stocks on file, {len(need)} days missing (fetching up to {max_days})")
-    need = need[-max_days:]
+    need = need[-max_days:] if max_days > 0 else []
+    # Days already in the local cache cost nothing; the rest are requested newest first so
+    # that a throttled run still ends with the most recent (most valuable) days on file.
+    tables = {d: read_json(DAY_CACHE / f"{d}.json", {}) for d in need if (DAY_CACHE / f"{d}.json").exists()}
+    todo = [d for d in reversed(need) if d not in tables]
+    tables.update(twse.fetch_days(todo, cached_day, "quotes", log))
     day_rows: dict[str, list] = {}
-    for d, table in sorted(twse.fetch_days(need, cached_day, "quotes", log).items()):
+    for d, table in sorted(tables.items()):
         for code, bar in table.items():
             day_rows.setdefault(code, []).append((d, *bar))
     out: dict[str, pd.DataFrame] = {}
@@ -382,7 +408,16 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
             frames[tkr] = df
             meta[tkr] = {"name": name, "market": "US", "kind": "stock", "code": tkr, "industry": industry,
                          "scored": True}
-    stocks = [s for s, m in meta.items() if m["kind"] == "stock" and m["scored"] and len(frames[s]) >= 120]
+    # Never score a stock on stale prices: its last bar must be within a week of the
+    # newest bar in its own market (a history gap would otherwise look like a signal).
+    newest = {mk: max((frames[s].index[-1] for s, m in meta.items() if m["kind"] == "stock" and m["market"] == mk),
+                      default=None) for mk in ("TW", "US")}
+    fresh = lambda s: frames[s].index[-1] >= newest[meta[s]["market"]] - pd.Timedelta(days=7)  # noqa: E731
+    stocks = [s for s, m in meta.items()
+              if m["kind"] == "stock" and m["scored"] and len(frames[s]) >= 120 and fresh(s)]
+    behind = [s for s, m in meta.items() if m["kind"] == "stock" and m["scored"] and not fresh(s)]
+    if behind:
+        SOURCES.append({"name": "股價過期未評分", "ok": False, "url": "", "note": "、".join(behind)[:160]})
     SOURCES.append({"name": "Cboe 美股每日行情", "ok": fails < len(us_list), "url": "https://www.cboe.com",
                     "note": f"{len(us_list) - fails} 檔成功，{fails} 檔失敗"})
     if stale:

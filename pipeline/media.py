@@ -20,6 +20,15 @@ def clean(text: str, limit: int = 160) -> str:
     return text[:limit] + ("…" if len(text) > limit else "")
 
 
+SPLIT = re.compile(r"[\n\r。！!？?｜|：:；;]+|\s{2,}")
+
+
+def chunks(raw: str) -> list[str]:
+    """Show notes cut into sentence-sized pieces (HTML removed) for boilerplate detection."""
+    text = html.unescape(TAG.sub("\n", raw or ""))
+    return [c for c in (clean(part, 400) for part in SPLIT.split(text)) if len(c) >= 2]
+
+
 def parse_feed(xml_text: str, since: dt.datetime, max_items: int = 6) -> list[dict]:
     root = ET.fromstring(xml_text.encode("utf-8"))
     items = []
@@ -35,10 +44,24 @@ def parse_feed(xml_text: str, since: dt.datetime, max_items: int = 6) -> list[di
         raw = it.findtext("description") or ""
         items.append({"title": clean(it.findtext("title") or "", 140), "date": when.date().isoformat(),
                       "link": (it.findtext("link") or "").strip(), "summary": clean(raw),
-                      "_text": clean((it.findtext("title") or "") + " " + raw, 6000)})
+                      "_chunks": chunks(raw)})
         if len(items) >= max_items:
             break
     return items
+
+
+def episode_texts(episodes: list[dict]) -> list[str]:
+    """Title + the parts of each episode's notes that are unique to that episode.
+
+    Sponsor blocks and "follow us on ..." footers repeat in every episode of a show
+    and would otherwise count as a mention each time, so any piece that appears in
+    two or more of the show's recent episodes is dropped.
+    """
+    seen: dict[str, int] = {}
+    for ep in episodes:
+        for c in set(ep["_chunks"]):
+            seen[c] = seen.get(c, 0) + 1
+    return [ep["title"] + " 。 " + " 。 ".join(c for c in ep["_chunks"] if seen[c] == 1) for ep in episodes]
 
 
 def build_matchers(names: dict[str, list[str]]) -> dict[str, re.Pattern]:
@@ -72,8 +95,9 @@ def podcasts(feeds: list[dict], matchers: dict[str, re.Pattern], days: int = 14,
         except Exception as e:
             errors.append(f"{f['name']}: {e}")
             continue
-        for ep in eps:
-            ep["mentions"] = find_mentions(ep.pop("_text"), matchers)
+        for ep, text in zip(eps, episode_texts(eps)):
+            ep.pop("_chunks")
+            ep["mentions"] = find_mentions(text, matchers)
             for s in ep["mentions"]:
                 counts[s] = counts.get(s, 0) + 1
         shows.append({"name": f["name"], "lang": f["lang"], "episodes": eps})

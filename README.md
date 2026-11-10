@@ -33,7 +33,8 @@ GitHub Pages 即可，不需要伺服器，也不使用付費 API。
    寫入 `docs/data/ai.json`，並以 `python -m pipeline.check_ai` 檢查資料日期與結構
 3. 直接提交並推送到 `main`
 
-排程可在 Claude Code（claude.ai/code）的排程工作清單中查看、暫停或手動觸發。
+排程每週三台北時間 21:37 喚醒一個已掛載本 repo 的專用工作階段「週三選股雷達 每週更新」。
+可在 Claude Code（claude.ai/code）查看每次執行的過程與回報，並在排程工作清單中暫停或手動觸發。
 要改更新內容或撰寫規則，編輯 `WEEKLY_UPDATE.md` 即可，下次執行就會生效。
 
 ## 啟用 GitHub Pages

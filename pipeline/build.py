@@ -28,6 +28,8 @@ CUSIP_CACHE = ROOT / "config" / "cusip_cache.json"
 QUICK = os.environ.get("QUICK") == "1"
 TPE = dt.timezone(dt.timedelta(hours=8))
 
+AMBIGUOUS_TICKERS = {"NOW", "ARM", "DIS", "CAT", "COST", "GEV", "CEG"}
+
 SOURCES: list[dict] = []
 
 
@@ -108,12 +110,13 @@ def update_flow_history(trading_days: list[str], twii: pd.DataFrame) -> list[dic
     todo_inst = [d for d in window if "foreign" not in hist.get(d, {})]
     todo_margin = [d for d in window if "margin_bal" not in hist.get(d, {})]
     log(f"flow history: {len(todo_inst)} inst days, {len(todo_margin)} margin days to fetch")
-    got_i = twse.fetch_days(todo_inst, twse.inst_market, "inst", log)
-    got_m = twse.fetch_days(todo_margin, twse.margin_market, "margin", log)
-    for got in (got_i, got_m):
-        for d, row in got.items():
+    ok = 0
+    for todo, fn, label in ((todo_inst, twse.inst_market, "inst"), (todo_margin, twse.margin_market, "margin")):
+        for d, row in twse.fetch_days(todo, fn, label, log).items():
             hist.setdefault(d, {"date": d}).update(row)
-    ok, fail = len(got_i) + len(got_m), len(todo_inst) + len(todo_margin) - len(got_i) - len(got_m)
+            ok += 1
+        write_json(path, [hist[d] for d in sorted(hist)])  # checkpoint after each phase
+    fail = len(todo_inst) + len(todo_margin) - ok
     closes = {d.strftime("%Y-%m-%d"): float(c) for d, c in twii["close"].items()}
     for d, r in hist.items():
         if d in closes:
@@ -189,9 +192,13 @@ def fetch_index(ix: dict, intraday: dict) -> pd.DataFrame:
         if y is not None:
             old = prices.merge(y, old)
             DEEP[sym] = True
-    back = 7 if QUICK else 14
-    start = old.index[-1].date() if len(old) else (today.replace(day=1) - dt.timedelta(days=30 * back))
-    got = twse.fetch_days(months_between(start, today), twse.taiex_month, "TAIEX", log)
+    # Ask only for months the store does not already hold in full (always the current one).
+    back = 7 if QUICK else CFG["taiex_months"]
+    have = old.index.strftime("%Y-%m").value_counts() if len(old) else {}
+    this_month = today.strftime("%Y-%m")
+    months = [m for m in months_between(today.replace(day=1) - dt.timedelta(days=30 * back), today)
+              if m == this_month or have.get(m, 0) < 15]
+    got = twse.fetch_days(months, twse.taiex_month, "TAIEX", log)
     rows = [r for m in sorted(got) for r in got[m]]
     new = pd.DataFrame([{"open": o, "high": h, "low": l, "close": c, "volume": 0.0} for _, o, h, l, c in rows],
                        index=pd.to_datetime([r[0] for r in rows])) if rows else None
@@ -254,11 +261,24 @@ def update_tw_prices(trading_days: list[str], universe: list[str]) -> dict[str, 
         for code, bar in table.items():
             day_rows.setdefault(code, []).append((d, *bar))
     out: dict[str, pd.DataFrame] = {}
+    # Stocks that only just entered the universe have no history on file. Back-fill a
+    # few of them per run, month by month (13 requests each), unless this run was
+    # already a bulk catch-up.
+    budget = 0 if QUICK or len(need) > 30 else 4
     for code in dict.fromkeys(list(stored) + universe):
         rows = day_rows.get(code)
         new = pd.DataFrame([r[1:] for r in rows], columns=prices.COLS,
                            index=pd.to_datetime([r[0] for r in rows])) if rows else None
         df = prices.merge(stored.get(code), new)
+        if code in universe and len(df) < 200 and budget > 0:
+            budget -= 1
+            end = dt.date.fromisoformat(trading_days[-1])
+            got = twse.fetch_days(months_between(end - dt.timedelta(days=365), end),
+                                  lambda m, c=code: twse.stock_month(c, m), f"backfill {code}", log)
+            bars = [r for m in sorted(got) for r in got[m]]
+            if bars:
+                df = prices.merge(pd.DataFrame([b[1:] for b in bars], columns=prices.COLS,
+                                               index=pd.to_datetime([b[0] for b in bars])), df)
         if len(df):
             out[code] = df
     if not out:
@@ -418,7 +438,12 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     names: dict[str, list[str]] = {}
     for s in stocks:
         m = meta[s]
-        base = [m["name"]] if m["market"] == "TW" else [m["code"]] if len(m["code"]) >= 3 else []
+        # Two-character Chinese names and word-like tickers (NOW, ARM, COST...) collide with
+        # ordinary text, so those are matched only through the explicit aliases in the config.
+        if m["market"] == "TW":
+            base = [m["name"]] if len(m["name"]) >= 3 else []
+        else:
+            base = [m["code"]] if len(m["code"]) >= 3 and m["code"] not in AMBIGUOUS_TICKERS else []
         names[s] = list(dict.fromkeys(base + CFG["aliases"].get(m["code"], [])))
     matchers = media.build_matchers(names)
     feeds = CFG["podcasts"][:3] if QUICK else CFG["podcasts"]

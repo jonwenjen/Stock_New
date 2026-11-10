@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import time
 from collections import defaultdict
 
 from . import http
@@ -40,29 +41,48 @@ class NoData(Exception):
 
 def _rwd(path: str, **params) -> dict:
     params["response"] = "json"
-    # One quick retry only: when TWSE throttles, the refusal sticks to that URL for a
-    # while, so callers re-queue the date for a later pass instead of hammering it.
-    j = http.get_json(f"{RWD}/{path}", params=params, retries=1, backoff=5)
+    # No in-place retry: when TWSE throttles, the refusal sticks for a while, so
+    # fetch_days() cools down and re-queues the date instead of hammering it.
+    j = http.get_json(f"{RWD}/{path}", params=params, retries=0)
     if j.get("stat") != "OK":
         raise NoData(f"{path} {params.get('date') or params.get('dayDate')}: {j.get('stat')}")
     return j
 
 
-def fetch_days(dates: list[str], fn, label: str = "", log=print) -> dict:
-    """Call fn(date) for each date; throttled dates get one more pass at the end."""
+def fetch_days(dates: list[str], fn, label: str = "", log=print, cooldown: float = 75.0) -> dict:
+    """Call fn(date) for each date, backing off whenever TWSE throttles.
+
+    A refusal triggers a cool-down and re-queues the date for one later pass.
+    Three refusals in a row end the pass: whatever is still missing is simply
+    picked up by the next run, because every caller persists what it got.
+    """
     out, retry = {}, []
-    for pass_no, todo in enumerate((dates, retry)):
-        for i, d in enumerate(list(todo)):
+    for pass_no, todo in enumerate((list(dates), retry)):
+        if pass_no and todo:
+            log(f"  {label}: retrying {len(todo)} throttled requests after a pause")
+            time.sleep(cooldown)
+        streak_fail = 0
+        for i, d in enumerate(todo):
             try:
                 out[d] = fn(d)
+                streak_fail = 0
             except NoData as e:
+                streak_fail = 0
                 log(f"  {label} {e}")
             except Exception as e:  # noqa: BLE001 - throttled or network error
+                streak_fail += 1
                 if pass_no == 0:
                     retry.append(d)
                 else:
                     log(f"  {label} {d}: {e}")
-            if i and i % 50 == 0:
+                if streak_fail >= 3:
+                    left = todo[i + 1:]
+                    log(f"  {label}: still throttled, leaving {len(left)} requests for later")
+                    if pass_no == 0:
+                        retry.extend(left)
+                    break
+                time.sleep(cooldown)
+            if i and i % 40 == 0:
                 log(f"  {label} {i}/{len(todo)}")
     return out
 
@@ -219,6 +239,17 @@ def taiex_month(month: str) -> list[tuple]:
     """TAIEX daily OHLC for a month ('YYYY-MM') -> [(iso_date, o, h, l, c), ...]."""
     j = _rwd("TAIEX/MI_5MINS_HIST", date=month.replace("-", "") + "01")
     return [(roc_to_iso(r[0]), *(num(x) for x in r[1:5])) for r in j["data"]]
+
+
+def stock_month(code: str, month: str) -> list[tuple]:
+    """One stock, one month ('YYYY-MM') of daily bars -> [(iso_date, o, h, l, c, shares), ...]."""
+    j = _rwd("afterTrading/STOCK_DAY", date=month.replace("-", "") + "01", stockNo=code)
+    out = []
+    for r in j["data"]:
+        o, h, l, c = (num(x) for x in r[3:7])
+        if c:
+            out.append((roc_to_iso(r[0]), o or c, h or c, l or c, c, num(r[1]) or 0))
+    return out
 
 
 def streak(values: list[float]) -> int:

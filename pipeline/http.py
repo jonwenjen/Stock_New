@@ -16,7 +16,7 @@ SEC_UA = os.environ.get("SEC_USER_AGENT") or "StockNew-research-bot contact@exam
 
 # Minimum seconds between two requests to the same host.
 HOST_INTERVAL = {
-    "www.twse.com.tw": 5.0,  # TWSE blocks clients that go much faster
+    "www.twse.com.tw": 6.0,  # TWSE blocks clients that go much faster
     "openapi.twse.com.tw": 1.0,
     "www.tpex.org.tw": 1.0,
     "query1.finance.yahoo.com": 1.5,

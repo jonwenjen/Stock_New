@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import ai_summary, media, prices, scoring, twse, us_data
+from . import http, indicators, media, prices, scoring, twse, us_data
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "docs" / "data"
@@ -26,6 +26,8 @@ CHARTS = DATA / "charts"
 CFG = json.loads((ROOT / "config" / "settings.json").read_text(encoding="utf-8"))
 CUSIP_CACHE = ROOT / "config" / "cusip_cache.json"
 QUICK = os.environ.get("QUICK") == "1"
+# SEC asks automated clients to say who they are ("name contact"); the owner's contact is in the config.
+http.SEC_UA = os.environ.get("SEC_USER_AGENT") or CFG.get("sec_contact") or http.SEC_UA
 TPE = dt.timezone(dt.timedelta(hours=8))
 
 AMBIGUOUS_TICKERS = {"NOW", "ARM", "DIS", "CAT", "COST", "GEV", "CEG"}
@@ -141,7 +143,7 @@ def stock_flows(trading_days: list[str]) -> tuple[list[str], dict[str, list[tupl
     need = [d for d in trading_days[-n:] if d not in store]
     for d, table in twse.fetch_days(need, twse.inst_stocks, "T86", log).items():
         store[d] = {c: [round(v[0] / 1000), round(v[1] / 1000)] for c, v in table.items()
-                    if twse.COMMON_STOCK.match(c) and (v[0] or v[1])}
+                    if twse.tracked(c) and (v[0] or v[1])}
     store = {d: store[d] for d in sorted(store)[-(n + 10):]}
     if not store:
         raise RuntimeError("no per-stock institutional data")
@@ -353,13 +355,34 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
 
     # ---- 2. Taiwan snapshots ------------------------------------------------
     tw_api = "https://openapi.twse.com.tw"
-    quotes = safe("證交所 每日收盤行情", twse.quotes, {}, tw_api)
-    valuation = safe("證交所 本益比/殖利率/淨值比", twse.valuation, {}, tw_api)
-    revenue = safe("證交所 月營收", twse.monthly_revenue, {}, tw_api)
-    eps = safe("證交所 每股盈餘", twse.quarterly_eps, {}, tw_api)
-    margin_now = safe("證交所 個股融資融券", twse.margin_latest, {}, tw_api)
+    # These endpoints occasionally answer 200 with an empty body, hence retry(); if one is
+    # still down, last week's per-stock values (kept in universe.json) stand in for it.
+    prev_tw = {r["code"]: r for r in read_json(DATA / "universe.json", []) if r.get("market") == "TW"}
+    carry = lambda keys: {c: {k: r.get(k) for k in keys} for c, r in prev_tw.items()}  # noqa: E731
+    quotes = safe("證交所 每日收盤行情", lambda: retry(twse.quotes), {}, tw_api)
+    valuation = safe("證交所 本益比/殖利率/淨值比", lambda: retry(twse.valuation), None, tw_api)
+    revenue = safe("證交所 月營收", lambda: retry(twse.monthly_revenue), None, tw_api)
+    eps = safe("證交所 每股盈餘", lambda: retry(twse.quarterly_eps), None, tw_api)
+    margin_now = safe("證交所 個股融資融券", lambda: retry(twse.margin_latest), {}, tw_api)
+    if valuation is None:
+        valuation = carry(("pe", "pb", "yield"))
+    if revenue is None:
+        revenue = carry(("industry", "month", "rev_mom", "rev_yoy", "rev_cum_yoy"))
+    if eps is None:
+        eps = carry(("eps", "eps_period"))
     insiders = safe("證交所 董監持股", lambda: retry(twse.insiders), {}, tw_api)
     futures = safe("期交所 外資台指期未平倉", twse.foreign_futures, None, "https://openapi.taifex.com.tw")
+
+    # ETFs: a fixed core list plus whatever is trading most actively right now.
+    etf_cfg = CFG.get("etfs", {})
+    etf_ranked = sorted((c for c in quotes if c.startswith("00") and quotes[c]["value"]),
+                        key=lambda c: -quotes[c]["value"])
+    tw_etfs = list(dict.fromkeys([c for c in etf_cfg.get("tw_core", []) if c in quotes]
+                                 + etf_ranked[:etf_cfg.get("tw_top_traded", 0)]))
+    us_etfs = etf_cfg.get("us", [])
+    if QUICK:
+        tw_etfs, us_etfs = tw_etfs[:3], us_etfs[:3]
+    twse.EXTRA_CODES = set(tw_etfs)
 
     flows = safe("證交所 三大法人/融資 (市場)", lambda: update_flow_history(trading_days, twii),
                  read_json(DATA / "history" / "tw_flows.json", []), "https://www.twse.com.tw")
@@ -380,14 +403,18 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     us_list = CFG["us_universe"][:10] if QUICK else CFG["us_universe"]
 
     # ---- 4. prices ----------------------------------------------------------
-    tw_frames = safe("證交所 個股每日行情", lambda: update_tw_prices(trading_days, tw_codes), {},
+    tw_frames = safe("證交所 個股每日行情", lambda: update_tw_prices(trading_days, tw_codes + tw_etfs), {},
                      "https://www.twse.com.tw")
     for code, df in tw_frames.items():
         sym = f"{code}.TW"
+        name = quotes.get(code, {}).get("name") or load_store(sym)[1].get("name") or code
         frames[sym] = df
-        meta[sym] = {"name": quotes.get(code, {}).get("name") or load_store(sym)[1].get("name") or code,
-                     "market": "TW", "kind": "stock", "code": code, "scored": code in tw_codes,
-                     "industry": revenue.get(code, {}).get("industry") or "其他"}
+        if code in twse.EXTRA_CODES:
+            meta[sym] = {"name": name, "market": "TW", "kind": "etf", "code": code, "scored": False,
+                         "industry": etf_category(code, name)}
+        else:
+            meta[sym] = {"name": name, "market": "TW", "kind": "stock", "code": code, "scored": code in tw_codes,
+                         "industry": revenue.get(code, {}).get("industry") or "其他"}
     def us_prices(tkr: str) -> pd.DataFrame:
         raw = []
         try:
@@ -400,7 +427,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
 
     us_frames: dict[str, pd.DataFrame] = {}
     later: list[str] = []
-    for tkr, _, _ in us_list:
+    for tkr, _, _ in us_list + us_etfs:
         try:
             us_frames[tkr] = us_prices(tkr)
         except Exception as e:  # noqa: BLE001 - usually a 429 burst limit: try again at the end
@@ -424,6 +451,11 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
             frames[tkr] = us_frames[tkr]
             meta[tkr] = {"name": name, "market": "US", "kind": "stock", "code": tkr, "industry": industry,
                          "scored": True}
+    for tkr, name, category in us_etfs:
+        if len(us_frames.get(tkr, [])) >= 120 and tkr not in frames:
+            frames[tkr] = us_frames[tkr]
+            meta[tkr] = {"name": name, "market": "US", "kind": "etf", "code": tkr, "industry": category,
+                         "scored": False}
     # Never score a stock on stale prices: its last bar must be within a week of the
     # newest bar in its own market (a history gap would otherwise look like a signal).
     newest = {mk: max((frames[s].index[-1] for s, m in meta.items() if m["kind"] == "stock" and m["market"] == mk),
@@ -496,6 +528,9 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         else:
             base = [m["code"]] if len(m["code"]) >= 3 and m["code"] not in AMBIGUOUS_TICKERS else []
         names[s] = list(dict.fromkeys(base + CFG["aliases"].get(m["code"], [])))
+    for s, m in meta.items():  # ETFs are talked about by code (0050, QQQ) more than by name
+        if m["kind"] == "etf":
+            names[s] = [m["code"]] + ([m["name"]] if m["market"] == "TW" and len(m["name"]) >= 4 else [])
     matchers = media.build_matchers(names)
     feeds = CFG["podcasts"][:3] if QUICK else CFG["podcasts"]
     shows, mentions, perr = media.podcasts(feeds, matchers)
@@ -583,6 +618,11 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
             out.append(r)
             if len(out) >= n:
                 break
+        for r in pool:  # the industry cap must never leave the list short
+            if len(out) >= n:
+                break
+            if r not in out:
+                out.append(r)
         return out
 
     picks = pick("TW", CFG["picks"]["tw"]) + pick("US", CFG["picks"]["us"])
@@ -592,6 +632,28 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     bullish = sorted(records, key=lambda r: -short(r))[:12]
     bearish = sorted(records, key=short)[:12]
     bt = scoring.backtest({s: tframes[s] for s in stocks}) if len(stocks) >= 25 else {}
+
+    # ---- 8b. ETFs and podcast-hot names -------------------------------------
+    etf_records = []
+    for s, m in meta.items():
+        if m["kind"] != "etf" or len(frames[s]) < 60:
+            continue
+        if newest[m["market"]] is not None and frames[s].index[-1] < newest[m["market"]] - pd.Timedelta(days=7):
+            continue  # stale prices: leave it out rather than score it
+        etf_records.append(etf_record(s, frames[s], tframes[s], m, flow_map, mentions.get(s, 0)))
+    etf_records.sort(key=lambda r: -r["overall"])
+    by_sym = {r["symbol"]: r for r in records + etf_records}
+    hot = []
+    for s, n in sorted(mentions.items(), key=lambda kv: -kv[1]):
+        r = by_sym.get(s)
+        if not r:
+            continue
+        eps = [{"show": sh["name"], "title": e["title"], "date": e["date"], "link": e["link"],
+                "summary": e.get("summary", "")}
+               for sh in shows for e in sh["episodes"] if s in e.get("mentions", [])]
+        hot.append({**{k: r.get(k) for k in ("symbol", "code", "name", "market", "industry", "close", "chg5d",
+                                             "r20", "rsi", "overall", "label", "horizons", "reasons", "risks")},
+                    "kind": r.get("kind", "stock"), "mentions": n, "episodes": eps[:6], "view": hot_view(r, n)})
 
     # ---- 9. market outlook --------------------------------------------------
     def breadth(market: str) -> float | None:
@@ -650,17 +712,21 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         indices_out.append(item)
 
     narrative = build_narrative(indices_out, tw_flow, picks, bullish, bearish)
-    digest = {"date": today.isoformat(),
-              "indices": [{k: i.get(k) for k in ("name", "close", "chg5d", "r20", "ytd", "rsi", "horizons")}
-                          for i in indices_out],
-              "tw_flow": tw_flow,
-              "picks": [{k: r.get(k) for k in ("code", "name", "market", "industry", "overall", "reasons", "risks")}
-                        for r in picks],
-              "bullish": [f"{r['code']} {r['name']}" for r in bullish[:8]],
-              "bearish": [f"{r['code']} {r['name']}" for r in bearish[:8]]}
-    ai_text = safe("Claude AI 觀點 (選用)", lambda: ai_summary.commentary(digest), None)
-    if ai_text is None:
-        SOURCES[-1]["note"] = SOURCES[-1]["note"] or "未設定 ANTHROPIC_API_KEY，僅顯示規則式觀點"
+    brief = lambda r: {k: r.get(k) for k in ("code", "name", "market", "industry", "close", "chg5d", "r20",  # noqa: E731
+                                             "overall", "label", "reasons", "risks")}
+    write_json(ROOT / ".cache" / "digest.json", {
+        "data_date": trading_days[-1],
+        "indices": [{k: i.get(k) for k in ("name", "close", "chg5d", "r20", "ytd", "rsi", "horizons")}
+                    for i in indices_out],
+        "tw_flow": tw_flow, "narrative": narrative, "backtest": bt,
+        "picks": [brief(r) for r in picks],
+        "bullish": [brief(r) for r in bullish[:8]], "bearish": [brief(r) for r in bearish[:8]],
+        "podcast_hot": [{**{k: h[k] for k in ("symbol", "name", "market", "industry", "close", "chg5d", "r20",
+                                              "rsi", "overall", "label", "mentions", "reasons", "risks", "view")},
+                         "episodes": [{k: e[k] for k in ("show", "title", "date", "summary")} for e in h["episodes"]]}
+                        for h in hot[:12]],
+        "etf": [{k: r.get(k) for k in ("symbol", "name", "market", "industry", "close", "chg5d", "r20", "r60", "ytd",
+                                       "overall", "label", "foreign5")} for r in etf_records]})
 
     # ---- 10. charts (also the on-disk price store for the next run) ----------
     if prices.Yahoo.enabled:  # optional Taiwan intraday for the names people will open first
@@ -720,23 +786,89 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                      "by_ticker": sorted(({"ticker": k, **v} for k, v in csum.items()),
                                          key=lambda r: -(r["buys"] + r["sells"]))[:40]},
         "gurus": gurus, "tw_insiders": sorted(tw_ins, key=lambda r: -(r["pledge"] or 0))})
-    write_json(DATA / "podcasts.json", {"shows": shows, "mentions": mentions,
+    write_json(DATA / "podcasts.json", {"shows": shows, "mentions": mentions, "hot": hot,
                                         "names": {s: meta[s]["name"] for s in mentions if s in meta}})
+    write_json(DATA / "etf.json", etf_records)
     write_json(DATA / "tools.json", tools)
     slim = lambda r: {k: v for k, v in r.items() if k not in ("bars",)}  # noqa: E731
     write_json(DATA / "universe.json", [slim(r) for r in sorted(records, key=lambda r: -r["overall"])])
     write_json(DATA / "summary.json", {
         "generated_at": now.isoformat(timespec="seconds"), "data_date": trading_days[-1],
         "next_update": next_wednesday(today).isoformat(), "quick": QUICK,
-        "indices": indices_out, "tw_flow": tw_flow, "narrative": narrative, "ai_commentary": ai_text,
+        "indices": indices_out, "tw_flow": tw_flow, "narrative": narrative,
         "picks": [slim(r) for r in picks],
         "bullish": [slim(r) for r in bullish], "bearish": [slim(r) for r in bearish],
         "backtest": bt, "weights": scoring.WEIGHTS, "sources": SOURCES,
         "counts": {"tw": sum(r["market"] == "TW" for r in records),
-                   "us": sum(r["market"] == "US" for r in records)}})
+                   "us": sum(r["market"] == "US" for r in records), "etf": len(etf_records)}})
     bad = [s["name"] for s in SOURCES if not s["ok"]]
-    log(f"done: {len(records)} stocks, {len(picks)} picks, failed sources: {bad or 'none'}")
+    log(f"done: {len(records)} stocks, {len(etf_records)} ETFs, {len(picks)} picks, {len(hot)} podcast-hot, "
+        f"failed sources: {bad or 'none'}")
     return 0
+
+
+def etf_category(code: str, name: str) -> str:
+    """Rough grouping of Taiwan ETFs from the code suffix and the fund name."""
+    if code.endswith("L"):
+        return "槓桿型"
+    if code.endswith("R"):
+        return "反向型"
+    if code.endswith("B"):
+        return "債券"
+    if code.endswith("A") or "主動" in name:
+        return "主動式"
+    if any(k in name for k in ("高息", "高股息", "優息", "股利", "收益")):
+        return "高股息"
+    if any(k in name for k in ("半導體", "科技", "5G", "AI", "電動車", "資安", "生技", "金融")):
+        return "產業主題"
+    if any(k in name for k in ("50", "市值", "加權", "中型")):
+        return "市值型"
+    return "其他"
+
+
+def etf_record(s: str, df: pd.DataFrame, tf: pd.DataFrame, m: dict, flow_map: dict, mentions: int) -> dict:
+    """ETFs are scored on price behaviour (plus institutional flows in Taiwan); no fundamentals."""
+    row = tf.iloc[-1]
+    last = float(row["close"])
+    rec: dict = {"symbol": s, "code": m["code"], "name": m["name"], "market": m["market"], "kind": "etf",
+                 "industry": m["industry"], "close": last, "date": df.index[-1].strftime("%Y-%m-%d"),
+                 "chg1d": ret(df, 1), "chg5d": ret(df, 5), "r20": ret(df, 20), "r60": ret(df, 60),
+                 "r250": ret(df, 250), "ytd": ytd(df), "rsi": row["rsi"], "ma20": row["ma20"], "ma60": row["ma60"],
+                 "vol_ann": (row["vol"] or 0) * math.sqrt(252), "pos250": row["pos250"],
+                 "mdd": indicators.max_drawdown(df["close"], 250), "mentions": mentions,
+                 "turnover": float((df["close"] * df["volume"]).tail(20).mean())}
+    chips, notes = None, scoring.tech_reasons(row)
+    fl = flow_map.get(m["code"]) if m["market"] == "TW" else None
+    avgvol = float(df["volume"].tail(20).mean()) or None
+    if fl and avgvol and any(x[0] or x[1] for x in fl):
+        f, t = [x[0] for x in fl], [x[1] for x in fl]
+        chips, cn = scoring.chips_tw({"f5": sum(f[-5:]) / avgvol, "f20": sum(f) / avgvol,
+                                      "t5": sum(t[-5:]) / avgvol, "streak": twse.streak(f), "r5": rec["chg5d"]})
+        notes += cn
+        rec.update({"foreign5": sum(f[-5:]) / 1000, "trust5": sum(t[-5:]) / 1000, "foreign_streak": twse.streak(f)})
+    if m["industry"] in ("槓桿型", "反向型"):
+        notes.append(("槓桿／反向 ETF 每日重設有耗損，只適合短線", -0.2))
+    rec.update(scoring.score_stock(tf, chips, None, scoring.buzz_score(mentions)))
+    rec["reasons"] = [t for t, w in sorted(notes, key=lambda x: -x[1]) if w > 0][:4]
+    rec["risks"] = [t for t, w in sorted(notes, key=lambda x: x[1]) if w < 0][:3]
+    rec["plan"] = scoring.trade_plan(row, rec["horizons"]["1m"], rec["overall"])
+    return rec
+
+
+def hot_view(r: dict, mentions: int) -> str:
+    """One-line reading of a podcast-hot name: does the attention agree with the data?"""
+    o, rsi, wk = r["overall"], r.get("rsi") or 50, r.get("chg5d") or 0
+    if o >= 0.15:
+        txt = "聲量與數據同向偏多"
+        txt += "，但 RSI 過熱，話題性可能已反映在股價，追高風險大" if rsi >= 72 else "，趨勢與籌碼支持，拉回可留意"
+    elif o <= -0.15:
+        txt = "討論度高但數據偏空"
+        txt += "，屬於超跌後的關注，等止穩訊號再說" if rsi <= 32 else "，留意「利多不漲」，反彈宜減碼"
+    else:
+        txt = "市場關注度高、多空訊號混雜，方向未明，觀望為主"
+    if abs(wk) >= 0.08:
+        txt += f"（近一週已{'漲' if wk > 0 else '跌'} {abs(wk):.0%}，波動放大）"
+    return txt
 
 
 def next_wednesday(d: dt.date) -> dt.date:

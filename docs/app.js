@@ -74,6 +74,8 @@
   };
   let S = null; // summary.json
   let U = []; // universe.json
+  let E = []; // etf.json
+  let AI = null; // ai.json - commentary written by Claude during the weekly run
   const bySymbol = new Map();
 
   // ---------- sortable table ----------
@@ -355,7 +357,11 @@
         h("div", { class: "plan" }, [["支撐", r.plan.support], ["停損", r.plan.stop], ["一月目標", r.plan.target]].map(([k, v]) =>
           h("div", {}, h("div", { class: "k" }, k), h("div", { class: "v num" }, px(v))))),
         h("p", { class: "stance", style: "margin-top:10px" }, r.plan.stance)));
-      const kv = r.market === "TW"
+      const kv = r.kind === "etf"
+        ? [["類別", r.industry], ["近一月", pct(r.r20)], ["近一季", pct(r.r60)], ["今年以來", pct(r.ytd)], ["近一年", pct(r.r250)],
+          ["一年最大回檔", pct(r.mdd)], ["年化波動", ok(r.vol_ann) ? num(r.vol_ann * 100, 0) + "%" : "–"], ["RSI(14)", num(r.rsi, 0)],
+          ["外資 5 日", ok(r.foreign5) ? signed(r.foreign5, 0) + " 張" : "–"], ["投信 5 日", ok(r.trust5) ? signed(r.trust5, 0) + " 張" : "–"]]
+        : r.market === "TW"
         ? [["本益比", num(r.pe, 1)], ["股價淨值比", num(r.pb, 2)], ["殖利率", ok(r.yield) ? num(r.yield, 2) + "%" : "–"],
           ["月營收年增", pctRaw(r.rev_yoy)], ["累計營收年增", pctRaw(r.rev_cum_yoy)], ["最新季 EPS", num(r.eps, 2)],
           ["外資 5 日", ok(r.foreign5) ? signed(r.foreign5, 0) + " 張" : "–"], ["投信 5 日", ok(r.trust5) ? signed(r.trust5, 0) + " 張" : "–"],
@@ -365,7 +371,7 @@
           ["營收年增", pctRaw(r.rev_yoy, 0)], ["議員買 / 賣", `${r.congress_buys ?? 0} / ${r.congress_sells ?? 0}`],
           ["名人基金淨加碼", signed(r.guru_net, 0)], ["RSI(14)", num(r.rsi, 0)], ["年化波動", ok(r.vol_ann) ? num(r.vol_ann * 100, 0) + "%" : "–"]];
       body.push(h("div", { class: "panel" }, h("h3", {}, "關鍵數據"), h("div", { class: "kv" },
-        kv.map(([k, v]) => h("div", {}, h("div", { class: "k" }, k), h("div", { class: "v num" }, v))))));
+        kv.map(([k, v]) => h("div", {}, h("div", { class: "k" }, k), h("div", { class: "v num " + (/^[+-][\d.,]+%$/.test(v) ? cls(parseFloat(v)) : "") }, v))))));
     }
     const drawer = h("div", { class: "drawer", role: "dialog", "aria-modal": "true", "aria-label": item.name + " 詳細資料" }, body);
     drawerEl = h("div", { class: "scrim", onclick: (e) => { if (e.target === drawerEl) closeDrawer(); } }, drawer);
@@ -377,9 +383,19 @@
 
   // ---------- views ----------
   const head = (title, lead) => h("div", { class: "stack" }, h("h2", {}, title), lead ? h("p", { class: "lead" }, lead) : null);
-  const statBox = (k, v, s, c) => h("div", { class: "stat" }, h("div", { class: "k" }, k), h("div", { class: "v num " + (c || "") }, v), s ? h("div", { class: "s" }, s) : null);
+  const statBox = (k, v, s, c) => h("div", { class: "stat" }, h("div", { class: "k" }, k),
+    h("div", { class: "v " + (/[\u4e00-\u9fff]{2}/.test(v) ? "txt " : "num ") + (c || "") }, v), s ? h("div", { class: "s" }, s) : null);
   const mdLite = (text) => text.split(/\n+/).filter((l) => l.trim()).map((l) =>
     (l.startsWith("#") ? h("h4", {}, l.replace(/^#+\s*/, "")) : h("p", {}, l.replace(/\*\*/g, ""))));
+
+  // Commentary is written from a given data date; say so when it lags the numbers on screen.
+  const aiBlock = (title, text) => {
+    if (!AI || !text) return null;
+    const stale = AI.data_date !== S.data_date;
+    return h("div", { class: "panel" }, h("div", { class: "sec-head" }, h("h3", {}, title),
+      h("span", { class: "chip " + (stale ? "warn" : "mk") }, stale ? `撰寫於資料日 ${AI.data_date}，尚未更新` : "Claude 依本週數據撰寫")),
+      h("div", { class: "ai note" }, mdLite(text)));
+  };
 
   const views = {
     async overview() {
@@ -395,7 +411,7 @@
             main.map((i) => h("div", { class: "stack" }, h("div", { class: "row" }, h("b", {}, i.name), h("span", { class: "num muted small" }, px(i.close)),
               h("button", { class: "chip", type: "button", onclick: () => openDrawer(i.symbol) }, "看圖")), forecastGrid(i.horizons))),
             h("p", { class: "chart-note" }, "機率與區間由技術面＋籌碼面分數與歷史波動度推估；上漲機率刻意限制在 28%–72% 之間，避免過度自信。"))),
-        S.ai_commentary ? h("div", { class: "panel" }, h("h3", {}, "AI 觀點（Claude 依本週數據撰寫）"), h("div", { class: "ai note" }, mdLite(S.ai_commentary))) : null,
+        aiBlock("AI 觀點", AI && AI.market),
         h("div", { class: "panel" }, h("h3", {}, "台灣加權指數"), priceChart("TWII", { range: "6m" })),
       ];
     },
@@ -588,19 +604,74 @@
 
     async podcast() {
       const P = await load("podcasts");
-      const rank = Object.entries(P.mentions || {}).sort((a, b) => b[1] - a[1]).slice(0, 24);
+      const hot = P.hot || [];
+      const notes = (AI && AI.data_date === S.data_date && AI.podcast && AI.podcast.stocks) || {};
       const nm = (s) => (bySymbol.get(s) || {}).name || (P.names || {})[s] || s;
       return [
-        head("Podcast 熱議", "近兩週知名財經 Podcast 的節目標題與簡介中提到的個股。這是聲量指標：被討論不等於看多，但常代表市場關注度升溫。"),
-        h("div", { class: "panel" }, h("h3", {}, "被提及次數排行"), rank.length
-          ? h("div", { class: "row" }, rank.map(([s, n]) => h("button", { class: "chip", type: "button", onclick: () => bySymbol.has(s) && openDrawer(s) }, `${nm(s)} × ${n}`)))
-          : h("div", { class: "empty" }, "近兩週節目簡介中沒有比對到觀察名單內的個股")),
+        head("Podcast 熱議", "近兩週知名財經 Podcast 的節目標題與簡介中提到的個股與 ETF，並對照它們目前的數據。被討論不等於看多：聲量高而數據轉弱，往往是該小心的時候。"),
+        aiBlock("本週 Podcast 話題解讀", AI && AI.podcast && AI.podcast.overview),
+        h("div", { class: "panel stack" }, h("h3", {}, "熱議個股分析"), hot.length ? table([
+          { key: "n", label: "標的", left: true, cell: (r) => h("span", {}, nameCell(r), " ", mkChip(r.market)) },
+          { key: "m", label: "提及集數", val: (r) => r.mentions, cell: (r) => h("b", { class: "num" }, r.mentions) },
+          { key: "c", label: "收盤", val: (r) => r.close, cell: (r) => h("span", { class: "num" }, px(r.close)) },
+          { key: "w", label: "週漲跌", val: (r) => r.chg5d, cell: (r) => numEl(pct(r.chg5d), r.chg5d) },
+          { key: "o", label: "綜合分", val: (r) => r.overall, cell: (r) => h("span", { class: "row", style: "justify-content:flex-end;flex-wrap:nowrap" }, meter(r.overall), numEl(signed(r.overall, 2), r.overall)) },
+          { key: "1", label: "一週", left: true, cell: (r) => pill(r.horizons["1w"]) },
+          { key: "2", label: "一月", left: true, cell: (r) => pill(r.horizons["1m"]) },
+          { key: "v", label: "聲量對照數據", left: true, wrap: true, cell: (r) => h("div", { class: "stack", style: "gap:4px" },
+            h("span", {}, r.view),
+            notes[r.symbol] ? h("span", { class: "small muted" }, "Claude：" + notes[r.symbol]) : null,
+            h("span", { class: "small muted" }, "出處：" + [...new Set(r.episodes.map((e) => e.show))].join("、"))) }],
+        hot, { sort: "m", onRow: (r) => openDrawer(r.symbol) })
+          : h("div", { class: "empty" }, "近兩週節目簡介中沒有比對到觀察名單內的標的"),
+        hot.length ? h("p", { class: "chart-note" }, "「聲量對照數據」由規則產生：比較提及次數與該標的的綜合分數、RSI、近一週漲跌。只分析節目標題與簡介，未轉錄音訊。") : null),
         h("div", { class: "grid g2" }, (P.shows || []).filter((s) => s.episodes.length).map((s) => h("div", { class: "panel" },
           h("h3", {}, s.name), s.episodes.map((e) => h("div", { class: "ep" },
             h("div", { class: "ep-t" }, e.link ? h("a", { href: e.link, target: "_blank", rel: "noopener noreferrer" }, e.title) : e.title),
             h("div", { class: "small muted num" }, e.date),
             e.summary ? h("div", { class: "small" }, e.summary) : null,
             e.mentions.length ? h("div", { class: "row" }, e.mentions.map((m) => h("button", { class: "chip mk", type: "button", onclick: () => bySymbol.has(m) && openDrawer(m) }, nm(m)))) : null))))),
+      ];
+    },
+
+    async etf() {
+      const state = { m: "ALL", c: "ALL" };
+      const cats = [...new Set(E.map((r) => r.industry))];
+      const cols = [
+        { key: "n", label: "ETF", left: true, cell: (r) => h("span", {}, nameCell(r), " ", mkChip(r.market)) },
+        { key: "i", label: "類別", left: true, cell: (r) => h("span", { class: "chip" + (/槓桿|反向/.test(r.industry) ? " warn" : "") }, r.industry) },
+        { key: "c", label: "收盤", val: (r) => r.close, cell: (r) => h("span", { class: "num" }, px(r.close)) },
+        { key: "w", label: "週", val: (r) => r.chg5d, cell: (r) => numEl(pct(r.chg5d), r.chg5d) },
+        { key: "m", label: "月", val: (r) => r.r20, cell: (r) => numEl(pct(r.r20), r.r20) },
+        { key: "q", label: "季", val: (r) => r.r60, cell: (r) => numEl(pct(r.r60), r.r60) },
+        { key: "y", label: "今年", val: (r) => r.ytd, cell: (r) => numEl(pct(r.ytd), r.ytd) },
+        { key: "1y", label: "一年", val: (r) => r.r250, cell: (r) => numEl(pct(r.r250), r.r250) },
+        { key: "d", label: "一年最大回檔", val: (r) => r.mdd, cell: (r) => numEl(pct(r.mdd), r.mdd) },
+        { key: "v", label: "年化波動", val: (r) => r.vol_ann, cell: (r) => h("span", { class: "num" }, ok(r.vol_ann) ? num(r.vol_ann * 100, 0) + "%" : "–") },
+        { key: "f", label: "外資 5 日（張）", tip: "僅台股 ETF", val: (r) => r.foreign5, cell: (r) => numEl(ok(r.foreign5) ? signed(r.foreign5, 0) : "–", r.foreign5) },
+        { key: "1", label: "一週", left: true, cell: (r) => pill(r.horizons["1w"]) },
+        { key: "2", label: "一月", left: true, cell: (r) => pill(r.horizons["1m"]) },
+        { key: "3", label: "一季", left: true, cell: (r) => pill(r.horizons["1q"]) },
+        { key: "o", label: "綜合分", val: (r) => r.overall, cell: (r) => h("span", { class: "row", style: "justify-content:flex-end;flex-wrap:nowrap" }, meter(r.overall), numEl(signed(r.overall, 2), r.overall)) }];
+      const tbl = table(cols, E, { sort: "o", onRow: (r) => openDrawer(r.symbol) });
+      const apply = () => tbl.setRows(E.filter((r) => (state.m === "ALL" || r.market === state.m) && (state.c === "ALL" || r.industry === state.c)));
+      const seg = h("div", { class: "seg", role: "group", "aria-label": "市場" }, [["ALL", "全部"], ["TW", "台股"], ["US", "美股"]].map(([k, v]) =>
+        h("button", { type: "button", "aria-pressed": String(k === "ALL"), onclick: (e) => {
+          state.m = k; seg.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b === e.currentTarget))); apply();
+        } }, v)));
+      const sel = h("select", { id: "etf-cat", "aria-label": "ETF 類別", onchange: () => { state.c = sel.value; apply(); } },
+        h("option", { value: "ALL" }, "所有類別"), cats.map((c) => h("option", { value: c }, c)));
+      const best = (rows) => rows.slice(0, 3).map((r) => `${r.name}（${signed(r.overall, 2)}）`).join("、") || "–";
+      const tw = E.filter((r) => r.market === "TW"), us = E.filter((r) => r.market === "US");
+      return [
+        head("ETF", "台股熱門與核心 ETF、美股主要市值型／產業／債券／商品 ETF。ETF 沒有個別財報，分數只看價格趨勢與動能，台股 ETF 另計外資與投信買賣超。"),
+        E.length ? h("div", { class: "stats" },
+          statBox("台股 ETF 最強", best(tw), `共 ${tw.length} 檔`), statBox("台股 ETF 最弱", best([...tw].reverse()), ""),
+          statBox("美股 ETF 最強", best(us), `共 ${us.length} 檔`), statBox("美股 ETF 最弱", best([...us].reverse()), "")) : null,
+        aiBlock("本週 ETF 觀察", AI && AI.etf),
+        E.length ? h("div", { class: "panel stack" }, h("div", { class: "row" }, seg, sel), tbl,
+          h("p", { class: "chart-note" }, "槓桿型與反向型 ETF 每日重新平衡，長期持有會有耗損；反向型「偏多」代表的是看空大盤。點列看圖表與參考價位。"))
+          : h("div", { class: "empty" }, "尚無 ETF 資料，下次更新後會出現"),
       ];
     },
 
@@ -632,6 +703,8 @@
         h("div", { class: "panel" }, h("h3", {}, "本週資料來源狀態"), h("div", { class: "src" }, S.sources.map((s) => [
           h("span", { class: "dot " + (s.ok ? "ok" : "bad") }, s.ok ? "✓ 成功" : "✕ 未取得"),
           h("span", {}, s.url ? h("a", { href: s.url, target: "_blank", rel: "noopener noreferrer" }, s.name) : s.name, s.note ? h("span", { class: "muted" }, "　" + s.note) : null)]))),
+        h("div", { class: "panel stack" }, h("h3", {}, "更新方式與 AI 觀點"),
+          h("p", { class: "small" }, "每週三由 Claude 排程自動執行：抓取資料、計算分數、撰寫觀點，然後直接推送到 GitHub。「AI 觀點」「Podcast 話題解讀」「ETF 觀察」三段文字由當次執行的 Claude 只根據本頁同一批數據撰寫，並經過程式檢查資料日期一致才會發布；其餘數字與判讀全部由固定規則計算。")),
         tools.length ? h("div", { class: "panel" }, h("h3", {}, "參考的開源投資與 AI 工具（GitHub 星數排序）"), table([
           { key: "n", label: "專案", left: true, cell: (r) => h("a", { href: r.url, target: "_blank", rel: "noopener noreferrer" }, r.name) },
           { key: "s", label: "星數", cell: (r) => h("span", { class: "num" }, nf(0).format(r.stars)) },
@@ -668,7 +741,9 @@
       app.replaceChildren(h("div", { class: "empty" }, "找不到資料檔。請先執行 python -m pipeline.build，或等待每週三的自動更新。（" + e.message + "）"));
       return;
     }
+    [E, AI] = await Promise.all([load("etf").catch(() => []), load("ai").catch(() => null)]);
     U.forEach((r) => bySymbol.set(r.symbol, r));
+    E.forEach((r) => bySymbol.set(r.symbol, r));
     [...S.picks, ...S.bullish, ...S.bearish].forEach((r) => bySymbol.set(r.symbol, r));
     document.getElementById("stamp").replaceChildren(
       h("span", {}, "資料日 ", h("b", { class: "num" }, S.data_date)),

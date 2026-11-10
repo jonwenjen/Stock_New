@@ -10,6 +10,11 @@ from . import http
 OPENAPI = "https://openapi.twse.com.tw/v1"
 RWD = "https://www.twse.com.tw/rwd/zh"
 COMMON_STOCK = re.compile(r"^[1-9]\d{3}$")  # excludes ETFs (00xx), warrants, etc.
+EXTRA_CODES: set[str] = set()  # ETF codes the build also wants from the all-securities tables
+
+
+def tracked(code: str) -> bool:
+    return bool(COMMON_STOCK.match(code)) or code in EXTRA_CODES
 
 
 def num(s) -> float | None:
@@ -236,7 +241,7 @@ def day_quotes(date: str) -> dict[str, tuple]:
     out = {}
     for r in table["data"]:
         code = r[0].strip()
-        if not COMMON_STOCK.match(code):
+        if not tracked(code):
             continue
         o, h, l, c, v = (num(r[i]) for i in ix)
         if c:  # no trade that day -> skip

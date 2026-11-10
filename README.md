@@ -1,8 +1,8 @@
 # 週三選股雷達
 
-每週三自動更新的台股＋美股研究儀表板：外資與融資動向、名人／議員／董監持股、財報指標、
-Podcast 熱議、未來一週／一月／一季趨勢預測，以及精選 20 檔個股。純靜態網站，放在 GitHub Pages
-即可，不需要伺服器。
+每週三由 Claude 自動更新的台股＋美股研究儀表板：外資與融資動向、名人／議員／董監持股、財報指標、
+ETF、Podcast 熱議與分析、未來一週／一月／一季趨勢預測，以及精選 20 檔個股。純靜態網站，放在
+GitHub Pages 即可，不需要伺服器，也不使用付費 API。
 
 > 本專案產出的分數、機率與價位都是模型推估，**不是投資建議**。
 
@@ -10,31 +10,38 @@ Podcast 熱議、未來一週／一月／一季趨勢預測，以及精選 20 �
 
 | 分頁 | 內容 |
 |---|---|
-| 總覽與預測 | 12 項指數與總經指標、本週判讀、大盤一週／一月／一季預測（方向、上漲機率、價格區間）、選用的 AI 觀點 |
+| 總覽與預測 | 12 項指數與總經指標、本週判讀、大盤一週／一月／一季預測（方向、上漲機率、價格區間）、Claude 撰寫的 AI 觀點 |
 | 精選 20 檔 | 台股 12 檔＋美股 8 檔，附多空理由、支撐／停損／目標參考價、操作立場 |
 | 外資法人 | 三大法人每日買賣超、外資台指期未平倉、外資與投信 5 日買賣超排行 |
 | 融資融券 | 融資餘額走勢、個股融資增減排行、「資增價跌」警示 |
 | 名人・議員・董監 | 美國國會議員交易申報、12 位知名投資人 13F 持股變化、台股董監持股與質押比 |
 | 財報指標 | 觀察名單全部個股的本益比、淨值比、殖利率、營收與 EPS 成長，可排序與搜尋 |
+| ETF | 台股核心與熱門 ETF、美股市值型／產業／債券／商品 ETF 的報酬、回檔、波動、外資動向與趨勢預測 |
 | 漲跌預警 | 短線最可能續強與轉弱的各 12 檔 |
-| Podcast | 12 個中英文財經節目近兩週集數與被提及的個股 |
+| Podcast | 12 個中英文財經節目近兩週集數、熱議標的與其數據對照分析 |
 | 方法與來源 | 因子權重、回測結果、每個資料來源本週是否成功取得 |
 
 任何個股或指數都能點開圖表，區間可切換 **天／週／月／季／2季／當年／2年／5年／所有**。
 顏色採台股慣例：紅漲綠跌。
 
-## 啟用步驟
+## 更新方式
 
-1. **開啟 GitHub Pages**：repo 的 Settings → Pages → Source 選 *Deploy from a branch*，
-   分支選預設分支、資料夾選 `/docs`。幾分鐘後網站會出現在 `https://<帳號>.github.io/<repo>/`。
-2. **允許排程寫入**：Settings → Actions → General → Workflow permissions 選 *Read and write permissions*。
-3. （選用）**AI 觀點**：Settings → Secrets and variables → Actions 新增 secret `ANTHROPIC_API_KEY`，
-   每週會多一段由 Claude 依當週數據撰寫的觀點。沒有設定也能運作，只顯示規則式判讀。
-4. （選用）**SEC 聯絡資訊**：SEC 要求自動化程式在 User-Agent 註明「名稱 聯絡信箱」。
-   新增 repository variable `SEC_USER_AGENT`（例如 `MyDashboard me@example.com`）可降低被拒機率。
+每週三由 Claude 的排程工作在雲端執行，使用 Claude 訂閱額度，不經 GitHub Actions、不呼叫付費 API：
 
-排程在 `.github/workflows/weekly-update.yml`：每週三台北時間 22:10 執行（當日收盤、三大法人、
-融資資料都已公布），也可以在 Actions 頁面手動 *Run workflow*。排程只會在**預設分支**上執行。
+1. 依 `WEEKLY_UPDATE.md` 抓取資料並計算分數（`python -m pipeline.build`）
+2. 由當次執行的 Claude 根據同一批數據撰寫「AI 觀點」「Podcast 話題解讀」「ETF 觀察」，
+   寫入 `docs/data/ai.json`，並以 `python -m pipeline.check_ai` 檢查資料日期與結構
+3. 直接提交並推送到 `main`
+
+排程可在 Claude Code（claude.ai/code）的排程工作清單中查看、暫停或手動觸發。
+要改更新內容或撰寫規則，編輯 `WEEKLY_UPDATE.md` 即可，下次執行就會生效。
+
+## 啟用 GitHub Pages
+
+repo 的 Settings → Pages → Source 選 *Deploy from a branch*，分支選 `main`、資料夾選 `/docs`。
+幾分鐘後網站會出現在 `https://<帳號>.github.io/<repo>/`，之後每次推送到 `main` 都會自動重新發布。
+
+SEC 要求自動化程式表明身分，聯絡資訊放在 `config/settings.json` 的 `sec_contact`。
 
 ## 本機執行
 
@@ -68,9 +75,10 @@ pipeline/
   media.py             Podcast RSS、GitHub 開源工具清單
   indicators.py        技術指標（純函式）
   scoring.py           因子評分、趨勢預測、回測（純函式）
-  ai_summary.py        選用的 Claude 觀點
+  check_ai.py          檢查 Claude 每週撰寫的觀點檔（docs/data/ai.json）
   build.py             主流程：抓資料 → 評分 → 寫出 docs/data/*.json
 docs/                  靜態網站（index.html、app.js、style.css、data/）
+WEEKLY_UPDATE.md       每週排程執行的作業手冊與觀點撰寫規則
 tests/                 純函式與解析器的單元測試
 ```
 
@@ -129,10 +137,11 @@ tests/                 純函式與解析器的單元測試
 - **Podcast 只分析節目標題與簡介**，沒有轉錄音訊；業配內容可能造成誤判。
 - **回測有倖存者偏差**（樣本是現在的熱門股），且只涵蓋技術面因子。
 - 台灣民意代表的持股沒有機器可讀的交易申報，因此「議員」部分只涵蓋美國國會。
-- 上櫃股票、ETF 目前不在觀察名單內。
+- ETF 沒有個別財報，分數只看價格與（台股的）法人買賣超；上櫃股票與上櫃 ETF（多數債券 ETF）不在名單內。
+- AI 觀點由 Claude 撰寫，雖限定只用當週數據並經程式檢查，仍可能有解讀偏差，請與數字對照閱讀。
 
 ## 調整設定
 
 編輯 `config/settings.json`：`us_universe` 增減美股、`tw_universe_size` 調整台股名單大小
 （依成交金額排序）、`picks` 調整精選檔數與產業上限、`investors` 增減 13F 追蹤對象（填 SEC CIK）、
-`podcasts` 增減節目 RSS。
+`podcasts` 增減節目 RSS、`etfs` 調整 ETF 名單（`tw_core` 固定名單、`tw_top_traded` 另取成交金額前幾名、`us` 美股 ETF）。

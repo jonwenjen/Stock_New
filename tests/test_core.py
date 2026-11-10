@@ -327,3 +327,51 @@ def test_fetch_days_backs_off_and_stops_when_throttled(monkeypatch):
     assert len(calls) == 6 and twse.THROTTLED is True      # 3 refusals per pass, then give up
     calls.clear()
     assert twse.fetch_days(["y1"], blocked, log=lambda m: None) == {} and calls == []  # no more requests
+
+
+# ---------------- ETFs, podcast-hot, weekly AI file ----------------
+def test_etf_category_and_record():
+    from pipeline import build
+    assert build.etf_category("00631L", "元大台灣50正2") == "槓桿型"
+    assert build.etf_category("00632R", "元大台灣50反1") == "反向型"
+    assert build.etf_category("00878", "國泰永續高股息") == "高股息"
+    assert build.etf_category("00891", "中信關鍵半導體") == "產業主題"
+    assert build.etf_category("00981A", "主動統一台股增長") == "主動式"
+    assert build.etf_category("0050", "元大台灣50") == "市值型"
+    assert build.etf_category("009816", "凱基台灣TOP50") == "市值型"
+    assert build.etf_category("00406A", "主動中信台灣收益") == "主動式"   # active beats the income keyword
+    df = make_df(trend(drift=0.003))
+    meta = {"code": "00631L", "name": "元大台灣50正2", "market": "TW", "industry": "槓桿型"}
+    flows = {"00631L": [(2e6, 1e5)] * 20}
+    rec = build.etf_record("00631L.TW", df, scoring.tech_frame(df), meta, flows, 2)
+    assert rec["kind"] == "etf" and rec["overall"] > 0.3 and rec["factors"]["fund"] is None
+    assert rec["foreign5"] == pytest.approx(10000) and rec["factors"]["chips"] > 0
+    assert any("槓桿" in t for t in rec["risks"]) and -1 <= rec["mdd"] <= 0
+    us = build.etf_record("SPY", df, scoring.tech_frame(df), {**meta, "market": "US", "industry": "市值型"}, flows, 0)
+    assert us["factors"]["chips"] is None and "foreign5" not in us
+
+
+def test_hot_view_reads_attention_against_the_data():
+    from pipeline import build
+    assert "同向偏多" in build.hot_view({"overall": 0.4, "rsi": 55, "chg5d": 0.01}, 3)
+    assert "追高風險" in build.hot_view({"overall": 0.4, "rsi": 80, "chg5d": 0.12}, 3)
+    assert "利多不漲" in build.hot_view({"overall": -0.4, "rsi": 45, "chg5d": -0.01}, 3)
+    assert "方向未明" in build.hot_view({"overall": 0.0, "rsi": None, "chg5d": None}, 1)
+
+
+def test_check_ai_validation():
+    from pipeline import check_ai
+    good = {"data_date": "2026-11-10",
+            "market": "".join(f"### 段落{i}\n" + "內容" * 40 + "\n" for i in range(4)),
+            "podcast": {"overview": "概況" * 40, "stocks": {"NVDA": "分析" * 30, "2330.TW": "分析" * 30}},
+            "etf": "ETF" * 60}
+    hot = ["NVDA", "2330.TW"]
+    assert check_ai.validate(good, "2026-11-10", hot) == []
+    assert any("data_date" in e for e in check_ai.validate(good, "2026-11-17", hot))          # stale commentary
+    assert any("lacks" in e for e in check_ai.validate(good, "2026-11-10", hot + ["AMD"]))    # hot name skipped
+    bad = {**good, "podcast": {"overview": good["podcast"]["overview"],
+                               "stocks": {**good["podcast"]["stocks"], "TSLA": "分析" * 30}}}
+    assert any("not in this week" in e for e in check_ai.validate(bad, "2026-11-10", hot))
+    assert any("sections" in e for e in check_ai.validate({**good, "market": "短" * 300}, "2026-11-10", hot))
+    assert any("placeholder" in e for e in check_ai.validate({**good, "etf": "TODO " * 40}, "2026-11-10", hot))
+    assert check_ai.validate({**good, "podcast": {}}, "2026-11-10", []) == []                  # quiet week

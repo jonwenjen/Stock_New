@@ -1,0 +1,644 @@
+{
+  "picks": {
+    "tw": 12,
+    "us": 8,
+    "max_per_industry": 3
+  },
+  "tw_universe_size": 90,
+  "flow_history_days": 40,
+  "stock_flow_days": 20,
+  "indices": [
+    {
+      "symbol": "TWII",
+      "name": "台灣加權指數",
+      "market": "TW",
+      "source": "twse"
+    },
+    {
+      "symbol": "SPX",
+      "name": "S&P 500",
+      "market": "US",
+      "source": "cboe",
+      "code": "_SPX"
+    },
+    {
+      "symbol": "NDQ",
+      "name": "那斯達克綜合",
+      "market": "US",
+      "source": "fred",
+      "code": "NASDAQCOM"
+    },
+    {
+      "symbol": "DJI",
+      "name": "道瓊工業",
+      "market": "US",
+      "source": "cboe",
+      "code": "_DJX",
+      "scale": 100
+    },
+    {
+      "symbol": "SOXX",
+      "name": "半導體 ETF (SOXX)",
+      "market": "US",
+      "source": "cboe",
+      "code": "SOXX"
+    },
+    {
+      "symbol": "VIX",
+      "name": "VIX 恐慌指數",
+      "market": "MACRO",
+      "source": "cboe",
+      "code": "_VIX"
+    },
+    {
+      "symbol": "US10Y",
+      "name": "美國10年期公債殖利率 %",
+      "market": "MACRO",
+      "source": "fred",
+      "code": "DGS10"
+    },
+    {
+      "symbol": "USDTWD",
+      "name": "美元/台幣",
+      "market": "MACRO",
+      "source": "fred",
+      "code": "DEXTAUS"
+    },
+    {
+      "symbol": "DXY",
+      "name": "美元指數 (Fed 廣義)",
+      "market": "MACRO",
+      "source": "fred",
+      "code": "DTWEXBGS"
+    },
+    {
+      "symbol": "GLD",
+      "name": "黃金 ETF (GLD)",
+      "market": "MACRO",
+      "source": "cboe",
+      "code": "GLD"
+    },
+    {
+      "symbol": "WTI",
+      "name": "WTI 原油",
+      "market": "MACRO",
+      "source": "fred",
+      "code": "DCOILWTICO"
+    },
+    {
+      "symbol": "BTC",
+      "name": "比特幣",
+      "market": "MACRO",
+      "source": "fred",
+      "code": "CBBTCUSD"
+    }
+  ],
+  "us_universe": [
+    [
+      "NVDA",
+      "輝達",
+      "半導體"
+    ],
+    [
+      "AAPL",
+      "蘋果",
+      "消費電子"
+    ],
+    [
+      "MSFT",
+      "微軟",
+      "軟體"
+    ],
+    [
+      "GOOGL",
+      "Alphabet",
+      "網路服務"
+    ],
+    [
+      "AMZN",
+      "亞馬遜",
+      "電商雲端"
+    ],
+    [
+      "META",
+      "Meta",
+      "網路服務"
+    ],
+    [
+      "TSLA",
+      "特斯拉",
+      "電動車"
+    ],
+    [
+      "AVGO",
+      "博通",
+      "半導體"
+    ],
+    [
+      "TSM",
+      "台積電ADR",
+      "半導體"
+    ],
+    [
+      "AMD",
+      "超微",
+      "半導體"
+    ],
+    [
+      "MU",
+      "美光",
+      "半導體"
+    ],
+    [
+      "INTC",
+      "英特爾",
+      "半導體"
+    ],
+    [
+      "QCOM",
+      "高通",
+      "半導體"
+    ],
+    [
+      "ASML",
+      "艾司摩爾",
+      "半導體設備"
+    ],
+    [
+      "AMAT",
+      "應用材料",
+      "半導體設備"
+    ],
+    [
+      "LRCX",
+      "科林研發",
+      "半導體設備"
+    ],
+    [
+      "ARM",
+      "安謀",
+      "半導體"
+    ],
+    [
+      "MRVL",
+      "邁威爾",
+      "半導體"
+    ],
+    [
+      "SMCI",
+      "美超微",
+      "伺服器"
+    ],
+    [
+      "DELL",
+      "戴爾",
+      "伺服器"
+    ],
+    [
+      "ORCL",
+      "甲骨文",
+      "軟體"
+    ],
+    [
+      "CRM",
+      "Salesforce",
+      "軟體"
+    ],
+    [
+      "ADBE",
+      "Adobe",
+      "軟體"
+    ],
+    [
+      "NOW",
+      "ServiceNow",
+      "軟體"
+    ],
+    [
+      "PLTR",
+      "Palantir",
+      "軟體"
+    ],
+    [
+      "SNOW",
+      "Snowflake",
+      "軟體"
+    ],
+    [
+      "CRWD",
+      "CrowdStrike",
+      "資安"
+    ],
+    [
+      "PANW",
+      "Palo Alto",
+      "資安"
+    ],
+    [
+      "NFLX",
+      "網飛",
+      "串流媒體"
+    ],
+    [
+      "DIS",
+      "迪士尼",
+      "串流媒體"
+    ],
+    [
+      "UBER",
+      "Uber",
+      "平台經濟"
+    ],
+    [
+      "SHOP",
+      "Shopify",
+      "電商雲端"
+    ],
+    [
+      "COIN",
+      "Coinbase",
+      "加密金融"
+    ],
+    [
+      "JPM",
+      "摩根大通",
+      "金融"
+    ],
+    [
+      "GS",
+      "高盛",
+      "金融"
+    ],
+    [
+      "BAC",
+      "美國銀行",
+      "金融"
+    ],
+    [
+      "V",
+      "Visa",
+      "支付"
+    ],
+    [
+      "MA",
+      "萬事達",
+      "支付"
+    ],
+    [
+      "BRK-B",
+      "波克夏",
+      "金融"
+    ],
+    [
+      "LLY",
+      "禮來",
+      "製藥"
+    ],
+    [
+      "NVO",
+      "諾和諾德",
+      "製藥"
+    ],
+    [
+      "UNH",
+      "聯合健康",
+      "醫療保險"
+    ],
+    [
+      "JNJ",
+      "嬌生",
+      "製藥"
+    ],
+    [
+      "PFE",
+      "輝瑞",
+      "製藥"
+    ],
+    [
+      "COST",
+      "好市多",
+      "零售"
+    ],
+    [
+      "WMT",
+      "沃爾瑪",
+      "零售"
+    ],
+    [
+      "HD",
+      "家得寶",
+      "零售"
+    ],
+    [
+      "KO",
+      "可口可樂",
+      "民生消費"
+    ],
+    [
+      "PG",
+      "寶僑",
+      "民生消費"
+    ],
+    [
+      "MCD",
+      "麥當勞",
+      "民生消費"
+    ],
+    [
+      "NKE",
+      "耐吉",
+      "民生消費"
+    ],
+    [
+      "XOM",
+      "艾克森美孚",
+      "能源"
+    ],
+    [
+      "CVX",
+      "雪佛龍",
+      "能源"
+    ],
+    [
+      "CAT",
+      "開拓重工",
+      "工業"
+    ],
+    [
+      "BA",
+      "波音",
+      "航太國防"
+    ],
+    [
+      "LMT",
+      "洛克希德馬丁",
+      "航太國防"
+    ],
+    [
+      "GE",
+      "奇異航太",
+      "航太國防"
+    ],
+    [
+      "VRT",
+      "Vertiv",
+      "電力設備"
+    ],
+    [
+      "CEG",
+      "Constellation",
+      "電力"
+    ],
+    [
+      "GEV",
+      "GE Vernova",
+      "電力設備"
+    ]
+  ],
+  "investors": [
+    {
+      "cik": 1067983,
+      "name": "波克夏 Berkshire Hathaway",
+      "person": "巴菲特 Warren Buffett"
+    },
+    {
+      "cik": 1336528,
+      "name": "Pershing Square",
+      "person": "艾克曼 Bill Ackman"
+    },
+    {
+      "cik": 1350694,
+      "name": "橋水 Bridgewater",
+      "person": "達利歐 Ray Dalio（創辦人）"
+    },
+    {
+      "cik": 1536411,
+      "name": "Duquesne Family Office",
+      "person": "朱肯米勒 Stanley Druckenmiller"
+    },
+    {
+      "cik": 1656456,
+      "name": "Appaloosa",
+      "person": "泰珀 David Tepper"
+    },
+    {
+      "cik": 1697748,
+      "name": "方舟投資 ARK Invest",
+      "person": "伍德 Cathie Wood"
+    },
+    {
+      "cik": 1167483,
+      "name": "老虎環球 Tiger Global",
+      "person": "柯爾曼 Chase Coleman"
+    },
+    {
+      "cik": 1029160,
+      "name": "索羅斯基金 Soros Fund",
+      "person": "索羅斯家族 Soros"
+    },
+    {
+      "cik": 1061768,
+      "name": "Baupost Group",
+      "person": "克拉曼 Seth Klarman"
+    },
+    {
+      "cik": 1040273,
+      "name": "Third Point",
+      "person": "勒布 Dan Loeb"
+    },
+    {
+      "cik": 1709323,
+      "name": "喜馬拉雅資本 Himalaya",
+      "person": "李彔 Li Lu"
+    },
+    {
+      "cik": 921669,
+      "name": "Icahn Enterprises",
+      "person": "伊坎 Carl Icahn"
+    }
+  ],
+  "podcasts": [
+    {
+      "name": "Gooaye 股癌",
+      "lang": "zh",
+      "feed": "https://feeds.soundon.fm/podcasts/954689a5-3096-43a4-a80b-7810b219cef3.xml"
+    },
+    {
+      "name": "財報狗",
+      "lang": "zh",
+      "feed": "https://feed.firstory.me/rss/user/clcftm46z000201z45w1c47fi"
+    },
+    {
+      "name": "M觀點",
+      "lang": "zh",
+      "feed": "https://feeds.soundon.fm/podcasts/b8f5a471-f4f7-4763-9678-65887beda63a.xml"
+    },
+    {
+      "name": "MacroMicro 財經M平方",
+      "lang": "zh",
+      "feed": "https://feeds.soundon.fm/podcasts/d2aab16c-3a70-4023-b52b-e50f07852ecd.xml"
+    },
+    {
+      "name": "兆華與股惑仔",
+      "lang": "zh",
+      "feed": "https://feeds.soundon.fm/podcasts/91be014b-9f55-4bf3-a910-b232eda82d11.xml"
+    },
+    {
+      "name": "美股投資學-財女珍妮",
+      "lang": "zh",
+      "feed": "https://feeds.soundon.fm/podcasts/4a8660a0-e0d0-490b-8d46-c28219606f47.xml"
+    },
+    {
+      "name": "Odd Lots (Bloomberg)",
+      "lang": "en",
+      "feed": "https://www.omnycontent.com/d/playlist/e73c998e-6e60-432f-8610-ae210140c5b1/8a94442e-5a74-4fa2-8b8d-ae27003a8d6b/982f5071-765c-403d-969d-ae27003a8d83/podcast.rss"
+    },
+    {
+      "name": "All-In Podcast",
+      "lang": "en",
+      "feed": "https://rss.libsyn.com/shows/254861/destinations/1928300.xml"
+    },
+    {
+      "name": "We Study Billionaires",
+      "lang": "en",
+      "feed": "https://feeds.megaphone.fm/PPLLC8974708240"
+    },
+    {
+      "name": "Animal Spirits",
+      "lang": "en",
+      "feed": "https://feeds.megaphone.fm/TCP6464651487"
+    },
+    {
+      "name": "Motley Fool Money",
+      "lang": "en",
+      "feed": "https://www.omnycontent.com/d/playlist/820f09cf-2ace-4180-a92d-aa4c0008f5fb/c1c22a03-f4e2-49e4-9eff-abb2003ac099/25111702-47b4-423f-9d57-abb2003ac0a7/podcast.rss"
+    },
+    {
+      "name": "Invest Like the Best",
+      "lang": "en",
+      "feed": "https://feeds.megaphone.fm/CLS2859450455"
+    }
+  ],
+  "aliases": {
+    "NVDA": [
+      "輝達",
+      "Nvidia",
+      "NVIDIA"
+    ],
+    "AAPL": [
+      "蘋果",
+      "Apple"
+    ],
+    "MSFT": [
+      "微軟",
+      "Microsoft"
+    ],
+    "GOOGL": [
+      "谷歌",
+      "Google",
+      "Alphabet"
+    ],
+    "AMZN": [
+      "亞馬遜",
+      "Amazon"
+    ],
+    "META": [
+      "Meta",
+      "臉書"
+    ],
+    "TSLA": [
+      "特斯拉",
+      "Tesla"
+    ],
+    "AVGO": [
+      "博通",
+      "Broadcom"
+    ],
+    "AMD": [
+      "超微",
+      "AMD"
+    ],
+    "MU": [
+      "美光",
+      "Micron"
+    ],
+    "INTC": [
+      "英特爾",
+      "Intel"
+    ],
+    "PLTR": [
+      "Palantir"
+    ],
+    "NFLX": [
+      "Netflix",
+      "網飛"
+    ],
+    "ORCL": [
+      "甲骨文",
+      "Oracle"
+    ],
+    "SMCI": [
+      "美超微",
+      "Supermicro"
+    ],
+    "COIN": [
+      "Coinbase"
+    ],
+    "LLY": [
+      "禮來",
+      "Eli Lilly"
+    ],
+    "BRK-B": [
+      "波克夏",
+      "Berkshire"
+    ],
+    "TSM": [
+      "TSMC"
+    ],
+    "2330": [
+      "台積電",
+      "TSMC",
+      "台積"
+    ],
+    "2317": [
+      "鴻海"
+    ],
+    "2454": [
+      "聯發科"
+    ],
+    "2382": [
+      "廣達"
+    ],
+    "3231": [
+      "緯創"
+    ],
+    "2308": [
+      "台達電"
+    ],
+    "3711": [
+      "日月光"
+    ],
+    "2303": [
+      "聯電"
+    ],
+    "2603": [
+      "長榮"
+    ],
+    "3008": [
+      "大立光"
+    ],
+    "2357": [
+      "華碩"
+    ],
+    "6669": [
+      "緯穎"
+    ],
+    "3017": [
+      "奇鋐"
+    ],
+    "2345": [
+      "智邦"
+    ]
+  },
+  "tw_price_days": 520
+}

@@ -1,0 +1,403 @@
+"""Multi-factor scoring and horizon forecasts.
+
+Every factor is squashed into [-1, +1]; horizon scores are weighted blends.
+All functions here are pure (no network) so they can be unit-tested and
+back-tested with the exact same code that produces the live numbers.
+"""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import pandas as pd
+
+from . import indicators as ind
+
+HORIZONS = {"1w": 5, "1m": 21, "1q": 63}  # trading days
+
+# Weight of each factor group per horizon (re-normalised when a group is missing).
+WEIGHTS = {
+    "1w": {"tech": 0.55, "chips": 0.35, "fund": 0.05, "buzz": 0.05},
+    "1m": {"tech": 0.45, "chips": 0.25, "fund": 0.25, "buzz": 0.05},
+    "1q": {"tech": 0.40, "chips": 0.15, "fund": 0.45, "buzz": 0.00},
+}
+OVERALL = {"1w": 0.3, "1m": 0.4, "1q": 0.3}
+
+
+def clamp(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, x))
+
+
+def _num(x) -> float | None:
+    if x is None:
+        return None
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) else None
+
+
+# --------------------------------------------------------------------------- #
+# Technical factors (vectorised: one row per trading day)
+# --------------------------------------------------------------------------- #
+def tech_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """df needs columns open/high/low/close/volume. Returns indicator + score columns."""
+    c = df["close"].astype(float)
+    out = pd.DataFrame(index=df.index)
+    out["close"] = c
+    for n in (5, 20, 60, 120, 240):
+        out[f"ma{n}"] = ind.sma(c, n)
+    out["rsi"] = ind.rsi(c, 14)
+    _, _, hist = ind.macd(c)
+    out["macd_hist"] = hist
+    out["atr"] = ind.atr(df["high"].astype(float), df["low"].astype(float), c, 14)
+    out["vol"] = ind.daily_vol(c, 60)
+    out["pos250"] = ind.range_position(c, 250)
+    for n in (5, 20, 60, 120):
+        out[f"r{n}"] = ind.pct_change_n(c, n)
+
+    sgn = lambda a, b: np.sign((a - b).fillna(0))  # noqa: E731
+    slope60 = (out["ma60"] / out["ma60"].shift(20) - 1) / (out["vol"] * math.sqrt(20))
+    trend = (
+        0.20 * sgn(c, out["ma20"])
+        + 0.30 * sgn(c, out["ma60"])
+        + 0.20 * sgn(c, out["ma120"])
+        + 0.15 * sgn(out["ma20"], out["ma60"])
+        + 0.15 * np.tanh(slope60.fillna(0) * 2)
+    )
+
+    def zret(n: int) -> pd.Series:  # volatility-normalised return
+        return np.tanh((out[f"r{n}"] / (out["vol"] * math.sqrt(n))).fillna(0))
+
+    rsi_s = pd.Series(0.0, index=df.index)
+    r = out["rsi"]
+    rsi_s = rsi_s.mask(r >= 80, -0.30).mask((r >= 70) & (r < 80), -0.10)
+    rsi_s = rsi_s.mask((r >= 50) & (r < 70), 0.15).mask((r > 30) & (r < 50), -0.15)
+    rsi_s = rsi_s.mask(r <= 30, 0.20)
+    macd_s = 0.2 * np.sign(hist.fillna(0)) + 0.1 * np.sign(hist.diff().fillna(0))
+    mom_s = (0.4 * zret(5) + macd_s + rsi_s).clip(-1, 1)
+    mom_m = (0.6 * zret(60) + 0.4 * zret(20)).clip(-1, 1)
+    mom_l = (0.6 * zret(120) + 0.8 * (out["pos250"].fillna(0.5) - 0.5)).clip(-1, 1)
+
+    out["trend"] = trend.clip(-1, 1)
+    out["mom_s"], out["mom_m"], out["mom_l"] = mom_s, mom_m, mom_l
+    out["t_1w"] = (0.5 * mom_s + 0.3 * out["trend"] + 0.2 * mom_m).clip(-1, 1)
+    out["t_1m"] = (0.4 * out["trend"] + 0.4 * mom_m + 0.2 * mom_s).clip(-1, 1)
+    out["t_1q"] = (0.4 * out["trend"] + 0.35 * mom_l + 0.25 * mom_m).clip(-1, 1)
+    return out
+
+
+def tech_reasons(row: pd.Series) -> list[tuple[str, float]]:
+    """Human-readable (text, signed weight) notes for the latest bar."""
+    notes: list[tuple[str, float]] = []
+    c = row["close"]
+    ma20, ma60, ma120 = _num(row.get("ma20")), _num(row.get("ma60")), _num(row.get("ma120"))
+    if ma20 and ma60 and ma120:
+        if c > ma20 > ma60 > ma120:
+            notes.append(("均線多頭排列（價>月線>季線>半年線）", 0.5))
+        elif c < ma20 < ma60 < ma120:
+            notes.append(("均線空頭排列（價<月線<季線<半年線）", -0.5))
+        elif c > ma60:
+            notes.append(("股價站上季線", 0.25))
+        else:
+            notes.append(("股價跌破季線", -0.25))
+    rsi = _num(row.get("rsi"))
+    if rsi is not None:
+        if rsi >= 80:
+            notes.append((f"RSI {rsi:.0f} 嚴重超買，短線追高風險大", -0.3))
+        elif rsi >= 70:
+            notes.append((f"RSI {rsi:.0f} 進入超買區", -0.1))
+        elif rsi <= 30:
+            notes.append((f"RSI {rsi:.0f} 超賣，留意反彈", 0.2))
+    h = _num(row.get("macd_hist"))
+    if h is not None:
+        notes.append(("MACD 柱狀體為正，動能偏多", 0.2) if h > 0 else ("MACD 柱狀體為負，動能偏空", -0.2))
+    r20, r60 = _num(row.get("r20")), _num(row.get("r60"))
+    if r60 is not None and abs(r60) >= 0.15:
+        notes.append((f"近一季漲跌 {r60:+.0%}", 0.3 if r60 > 0 else -0.3))
+    elif r20 is not None and abs(r20) >= 0.08:
+        notes.append((f"近一月漲跌 {r20:+.0%}", 0.2 if r20 > 0 else -0.2))
+    pos = _num(row.get("pos250"))
+    if pos is not None:
+        if pos >= 0.95:
+            notes.append(("股價位於一年高點附近", 0.15))
+        elif pos <= 0.05:
+            notes.append(("股價位於一年低點附近", -0.15))
+    return notes
+
+
+# --------------------------------------------------------------------------- #
+# Chips (flows / positioning)
+# --------------------------------------------------------------------------- #
+def chips_tw(m: dict) -> tuple[float | None, list[tuple[str, float]]]:
+    """m keys: f5, f20, t5 (net shares / avg daily volume), streak (signed days),
+    margin_chg5 (fraction), r5 (price return)."""
+    notes: list[tuple[str, float]] = []
+    if _num(m.get("f5")) is None:
+        return None, notes
+    f5, f20, t5 = m["f5"], _num(m.get("f20")) or 0.0, _num(m.get("t5")) or 0.0
+    s = 0.35 * math.tanh(f5 / 0.5) + 0.20 * math.tanh(f20 / 1.5) + 0.20 * math.tanh(t5 / 0.25)
+    if abs(f5) >= 0.15:
+        notes.append((f"外資近5日{'買超' if f5 > 0 else '賣超'}（約 {abs(f5):.1f} 日均量）", 0.35 * math.tanh(f5 / 0.5)))
+    if abs(t5) >= 0.08:
+        notes.append((f"投信近5日{'買超' if t5 > 0 else '賣超'}", 0.2 * math.tanh(t5 / 0.25)))
+    streak = int(m.get("streak") or 0)
+    if abs(streak) >= 3:
+        w = (0.15 if abs(streak) >= 5 else 0.10) * (1 if streak > 0 else -1)
+        s += w
+        notes.append((f"外資連續{abs(streak)}日{'買超' if streak > 0 else '賣超'}", w))
+    mc, r5 = _num(m.get("margin_chg5")), _num(m.get("r5")) or 0.0
+    if mc is not None:
+        if mc >= 0.05 and r5 < -0.02:
+            s -= 0.15
+            notes.append((f"融資增 {mc:+.1%} 但股價下跌，散戶接刀籌碼凌亂", -0.15))
+        elif mc <= -0.03 and r5 > 0.01:
+            s += 0.10
+            notes.append((f"融資減 {mc:+.1%} 而股價上漲，籌碼沉澱", 0.10))
+        elif mc >= 0.10:
+            s -= 0.05
+            notes.append((f"融資一週暴增 {mc:+.1%}，短線過熱", -0.05))
+    return clamp(s), notes
+
+
+def chips_us(m: dict) -> tuple[float | None, list[tuple[str, float]]]:
+    """m keys: congress_net (buys - sells, 90d), guru_net (adds - cuts among tracked 13F)."""
+    notes: list[tuple[str, float]] = []
+    cn, gn = _num(m.get("congress_net")), _num(m.get("guru_net"))
+    if cn is None and gn is None:
+        return None, notes
+    s = 0.0
+    if cn:
+        w = 0.5 * math.tanh(cn / 3)
+        s += w
+        notes.append((f"美國國會議員近90日淨{'買進' if cn > 0 else '賣出'} {abs(int(cn))} 筆", w))
+    if gn:
+        w = 0.5 * math.tanh(gn / 3)
+        s += w
+        notes.append((f"追蹤的名人基金上季淨{'加碼' if gn > 0 else '減碼'}（{int(gn):+d} 家）", w))
+    return clamp(s), notes
+
+
+# --------------------------------------------------------------------------- #
+# Fundamentals
+# --------------------------------------------------------------------------- #
+def _pe_score(pe: float | None, bands: tuple[float, float, float, float]) -> tuple[float, str | None]:
+    a, b, c, d = bands
+    if pe is None:
+        return 0.0, None
+    if pe <= 0:
+        return -0.10, "近四季虧損（本益比為負）"
+    if pe < a:
+        return 0.20, f"本益比 {pe:.1f} 倍，評價偏低"
+    if pe < b:
+        return 0.10, None
+    if pe < c:
+        return 0.0, None
+    if pe < d:
+        return -0.10, f"本益比 {pe:.1f} 倍，評價偏高"
+    return -0.20, f"本益比 {pe:.1f} 倍，評價昂貴"
+
+
+def fund_tw(m: dict) -> tuple[float | None, list[tuple[str, float]]]:
+    """m keys: rev_yoy, rev_mom, rev_cum_yoy (percent), pe, pb, yield (percent), eps."""
+    notes: list[tuple[str, float]] = []
+    yoy, pe = _num(m.get("rev_yoy")), _num(m.get("pe"))
+    if yoy is None and pe is None and _num(m.get("pb")) is None:
+        return None, notes
+    s = 0.0
+    if yoy is not None:
+        w = 0.35 * math.tanh(yoy / 30)
+        s += w
+        if abs(yoy) >= 10:
+            notes.append((f"月營收年增 {yoy:+.1f}%", w))
+    cum = _num(m.get("rev_cum_yoy"))
+    if cum is not None:
+        s += 0.15 * math.tanh(cum / 25)
+        if abs(cum) >= 15:
+            notes.append((f"累計營收年增 {cum:+.1f}%", 0.15 * math.tanh(cum / 25)))
+    mom = _num(m.get("rev_mom"))
+    if mom is not None:
+        s += 0.10 * math.tanh(mom / 20)
+    w, txt = _pe_score(pe, (12, 20, 30, 45))
+    s += w
+    if txt:
+        notes.append((txt, w))
+    dy = _num(m.get("yield"))
+    if dy is not None and dy >= 3:
+        w = 0.10 if dy >= 5 else 0.05
+        s += w
+        notes.append((f"殖利率 {dy:.1f}%", w))
+    pb = _num(m.get("pb"))
+    if pb is not None and 0 < pb < 1:
+        s += 0.05
+        notes.append((f"股價淨值比 {pb:.2f} 低於 1", 0.05))
+    eps = _num(m.get("eps"))
+    if eps is not None:
+        s += 0.05 if eps > 0 else -0.10
+        if eps < 0:
+            notes.append((f"最新一季 EPS {eps:.2f} 元為虧損", -0.10))
+    return clamp(s), notes
+
+
+def fund_us(m: dict) -> tuple[float | None, list[tuple[str, float]]]:
+    """m keys: eps_yoy, rev_yoy (percent), pe."""
+    notes: list[tuple[str, float]] = []
+    g, rv, pe = _num(m.get("eps_yoy")), _num(m.get("rev_yoy")), _num(m.get("pe"))
+    if g is None and rv is None and pe is None:
+        return None, notes
+    s = 0.0
+    if g is not None:
+        w = 0.40 * math.tanh(g / 40)
+        s += w
+        if abs(g) >= 10:
+            notes.append((f"最新一季 EPS 年增 {g:+.0f}%", w))
+    if rv is not None:
+        w = 0.35 * math.tanh(rv / 20)
+        s += w
+        if abs(rv) >= 8:
+            notes.append((f"最新一季營收年增 {rv:+.0f}%", w))
+    w, txt = _pe_score(pe, (15, 25, 40, 60))
+    s += w
+    if txt:
+        notes.append((txt, w))
+    return clamp(s), notes
+
+
+def buzz_score(mentions: int) -> float | None:
+    """Podcast mentions are attention, not direction: a small positive tilt only."""
+    if not mentions:
+        return 0.0
+    return clamp(0.3 * math.tanh(mentions / 3))
+
+
+# --------------------------------------------------------------------------- #
+# Blend + forecast
+# --------------------------------------------------------------------------- #
+def blend(horizon: str, parts: dict[str, float | None]) -> float:
+    w = WEIGHTS[horizon]
+    tot = sum(w[k] for k, v in parts.items() if v is not None and w.get(k))
+    if tot <= 0:
+        return 0.0
+    return clamp(sum(w[k] * v for k, v in parts.items() if v is not None and w.get(k)) / tot)
+
+
+def label(score: float) -> str:
+    if score >= 0.45:
+        return "強勢偏多"
+    if score >= 0.15:
+        return "偏多"
+    if score > -0.15:
+        return "中性"
+    if score > -0.45:
+        return "偏空"
+    return "強勢偏空"
+
+
+def forecast(last: float, dvol: float, score: float, days: int) -> dict:
+    """Probabilistic outlook: direction tilt from the score, width from realised vol.
+
+    The up-probability is deliberately capped at 28%..72% - factor models
+    do not justify more confidence than that.
+    """
+    dvol = dvol if dvol and math.isfinite(dvol) else 0.02
+    sigma = dvol * math.sqrt(days)
+    exp_ret = score * 0.6 * sigma
+    return {
+        "score": round(score, 3),
+        "label": label(score),
+        "p_up": round(clamp(0.5 + 0.22 * score, 0.28, 0.72), 3),
+        "exp_ret": round(exp_ret, 4),
+        "low": round(last * (1 + exp_ret - sigma), 2),
+        "high": round(last * (1 + exp_ret + sigma), 2),
+        "sigma": round(sigma, 4),
+    }
+
+
+def score_stock(tf: pd.DataFrame, chips: float | None, fund: float | None,
+                buzz: float | None) -> dict:
+    """Combine the latest technical row with the other factor groups."""
+    row = tf.iloc[-1]
+    last, dvol = float(row["close"]), _num(row["vol"]) or 0.02
+    out = {"horizons": {}}
+    overall = 0.0
+    for h, days in HORIZONS.items():
+        s = blend(h, {"tech": float(row[f"t_{h}"]), "chips": chips, "fund": fund, "buzz": buzz})
+        out["horizons"][h] = forecast(last, dvol, s, days)
+        overall += OVERALL[h] * s
+    out["overall"] = round(overall, 3)
+    out["label"] = label(overall)
+    out["factors"] = {
+        "trend": round(float(row["trend"]), 3),
+        "momentum": round(float(row["mom_m"]), 3),
+        "chips": None if chips is None else round(chips, 3),
+        "fund": None if fund is None else round(fund, 3),
+        "buzz": None if buzz is None else round(buzz, 3),
+    }
+    return out
+
+
+def trade_plan(row: pd.Series, f1m: dict, overall: float) -> dict:
+    """Reference levels (not orders): support, stop, target + a one-line stance."""
+    c, atr = float(row["close"]), _num(row.get("atr")) or float(row["close"]) * 0.03
+    ma20, ma60, rsi = _num(row.get("ma20")), _num(row.get("ma60")), _num(row.get("rsi")) or 50
+    support = ma20 if ma20 and ma20 < c else (ma60 if ma60 and ma60 < c else c - 1.5 * atr)
+    stop = min(c - 2.5 * atr, support - 0.5 * atr)
+    target = max(f1m["high"], c + 2 * atr)
+    if overall >= 0.45:
+        stance = "強勢股，偏多操作" + ("；RSI 過熱，等拉回月線附近再分批布局" if rsi >= 72 else "；可沿月線分批布局")
+    elif overall >= 0.15:
+        stance = "偏多看待，拉回支撐不破可分批承接" + ("；短線過熱勿追高" if rsi >= 72 else "")
+    elif overall > -0.15:
+        stance = "多空拉鋸，觀望為主，等待方向表態"
+    elif overall > -0.45:
+        stance = "偏空看待，反彈減碼、不宜攤平"
+    else:
+        stance = "弱勢股，避開或嚴設停損"
+    return {"support": round(support, 2), "stop": round(max(stop, 0.01), 2),
+            "target": round(target, 2), "stance": stance}
+
+
+# --------------------------------------------------------------------------- #
+# Walk-forward check of the technical score
+# --------------------------------------------------------------------------- #
+def backtest(frames: dict[str, pd.DataFrame], lookback_days: int = 750, step: int = 5) -> dict:
+    """Cross-sectional check: does today's technical score rank future returns?
+
+    frames: symbol -> tech_frame output (indexed by date). Uses only information
+    available at each date. Universe = today's constituents (survivorship bias!).
+    """
+    res = {}
+    for h, days in HORIZONS.items():
+        col = f"t_{h}"
+        scores = pd.DataFrame({s: f[col] for s, f in frames.items()})
+        closes = pd.DataFrame({s: f["close"] for s, f in frames.items()})
+        fwd = closes.shift(-days) / closes - 1
+        dates = scores.index[-lookback_days:-days:step] if len(scores) > days + 50 else []
+        ics, top, bot, allr = [], [], [], []
+        for d in dates:
+            s, r = scores.loc[d].dropna(), fwd.loc[d].dropna()
+            idx = s.index.intersection(r.index)
+            if len(idx) < 20:
+                continue
+            s, r = s[idx], r[idx]
+            ics.append(s.rank().corr(r.rank()))
+            k = max(1, len(idx) // 5)
+            order = s.sort_values()
+            top.append(r[order.index[-k:]].mean())
+            bot.append(r[order.index[:k]].mean())
+            allr.append(r.mean())
+        if not ics:
+            res[h] = None
+            continue
+        top_a, bot_a, all_a = np.array(top), np.array(bot), np.array(allr)
+        res[h] = {
+            "samples": len(ics),
+            "ic": round(float(np.nanmean(ics)), 3),
+            "top_ret": round(float(top_a.mean()), 4),
+            "bottom_ret": round(float(bot_a.mean()), 4),
+            "avg_ret": round(float(all_a.mean()), 4),
+            "top_beats_avg": round(float((top_a > all_a).mean()), 3),
+            "top_beats_bottom": round(float((top_a > bot_a).mean()), 3),
+        }
+    return res

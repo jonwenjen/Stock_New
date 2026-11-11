@@ -21,6 +21,13 @@ WEIGHTS = {
     "1m": {"tech": 0.45, "chips": 0.25, "fund": 0.25, "buzz": 0.05},
     "1q": {"tech": 0.40, "chips": 0.15, "fund": 0.45, "buzz": 0.00},
 }
+# US "chips" are congressional filings (up to 45 days late) and quarterly 13F holdings:
+# real information, but too slow to drive a one-week call, so they weigh less up front.
+WEIGHTS_SLOW_CHIPS = {
+    "1w": {"tech": 0.80, "chips": 0.10, "fund": 0.05, "buzz": 0.05},
+    "1m": {"tech": 0.50, "chips": 0.15, "fund": 0.30, "buzz": 0.05},
+    "1q": {"tech": 0.40, "chips": 0.15, "fund": 0.45, "buzz": 0.00},
+}
 OVERALL = {"1w": 0.3, "1m": 0.4, "1q": 0.3}
 
 
@@ -289,8 +296,8 @@ def buzz_score(mentions: int) -> float | None:
 # --------------------------------------------------------------------------- #
 # Blend + forecast
 # --------------------------------------------------------------------------- #
-def blend(horizon: str, parts: dict[str, float | None]) -> float:
-    w = WEIGHTS[horizon]
+def blend(horizon: str, parts: dict[str, float | None], weights: dict | None = None) -> float:
+    w = (weights or WEIGHTS)[horizon]
     tot = sum(w[k] for k, v in parts.items() if v is not None and w.get(k))
     if tot <= 0:
         return 0.0
@@ -329,15 +336,45 @@ def forecast(last: float, dvol: float, score: float, days: int) -> dict:
     }
 
 
+def _mix(parts: list[tuple[float, float | None]]) -> float | None:
+    """Weighted mean of the parts that exist; None when none does."""
+    tot = sum(w for w, v in parts if v is not None)
+    return clamp(sum(w * v for w, v in parts if v is not None) / tot) if tot else None
+
+
+def setup_tag(tactical: float | None, structural: float | None, tactical_prev: float | None = None) -> str | None:
+    """Name the combination of the slow (structural) and fast (tactical) reads."""
+    if tactical is None or structural is None:
+        return None
+    if structural >= 0.2 and tactical >= 0.15:
+        if tactical_prev is not None and tactical_prev < 0.15:
+            return "結構佳，短線剛轉強"
+        return "結構與短線同步偏多"
+    if structural >= 0.2 and tactical <= -0.15:
+        return "結構佳但短線偏弱，等轉強"
+    if structural <= -0.2 and tactical >= 0.15:
+        return "短線強但結構弱，僅宜短打"
+    if structural <= -0.2 and tactical <= -0.15:
+        return "結構與短線同步偏空"
+    return None
+
+
 def score_stock(tf: pd.DataFrame, chips: float | None, fund: float | None,
-                buzz: float | None) -> dict:
-    """Combine the latest technical row with the other factor groups."""
+                buzz: float | None, slow_chips: bool = False) -> dict:
+    """Combine the latest technical row with the other factor groups.
+
+    slow_chips marks positioning data that arrives weeks late (US filings). Besides the
+    horizon forecasts two summary reads are returned: `tactical` uses only inputs that
+    update daily (price action, daily flows, attention) and `structural` only those
+    that update monthly or quarterly (fundamentals, filed holdings).
+    """
     row = tf.iloc[-1]
     last, dvol = float(row["close"]), _num(row["vol"]) or 0.02
     out = {"horizons": {}}
     overall = 0.0
+    weights = WEIGHTS_SLOW_CHIPS if slow_chips else WEIGHTS
     for h, days in HORIZONS.items():
-        s = blend(h, {"tech": float(row[f"t_{h}"]), "chips": chips, "fund": fund, "buzz": buzz})
+        s = blend(h, {"tech": float(row[f"t_{h}"]), "chips": chips, "fund": fund, "buzz": buzz}, weights)
         out["horizons"][h] = forecast(last, dvol, s, days)
         overall += OVERALL[h] * s
     out["overall"] = round(overall, 3)
@@ -349,11 +386,23 @@ def score_stock(tf: pd.DataFrame, chips: float | None, fund: float | None,
         "fund": None if fund is None else round(fund, 3),
         "buzz": None if buzz is None else round(buzz, 3),
     }
+    tactical = _mix([(0.60, float(row["t_1w"])), (0.35, None if slow_chips else chips), (0.05, buzz)])
+    structural = _mix([(0.70, fund), (0.30, chips if slow_chips else None)])
+    out["tactical"] = None if tactical is None else round(tactical, 3)
+    out["structural"] = None if structural is None else round(structural, 3)
     return out
 
 
+RISK_BUDGET = 0.01   # share of the portfolio put at risk on one position
+MAX_POSITION = 0.25  # never suggest more than a quarter of the portfolio in one name
+
+
 def trade_plan(row: pd.Series, f1m: dict, overall: float) -> dict:
-    """Reference levels (not orders): support, stop, target + a one-line stance."""
+    """Reference levels (not orders): support, stop, target + a one-line stance.
+
+    Distances are measured in ATR (14-day average true range), so a volatile stock
+    gets a wider stop and therefore a smaller suggested position than a steady one.
+    """
     c, atr = float(row["close"]), _num(row.get("atr")) or float(row["close"]) * 0.03
     ma20, ma60, rsi = _num(row.get("ma20")), _num(row.get("ma60")), _num(row.get("rsi")) or 50
     support = ma20 if ma20 and ma20 < c else (ma60 if ma60 and ma60 < c else c - 1.5 * atr)
@@ -372,8 +421,15 @@ def trade_plan(row: pd.Series, f1m: dict, overall: float) -> dict:
     stop = max(stop, 0.01)
     # reward to the one-month target for each unit of risk down to the stop
     rr = (target - c) / (c - stop) if c > stop else None
+    stop_pct = (c - stop) / c if c > stop else None
+    # position that loses RISK_BUDGET of the portfolio if the stop is hit
+    size = min(MAX_POSITION, RISK_BUDGET / stop_pct) if stop_pct else None
     return {"support": round(support, 2), "stop": round(stop, 2), "target": round(target, 2),
-            "rr": None if rr is None else round(rr, 2), "stance": stance}
+            "rr": None if rr is None else round(rr, 2), "stance": stance,
+            "atr": round(atr, 2), "atr_pct": round(atr / c, 4),
+            "zone_high": round(min(c, support + atr), 2),
+            "stop_pct": None if stop_pct is None else round(stop_pct, 4),
+            "size": None if size is None else round(size, 3)}
 
 
 # --------------------------------------------------------------------------- #

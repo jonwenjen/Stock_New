@@ -9,6 +9,8 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Noto+Sans+TC:wght@400;500;700&display=swap">
 <link rel="stylesheet" href="style.css">
+<link rel="preload" href="data/summary.json" as="fetch" crossorigin>
+<link rel="preload" href="data/universe.json" as="fetch" crossorigin>
 </head>
 <body>
 <header class="mast">
@@ -18,8 +20,10 @@
       <div class="stamp" id="stamp"><span>資料載入中…</span></div>
       <button class="chip" id="updown" type="button" aria-pressed="false" title="切換漲跌配色">紅漲綠跌</button>
     </div>
-    <nav class="tabs" id="groups" aria-label="主要分類"></nav>
-    <nav class="subtabs" id="tabs" aria-label="分頁"></nav>
+    <nav class="tabs" id="groups" aria-label="主要分類">
+      <a href="#overview" aria-current="page">市場總覽</a><a href="#picks">核心選股</a><a href="#flows">籌碼與聰明錢</a><a href="#etf">資產配置</a><a href="#podcast">輿情與知識</a>
+    </nav>
+    <nav class="subtabs" id="tabs" aria-label="分頁"><a href="#overview" aria-current="page">總覽與預測</a><a href="#alerts">漲跌預警</a></nav>
   </div>
 </header>
 <main class="wrap"><div id="app" class="view"><div class="empty">資料載入中…</div></div></main>
@@ -28,6 +32,7 @@
   投資有風險，買賣前請自行判斷並控管部位。<span id="legend"></span>
 </p></div></footer>
 <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<script src="knowledge.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

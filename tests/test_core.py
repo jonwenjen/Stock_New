@@ -571,3 +571,165 @@ def test_leading_card_accepts_series_and_lists():
     from pipeline import build
     c = build._card("k", "名稱", "1.0", "+0.1", "說明", 1, pd.Series([1.23456, 2.0]))
     assert c["spark"] == [1.2346, 2.0] and build._card("k", "n", "v", "c", "r")["spark"] == []
+
+
+# ---------------- second batch of indicators ----------------
+def test_option_expiry_dates_and_max_pain():
+    from pipeline import leading
+    assert leading.expiry_date("202611") == dt.date(2026, 11, 18)        # third Wednesday
+    assert leading.expiry_date("202611W2") == dt.date(2026, 11, 11)
+    assert leading.expiry_date("202611F2") == dt.date(2026, 11, 13)
+    assert leading.expiry_date("bad") is None and leading.expiry_date("202613") is None
+    # holders of 100 calls struck at 90 and 100 puts struck at 110 collect least at 100
+    assert leading.max_pain({90.0: (100, 0), 100.0: (10, 10), 110.0: (0, 100)}) == 100.0
+    assert leading.max_pain({}) is None
+
+
+def test_option_walls_pick_live_wednesday_expiry():
+    from pipeline import leading
+    def row(code, strike, cp, oi, session="一般", contract="TXO"):
+        return {"Contract": contract, "ContractMonth(Week)": code, "StrikePrice": str(strike), "CallPut": cp,
+                "OpenInterest": str(oi), "TradingSession": session}
+    rows = [row("202611W2", 100, "買權", 999),                                   # expires on the build day: skipped
+            row("202611F2", 100, "買權", 999),                                   # Friday weekly: skipped
+            row("202611", 90, "賣權", 500), row("202611", 95, "賣權", 300), row("202611", 100, "買權", 50),
+            row("202611", 105, "買權", 400), row("202611", 110, "買權", 700), row("202611", 80, "買權", 900),
+            row("202611", 110, "買權", 5000, session="盤後"), row("202611", 110, "買權", 5000, contract="TEO")]
+    walls = leading.option_walls(rows, dt.date(2026, 11, 11), spot=100.0)
+    assert len(walls) == 1 and walls[0]["code"] == "202611" and walls[0]["monthly"]
+    w = walls[0]
+    assert w["call_wall"] == 110.0      # the deep in-the-money 80 call is below the index and does not count
+    assert w["put_wall"] == 90.0 and w["call_oi"] == 2050 and w["put_oi"] == 800
+    assert leading.trim_ladder(w["ladder"], 2) == [[80.0, 900.0, 0.0], [110.0, 700.0, 0.0]]
+    assert leading.option_walls(rows, dt.date(2026, 12, 1), spot=100.0) == []
+
+
+def test_large_traders_and_futures_basis():
+    from pipeline import leading
+    rows = [{"Date": "20261110", "Contract": "TX", "SettlementMonth": "202611", "TypeOfTraders": "0",
+             "Top10Buy": "10", "Top10Sell": "5", "OIOfMarket": "100"},
+            {"Date": "20261110", "Contract": "TX", "SettlementMonth": "999999", "TypeOfTraders": "0",
+             "Top10Buy": "300", "Top10Sell": "500", "OIOfMarket": "1000"},
+            {"Date": "20261110", "Contract": "TX", "SettlementMonth": "999999", "TypeOfTraders": "1",
+             "Top10Buy": "900", "Top10Sell": "0", "OIOfMarket": "1000"}]
+    lt = leading.large_traders(rows)
+    assert lt == {"date": "2026-11-10", "net": -200.0, "oi": 1000.0, "ratio": -0.2}
+    assert leading.large_traders(rows[:1])["net"] == 5.0 and leading.large_traders([]) is None
+    fut = [{"Date": "20261110", "Contract": "TX", "ContractMonth(Week)": "202612", "SettlementPrice": "43000", "TradingSession": "一般"},
+           {"Date": "20261110", "Contract": "TX", "ContractMonth(Week)": "202611", "SettlementPrice": "42646", "TradingSession": "一般"},
+           {"Date": "20261110", "Contract": "TX", "ContractMonth(Week)": "202611", "SettlementPrice": "NULL", "TradingSession": "盤後"},
+           {"Date": "20261110", "Contract": "TX", "ContractMonth(Week)": "202611/202612", "SettlementPrice": "350", "TradingSession": "一般"}]
+    assert leading.futures_basis(fut) == {"date": "2026-11-10", "month": "202611", "settle": 42646.0}
+    assert leading.futures_basis([]) is None
+
+
+def test_trust_first_buys_need_a_quiet_spell_then_a_streak():
+    from pipeline import leading
+    quiet = [(0, 0)] * 12
+    flows = {"1111": quiet + [(5000, 300_000), (-1000, 400_000)],                 # 2-day streak after 12 quiet days
+             "2222": [(0, 100_000)] + quiet + [(0, 300_000), (0, 400_000)],       # bought earlier in the window
+             "3333": quiet + [(0, 300_000)],                                      # one day is not a streak
+             "4444": quiet + [(0, 1000), (0, 1000)],                              # too small
+             "5555": [(0, -50_000)] * 12 + [(0, 300_000), (0, 400_000)]}          # selling before counts as quiet
+    hits = leading.trust_first_buys(flows, {c: 100.0 for c in flows})
+    assert [h["code"] for h in hits] == ["1111", "5555"]
+    assert hits[0]["streak"] == 2 and hits[0]["quiet"] == 12 and hits[0]["value"] == pytest.approx(0.7)
+    assert hits[0]["foreign_value"] == pytest.approx(0.004)
+    assert leading.trust_first_buys(flows, {}) == []
+
+
+def test_margin_cost_rolls_forward_and_gives_a_maintenance_ratio():
+    from pipeline import leading
+    assert leading.roll_margin_cost(None, 0, 100, 50.0) == 50.0                   # first sight: seeded at the close
+    assert leading.roll_margin_cost(50.0, 100, 200, 60.0) == pytest.approx(55.0)  # 100 new lots at 60
+    assert leading.roll_margin_cost(55.0, 200, 120, 40.0) == pytest.approx(55.0)  # lots leaving keep the average
+    assert leading.roll_margin_cost(55.0, 200, 0, 40.0) == 55.0
+    assert leading.stock_maintenance(100.0, 100.0) == pytest.approx(1 / 0.6)      # bought today: the initial 166.7%
+    assert leading.stock_maintenance(100.0, 78.0) == pytest.approx(1.30)          # a 22% fall reaches the call line
+    assert leading.stock_maintenance(None, 78.0) is None
+
+
+def test_expected_quarter_and_liability_growth():
+    from pipeline import leading
+    assert leading.expected_quarter(dt.date(2026, 11, 11)) == "2026-06-30"       # Q3 is due on 11/14
+    assert leading.expected_quarter(dt.date(2026, 11, 20)) == "2026-09-30"
+    assert leading.expected_quarter(dt.date(2026, 2, 1)) == "2025-09-30"         # the annual report has until end of March
+    assert leading.expected_quarter(dt.date(2026, 4, 5)) == "2025-12-31"
+    q = {"2025-06-30": {"value": 80.0}, "2025-09-30": {"value": 100.0}, "2025-12-31": {"value": 90.0},
+         "2026-03-31": {"value": 100.0}, "2026-06-30": {"value": 130.0, "share": 35.0}, "2026-09-30": {}}
+    g = leading.liability_growth(q)
+    assert g["quarter"] == "2026-06-30" and g["qoq"] == pytest.approx(0.3) and g["yoy"] == pytest.approx(0.625)
+    assert g["share"] == 35.0
+    assert leading.liability_growth({"2026-06-30": {"value": 1.0}}) is None
+
+
+def test_risk_regime_states():
+    from pipeline import leading
+    idx = pd.bdate_range("2026-01-01", periods=80)
+    flat, rising, falling = pd.Series(1.0, index=idx), pd.Series(np.linspace(1, 2, 80), index=idx), pd.Series(np.linspace(2, 1, 80), index=idx)
+    tight, wide = pd.Series(3.0, index=idx), pd.Series(4.5, index=idx)
+    jump = pd.Series([3.0] * 70 + [3.7] * 10, index=idx)
+    assert leading.risk_regime(tight, rising)["state"] == "risk_on"
+    assert leading.risk_regime(wide, falling)["state"] == "risk_off"
+    assert leading.risk_regime(jump, falling)["state"] == "risk_off"             # tight level, but widening fast
+    assert leading.risk_regime(tight, falling)["state"] == "mixed"               # rotation, not a credit problem
+    assert leading.risk_regime(wide, rising)["state"] == "mixed"
+    assert leading.risk_regime(tight.head(5), flat) is None
+
+
+def test_advance_decline_counts_common_stocks_only():
+    from pipeline import leading
+    before = {f"{1000 + i}": 10.0 for i in range(300)}
+    now = {c: (11.0 if i < 180 else 9.0 if i < 280 else 10.0) for i, c in enumerate(before)}
+    assert leading.advance_decline({**now, "0050": 99.0}, {**before, "0050": 1.0}) == (180, 100)
+    assert leading.advance_decline({"1101": 2.0}, {"1101": 1.0}) is None         # too few names to mean anything
+
+
+def test_tactical_structural_and_slow_chip_weights():
+    tf = scoring.tech_frame(make_df(trend(400, 0.003)))
+    fast = scoring.score_stock(tf, 0.8, -0.5, 0.0)
+    slow = scoring.score_stock(tf, 0.8, -0.5, 0.0, slow_chips=True)
+    t1w = float(tf["t_1w"].iloc[-1])
+    assert fast["tactical"] == pytest.approx((0.60 * t1w + 0.35 * 0.8) / 1.0, abs=1e-3)
+    assert fast["structural"] == pytest.approx(-0.5)                              # daily flows are not structural
+    assert slow["tactical"] == pytest.approx(0.60 * t1w / 0.65, abs=1e-3)         # late filings are not tactical
+    assert slow["structural"] == pytest.approx(0.7 * -0.5 + 0.3 * 0.8)
+    # filings weigh 10% of a one-week call instead of 35%
+    assert slow["horizons"]["1w"]["score"] == pytest.approx(0.80 * t1w + 0.10 * 0.8 + 0.05 * -0.5, abs=2e-3)
+    assert scoring.score_stock(tf, None, None, None)["structural"] is None
+    assert scoring.setup_tag(0.3, 0.4) == "結構與短線同步偏多"
+    assert scoring.setup_tag(0.3, 0.4, tactical_prev=0.0) == "結構佳，短線剛轉強"
+    assert scoring.setup_tag(-0.3, 0.4) == "結構佳但短線偏弱，等轉強"
+    assert scoring.setup_tag(0.3, -0.4) == "短線強但結構弱，僅宜短打"
+    assert scoring.setup_tag(0.0, 0.4) is None and scoring.setup_tag(None, 0.4) is None
+
+
+def test_trade_plan_sizes_positions_by_volatility():
+    calm, wild = make_df(trend(300, 0.001, seed=3)), make_df(trend(300, 0.001, seed=3))
+    wild["high"], wild["low"] = wild["close"] * 1.05, wild["close"] * 0.95
+    plans = []
+    for df in (calm, wild):
+        tf = scoring.tech_frame(df)
+        sc = scoring.score_stock(tf, None, None, None)
+        plans.append(scoring.trade_plan(tf.iloc[-1], sc["horizons"]["1m"], sc["overall"]))
+    a, b = plans
+    assert b["atr_pct"] > a["atr_pct"] and b["stop_pct"] > a["stop_pct"] and b["size"] < a["size"]
+    for p in plans:
+        assert p["size"] == pytest.approx(min(0.25, 0.01 / p["stop_pct"]), abs=1e-3)
+        assert p["stop"] < p["support"] <= p["zone_high"]
+
+
+def test_calibrate_costs_matches_market_ratio_then_respects_call_line():
+    from pipeline import leading
+    book = {"1111": [100.0, 1000], "2222": [50.0, 1000], "3333": [200.0, 10]}
+    closes = {"1111": 100.0, "2222": 60.0, "3333": 100.0}
+    leading.calibrate_costs(book, closes, market_maint=1.60)
+    value = sum(v[1] * closes[c] for c, v in book.items())
+    loan = sum(v[1] * v[0] * 0.6 for v in book.values())
+    # 3333 was far under water: it is pulled up to the call line, which lifts the total a little above 160%
+    assert leading.stock_maintenance(book["3333"][0], 100.0) == pytest.approx(1.30)
+    assert 1.60 <= value / loan < 1.62
+    assert book["2222"][0] < book["1111"][0]                                      # relative order is kept
+    untouched = {"1111": [100.0, 1000]}
+    leading.calibrate_costs(untouched, {"1111": 100.0}, None)                     # no market figure: only the floor applies
+    assert untouched["1111"][0] == 100.0

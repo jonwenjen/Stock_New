@@ -16,26 +16,16 @@
     <div class="mast-row">
       <div class="brand">週三<span>選股雷達</span></div>
       <div class="stamp" id="stamp"><span>資料載入中…</span></div>
+      <button class="chip" id="updown" type="button" aria-pressed="false" title="切換漲跌配色">紅漲綠跌</button>
     </div>
-    <nav class="tabs" id="tabs" aria-label="主要分頁">
-      <a href="#overview">總覽與預測</a>
-      <a href="#picks">精選 20 檔</a>
-      <a href="#flows">外資法人</a>
-      <a href="#margin">融資融券</a>
-      <a href="#smart">名人・議員・董監</a>
-      <a href="#fund">財報指標</a>
-      <a href="#etf">ETF</a>
-      <a href="#funds">基金</a>
-      <a href="#alerts">漲跌預警</a>
-      <a href="#podcast">Podcast</a>
-      <a href="#method">方法與來源</a>
-    </nav>
+    <nav class="tabs" id="groups" aria-label="主要分類"></nav>
+    <nav class="subtabs" id="tabs" aria-label="分頁"></nav>
   </div>
 </header>
 <main class="wrap"><div id="app" class="view"><div class="empty">資料載入中…</div></div></main>
 <footer><div class="wrap"><p class="disclaimer">
   本站為程式自動彙整的研究資訊，所有分數、機率、價位皆為模型推估，不構成任何投資建議，亦不保證獲利。
-  投資有風險，買賣前請自行判斷並控管部位。顏色採台股慣例：<span class="up">紅＝上漲／買超</span>、<span class="down">綠＝下跌／賣超</span>。
+  投資有風險，買賣前請自行判斷並控管部位。<span id="legend"></span>
 </p></div></footer>
 <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 <script src="app.js"></script>

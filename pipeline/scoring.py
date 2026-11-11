@@ -237,6 +237,21 @@ def fund_tw(m: dict) -> tuple[float | None, list[tuple[str, float]]]:
         s += 0.05 if eps > 0 else -0.10
         if eps < 0:
             notes.append((f"最新一季 EPS {eps:.2f} 元為虧損", -0.10))
+    # Revenue momentum: 3-month average against the 12-month average (monthly filings lead quarterly reports).
+    ratio = _num(m.get("rev_ratio"))
+    if ratio is not None:
+        if m.get("rev_cross_up"):
+            s += 0.10
+            notes.append(("近 3 月平均營收剛站上 12 月均線，營運轉強", 0.10))
+        elif m.get("rev_cross_down"):
+            s -= 0.10
+            notes.append(("近 3 月平均營收跌破 12 月均線，營運轉弱", -0.10))
+        elif ratio >= 1.10:
+            s += 0.05
+            notes.append((f"近 3 月營收高於年均 {ratio - 1:.0%}", 0.05))
+        elif ratio <= 0.90:
+            s -= 0.05
+            notes.append((f"近 3 月營收低於年均 {1 - ratio:.0%}", -0.05))
     return clamp(s), notes
 
 
@@ -354,8 +369,11 @@ def trade_plan(row: pd.Series, f1m: dict, overall: float) -> dict:
         stance = "偏空看待，反彈減碼、不宜攤平"
     else:
         stance = "弱勢股，避開或嚴設停損"
-    return {"support": round(support, 2), "stop": round(max(stop, 0.01), 2),
-            "target": round(target, 2), "stance": stance}
+    stop = max(stop, 0.01)
+    # reward to the one-month target for each unit of risk down to the stop
+    rr = (target - c) / (c - stop) if c > stop else None
+    return {"support": round(support, 2), "stop": round(stop, 2), "target": round(target, 2),
+            "rr": None if rr is None else round(rr, 2), "stance": stance}
 
 
 # --------------------------------------------------------------------------- #

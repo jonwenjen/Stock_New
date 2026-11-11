@@ -11,10 +11,10 @@
   --line-soft: #ebeef3;
   --accent: #1d4fcf;
   --accent-soft: #e6edfc;
-  --up: #d93a3a;
-  --up-soft: #fbe9e9;
-  --down: #0f8f6b;
-  --down-soft: #e1f4ee;
+  --rise: #d93a3a;
+  --rise-soft: #fbe9e9;
+  --fall: #0f8f6b;
+  --fall-soft: #e1f4ee;
   --warn: #9a6400;
   --warn-soft: #fdf1d6;
   --ma1: #2a78d6;
@@ -29,7 +29,7 @@
   :root:not([data-theme="light"]) {
     --bg: #0e1117; --surface: #161a22; --surface-2: #1b2029; --ink: #e9ecf1; --ink-2: #aab3c0;
     --ink-3: #7d8796; --line: #2a313d; --line-soft: #212731; --accent: #7fa4ff; --accent-soft: #1c2740;
-    --up: #e25555; --up-soft: #3a1d1f; --down: #17997a; --down-soft: #12302a; --warn: #e0a83a;
+    --rise: #e25555; --rise-soft: #3a1d1f; --fall: #17997a; --fall-soft: #12302a; --warn: #e0a83a;
     --warn-soft: #33290f; --ma1: #3987e5; --ma2: #d95926; --ma3: #9085e9;
     --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 8px 24px rgba(0, 0, 0, .35); color-scheme: dark;
   }
@@ -37,10 +37,14 @@
 :root[data-theme="dark"] {
   --bg: #0e1117; --surface: #161a22; --surface-2: #1b2029; --ink: #e9ecf1; --ink-2: #aab3c0;
   --ink-3: #7d8796; --line: #2a313d; --line-soft: #212731; --accent: #7fa4ff; --accent-soft: #1c2740;
-  --up: #e25555; --up-soft: #3a1d1f; --down: #17997a; --down-soft: #12302a; --warn: #e0a83a;
+  --rise: #e25555; --rise-soft: #3a1d1f; --fall: #17997a; --fall-soft: #12302a; --warn: #e0a83a;
   --warn-soft: #33290f; --ma1: #3987e5; --ma2: #d95926; --ma3: #9085e9;
   --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 8px 24px rgba(0, 0, 0, .35); color-scheme: dark;
 }
+
+/* Which colour means "up" is a convention, so it is one indirection away from the palette. */
+:root { --up: var(--rise); --up-soft: var(--rise-soft); --down: var(--fall); --down-soft: var(--fall-soft); }
+:root[data-updown="us"] { --up: var(--fall); --up-soft: var(--fall-soft); --down: var(--rise); --down-soft: var(--rise-soft); }
 
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
@@ -89,6 +93,12 @@ button { font: inherit; color: inherit; }
 }
 .tabs a:hover { color: var(--ink); }
 .tabs a[aria-current="page"] { color: var(--accent); border-bottom-color: var(--accent); }
+.subtabs { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; padding-block: 8px; border-top: 1px solid var(--line-soft); }
+.subtabs::-webkit-scrollbar { display: none; }
+.subtabs a { flex: none; padding: 3px 12px; font-size: 13.5px; color: var(--ink-2); text-decoration: none; border-radius: 999px; border: 1px solid transparent; white-space: nowrap; }
+.subtabs a:hover { color: var(--ink); border-color: var(--line); }
+.subtabs a[aria-current="page"] { background: var(--accent-soft); color: var(--accent); font-weight: 500; }
+#updown { cursor: pointer; }
 
 main { padding-block: 20px 56px; }
 .view { display: flex; flex-direction: column; gap: 20px; }
@@ -179,7 +189,7 @@ th[aria-sort="ascending"]::after { content: " ↑"; }
 .why li::before { position: absolute; left: 0; font-size: 11px; top: 3px; }
 .why li.pro::before { content: "▲"; color: var(--up); }
 .why li.con::before { content: "▼"; color: var(--down); }
-.plan { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; border-top: 1px solid var(--line-soft); padding-top: 10px; }
+.plan { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; border-top: 1px solid var(--line-soft); padding-top: 10px; }
 .plan div { min-width: 0; }
 .plan .k { font-size: 12px; color: var(--ink-3); }
 .plan .v { font-size: 14px; }
@@ -246,9 +256,16 @@ footer { border-top: 1px solid var(--line); padding-block: 18px 32px; }
   body { font-size: 14.5px; }
   .chart { height: 300px; }
   .stamp { margin-left: 0; }
-  .plan { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .plan { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (prefers-reduced-motion: no-preference) {
   .drawer { animation: slide .18s ease-out; }
   @keyframes slide { from { transform: translateX(24px); opacity: .6; } to { transform: none; opacity: 1; } }
 }
+
+/* ---------- leading indicator cards ---------- */
+.leads { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 270px), 1fr)); gap: 12px; }
+.lead-card { border: 1px solid var(--line); border-radius: var(--r); padding: 12px; display: grid; gap: 6px; align-content: start; min-width: 0; background: var(--surface-2); }
+.lead-card .nm { font-size: 13px; color: var(--ink-2); font-weight: 500; }
+.lead-card .lv { font-size: 19px; font-weight: 500; }
+.lead-card svg { width: 100%; height: 28px; display: block; }

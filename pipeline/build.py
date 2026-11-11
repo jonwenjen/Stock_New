@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import funds, http, indicators, media, prices, scoring, twse, us_data
+from . import funds, http, indicators, leading, media, prices, scoring, twse, us_data
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "docs" / "data"
@@ -434,6 +434,9 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     mres = safe("證交所 個股融資 (逐日) 與融資維持率", lambda: update_maintenance(flows), None, "https://www.twse.com.tw")
     margin_ref_date, margin_ref, closes_5, closes_20 = mres if mres else (None, {}, {}, {})
 
+    rev_hist = safe("公開資訊觀測站 月營收歷史", lambda: update_revenue_history(revenue), {},
+                    "https://mopsov.twse.com.tw")
+
     # ---- 3. universes -------------------------------------------------------
     forced = [k for k in CFG["aliases"] if k.isdigit()]
     ranked = sorted((c for c in quotes if twse.COMMON_STOCK.match(c) and quotes[c]["value"]),
@@ -606,6 +609,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                 t = [x[1] for x in fl]
                 chips_in.update({"f5": sum(f[-5:]) / avgvol, "f20": sum(f) / avgvol, "t5": sum(t[-5:]) / avgvol,
                                  "streak": twse.streak(f)})
+                rec["f5_adv"] = chips_in["f5"]
                 rec.update({"foreign5": sum(f[-5:]) / 1000, "foreign20": sum(f) / 1000,
                             "trust5": sum(t[-5:]) / 1000, "foreign_streak": chips_in["streak"],
                             "foreign5_value": sum(f[-5:]) * last / 1e8})
@@ -617,6 +621,12 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                     chips_in["margin_chg5"] = rec["margin_chg5"] = mg / mg0 - 1
             chips, cn = scoring.chips_tw(chips_in)
             fund_in = {**valuation.get(code, {}), **revenue.get(code, {}), **eps.get(code, {})}
+            rm = leading.revenue_momentum({ym: t[code] for ym, t in rev_hist.items() if t.get(code)})
+            if rm:
+                fund_in.update({"rev_ratio": rm["ratio"], "rev_cross_up": rm["cross_up"],
+                                "rev_cross_down": rm["cross_down"]})
+                rec.update({"rev_ratio": rm["ratio"], "rev_cross": "up" if rm["cross_up"] else
+                            "down" if rm["cross_down"] else None, "rev_rising": rm["rising"]})
             fund, fn = scoring.fund_tw(fund_in)
             rec.update({k: fund_in.get(k) for k in ("pe", "pb", "yield", "rev_yoy", "rev_mom",
                                                     "rev_cum_yoy", "eps", "eps_period", "month")})
@@ -685,6 +695,22 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         etf_records.append(etf_record(s, frames[s], tframes[s], m, flow_map, mentions.get(s, 0)))
     etf_records.sort(key=lambda r: -r["overall"])
     by_sym = {r["symbol"]: r for r in records + etf_records}
+    # Mentions per ISO week, so "new this week" can be told from "still being talked about".
+    week_key = "{}-W{:02d}".format(*dt.date.fromisoformat(trading_days[-1]).isocalendar()[:2])
+    mention_hist = read_json(DATA / "history" / "podcast_mentions.json", {})
+    mention_hist[week_key] = dict(mentions)
+    mention_hist = {k: mention_hist[k] for k in sorted(mention_hist)[-26:]}
+    write_json(DATA / "history" / "podcast_mentions.json", mention_hist)
+    past_weeks = [mention_hist[k] for k in sorted(mention_hist) if k < week_key][::-1]
+
+    def talk_weeks(sym: str) -> int:
+        n = 1
+        for wk in past_weeks:
+            if sym not in wk:
+                break
+            n += 1
+        return n
+
     hot = []
     for s, n in sorted(mentions.items(), key=lambda kv: -kv[1]):
         r = by_sym.get(s)
@@ -695,7 +721,10 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                for sh in shows for e in sh["episodes"] if s in e.get("mentions", [])]
         hot.append({**{k: r.get(k) for k in ("symbol", "code", "name", "market", "industry", "close", "chg5d",
                                              "r20", "rsi", "overall", "label", "horizons", "reasons", "risks")},
-                    "kind": r.get("kind", "stock"), "mentions": n, "episodes": eps[:6], "view": hot_view(r, n)})
+                    "kind": r.get("kind", "stock"), "mentions": n, "episodes": eps[:6], "view": hot_view(r, n),
+                    "weeks": talk_weeks(s),
+                    "signal": leading.attention_signal(n, talk_weeks(s), r.get("f5_adv"), r.get("margin_chg5"))
+                    if r["market"] == "TW" else None})
 
     # ---- 8c. mutual funds: provider figures + our own evaluation --------------
     fund_cfg = CFG.get("funds", {})
@@ -723,6 +752,16 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     if not fund_records:  # source down: keep last week's table
         fund_records = read_json(DATA / "funds.json", [])
     fund_records.sort(key=lambda r: -(r["score"] if r.get("score") is not None else -1))
+
+    # ---- 8d. leading indicators and the record of past picks ------------------
+    lead = build_leading(frames, tframes, stocks, meta, flows, quotes)
+    cohorts = [c for c in read_json(DATA / "history" / "picks.json", []) if c["date"] != trading_days[-1]]
+    cohorts.append({"date": trading_days[-1],
+                    "picks": [{"symbol": r["symbol"], "name": r["name"], "market": r["market"], "close": r["close"]}
+                              for r in picks]})
+    cohorts = cohorts[-60:]
+    write_json(DATA / "history" / "picks.json", cohorts)
+    track = leading.cohort_results(cohorts[:-1], frames, {"TW": "TWII", "US": "SPX"})
 
     # ---- 9. market outlook --------------------------------------------------
     def breadth(market: str) -> float | None:
@@ -802,6 +841,8 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         "indices": [{k: i.get(k) for k in ("name", "close", "chg5d", "r20", "ytd", "rsi", "horizons")}
                     for i in indices_out],
         "tw_flow": tw_flow, "narrative": narrative, "backtest": bt,
+        "leading": [{k: c.get(k) for k in ("name", "value_text", "change_text", "reading")} for c in lead["cards"]],
+        "picks_track": track[-8:],
         "picks": [brief(r) for r in picks],
         "bullish": [brief(r) for r in bullish[:8]], "bearish": [brief(r) for r in bearish[:8]],
         "podcast_hot": [{**{k: h[k] for k in ("symbol", "name", "market", "industry", "close", "chg5d", "r20",
@@ -870,7 +911,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         "foreign_buy": top_flow(0, 1) if flow_map else [], "foreign_sell": top_flow(0, -1) if flow_map else [],
         "trust_buy": top_flow(1, 1) if flow_map else [], "trust_sell": top_flow(1, -1) if flow_map else [],
         "margin_up": margin_moves[:15], "margin_down": margin_moves[::-1][:15], "margin_ref_date": margin_ref_date,
-        "margin_risk": margin_risk[:20]})
+        "margin_risk": margin_risk[:20], "sbl": lead.get("sbl")})
 
     tw_ins = []
     for r in records:
@@ -892,6 +933,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                                         "names": {s: meta[s]["name"] for s in mentions if s in meta}})
     write_json(DATA / "etf.json", etf_records)
     write_json(DATA / "funds.json", fund_records)
+    write_json(DATA / "leading.json", {"cards": lead["cards"], "series": lead["series"]})
     write_json(DATA / "tools.json", tools)
     slim = lambda r: {k: v for k, v in r.items() if k not in ("bars",)}  # noqa: E731
     write_json(DATA / "universe.json", [slim(r) for r in sorted(records, key=lambda r: -r["overall"])])
@@ -901,7 +943,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         "indices": indices_out, "tw_flow": tw_flow, "narrative": narrative,
         "picks": [slim(r) for r in picks],
         "bullish": [slim(r) for r in bullish], "bearish": [slim(r) for r in bearish],
-        "backtest": bt, "weights": scoring.WEIGHTS, "sources": SOURCES,
+        "backtest": bt, "weights": scoring.WEIGHTS, "sources": SOURCES, "picks_track": track,
         "counts": {"tw": sum(r["market"] == "TW" for r in records),
                    "us": sum(r["market"] == "US" for r in records), "etf": len(etf_records),
                    "fund": len(fund_records)}})
@@ -910,6 +952,155 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         f"{len(hot)} podcast-hot, "
         f"failed sources: {bad or 'none'}")
     return 0
+
+
+def update_revenue_history(revenue: dict) -> dict[str, dict]:
+    """Monthly revenue per company for the last 15 months: {'YYYY-MM': {code: thousand TWD}}.
+
+    The exchange's open data only has the latest month, so older months come once from
+    the MOPS archive (one page per month) and are kept in history/tw_revenue.json.
+    """
+    path = DATA / "history" / "tw_revenue.json"
+    hist: dict[str, dict] = read_json(path, {})
+    for code, r in revenue.items():  # latest month straight from the open data
+        if r.get("month") and r.get("revenue"):
+            hist.setdefault(r["month"], {})[code] = r["revenue"]
+    if not hist:
+        raise RuntimeError("no monthly revenue to anchor the history")
+    y, m = (int(x) for x in max(hist).split("-"))
+    wanted = []
+    for _ in range(3 if QUICK else 15):
+        wanted.append(f"{y}-{m:02d}")
+        y, m = (y - 1, 12) if m == 1 else (y, m - 1)
+    for ym in wanted:
+        if len(hist.get(ym, {})) >= 500:
+            continue
+        try:
+            hist.setdefault(ym, {}).update(leading.mops_revenue(ym))
+        except Exception as e:  # noqa: BLE001 - archive page missing or refused: try again next run
+            log(f"  revenue {ym}: {e}")
+    hist = {k: hist[k] for k in sorted(hist)[-15:]}
+    write_json(path, hist)
+    return hist
+
+
+def _card(key: str, name: str, value_text: str, change_text: str, reading: str, tone: int = 0,
+          spark=None) -> dict:
+    return {"key": key, "name": name, "value_text": value_text, "change_text": change_text,
+            "reading": reading, "tone": tone,
+            "spark": [] if spark is None else [round(float(x), 4) for x in spark]}
+
+
+def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, flows: list[dict],
+                  quotes: dict) -> dict:
+    """Indicators that tend to move before prices do. Shown for context only: none of
+    them feeds the scores, because this site has no history yet to test them on.
+    Each indicator is built on its own, so one failing source costs one card."""
+    cards, series, extra = [], {}, {"sbl": None}
+    pp = lambda x: f"{x * 100:+.1f} 個百分點"  # noqa: E731
+    dated = lambda sr, n=250: [[d.strftime("%Y-%m-%d"), round(float(v), 4)] for d, v in sr.tail(n).items()]  # noqa: E731
+    by_date = {r["date"]: r for r in flows}
+
+    def adr():
+        prem = leading.adr_premium(frames["TSM"]["close"], frames["2330.TW"]["close"], frames["USDTWD"]["close"])
+        now, ago, pct = float(prem.iloc[-1]), float(prem.iloc[-21]), leading.percentile(prem)
+        series["adr"] = dated(prem)
+        cards.append(_card("adr", "台積電 ADR 溢價", f"{now:.1%}", f"20 日 {pp(now - ago)}",
+                           f"高於過去一年 {pct:.0%} 的日子。溢價擴大代表海外買盤對台積電的出價高於台股，"
+                           "常被視為外資回補的前兆；收斂則相反。", 1 if now > ago else -1, prem.tail(60)))
+
+    def fx():
+        c = frames["USDTWD"]["close"]
+        r20, weak = float(c.iloc[-1] / c.iloc[-21] - 1), bool(c.iloc[-1] > c.tail(20).mean())
+        cards.append(_card("fx", "美元／台幣", f"{c.iloc[-1]:.2f}", f"20 日 {r20:+.1%}",
+                           ("台幣走貶、匯率在月線之上，外資匯出壓力仍在。" if weak else
+                            "台幣走升、匯率跌破月線，通常伴隨外資匯入。")
+                           + f"資料日 {c.index[-1]:%m/%d}（Fed 公布有數日落差）。", -1 if weak else 1, c.tail(60)))
+
+    def real_yield():
+        ry = prices.fred_daily("DFII10")["close"]
+        chg = float(ry.iloc[-1] - ry.iloc[-21])
+        cards.append(_card("real", "美國 10 年期實質殖利率", f"{ry.iloc[-1]:.2f}%", f"20 日 {chg:+.2f} 個百分點",
+                           "實質利率上升會壓縮成長股評價，下降則有利科技股與新興市場資金流入。",
+                           -1 if chg > 0.05 else 1 if chg < -0.05 else 0, ry.tail(60)))
+
+    def vix_term():
+        ts = leading.term_structure(frames["VIX"]["close"], prices.cboe_daily("_VIX3M")["close"])
+        now = float(ts.iloc[-1])
+        series["vix_term"] = dated(ts)
+        cards.append(_card("vixts", "VIX 期限結構（VIX ÷ VIX3M）", f"{now:.2f}", f"5 日 {now - float(ts.iloc[-6]):+.2f}",
+                           ("高於 1：短期恐慌高過三個月後的預期，屬於恐慌狀態；由高點回落常出現在急跌尾聲。"
+                            if now >= 1 else "低於 1：屬正常狀態，短期避險需求不高。"), -1 if now >= 1 else 0, ts.tail(60)))
+
+    def breadth_of(mk: str, label: str):
+        fs = {s: tframes[s] for s in stocks if meta[s]["market"] == mk}
+        b = leading.breadth(fs)
+        a20, a60 = float(b["above20"].iloc[-1]), float(b["above60"].iloc[-1])
+        series[f"breadth_{mk.lower()}"] = [[d.strftime("%Y-%m-%d"), round(float(x), 3), round(float(y), 3)]
+                                           for d, x, y in b.itertuples()]
+        read = ("不到 15% 的個股站上月線，屬於超賣區，常見於急跌尾聲。" if a20 < 0.15 else
+                "超過 85% 的個股站上月線，短線過熱。" if a20 > 0.85 else
+                "站上季線的個股不到四成，指數若續強須留意只靠少數權值股撐盤。" if a60 < 0.4 else
+                "多數個股站上季線，漲勢有廣度支撐。" if a60 > 0.6 else "廣度中性。")
+        cards.append(_card(f"breadth_{mk.lower()}", f"{label}廣度（觀察名單 {len(fs)} 檔）",
+                           f"月線上 {a20:.0%}・季線上 {a60:.0%}", f"5 日 {pp(a20 - float(b['above20'].iloc[-6]))}",
+                           read, 1 if a60 > 0.6 else -1 if a60 < 0.4 else 0, b["above20"].tail(60)))
+
+    def retail():
+        fp = leading.futures_positions()
+        mtx, tmf = fp["mtx"], fp.get("tmf")
+        if fp["date"] in by_date:
+            by_date[fp["date"]].update({"retail_mtx": round(mtx["ratio"], 4),
+                                        **({"retail_tmf": round(tmf["ratio"], 4)} if tmf else {})})
+        r = mtx["ratio"]
+        cards.append(_card("retail", "散戶小台多空比", f"{r:+.1%}",
+                           (f"微台 {tmf['ratio']:+.1%}・" if tmf else "") + fp["date"][5:],
+                           ("散戶明顯偏多。這是反向指標：散戶一面倒做多時，指數常有下跌壓力。" if r >= 0.2 else
+                            "散戶明顯偏空。反向來看，容易出現軋空上漲。" if r <= -0.2 else
+                            "散戶多空部位不極端，反向訊號不明顯。")
+                           + "算法：小型臺指未平倉扣掉三大法人後的淨部位 ÷ 全市場未平倉。",
+                           -1 if r >= 0.2 else 1 if r <= -0.2 else 0,
+                           [x["retail_mtx"] for x in flows if x.get("retail_mtx") is not None][-60:]))
+
+    def pcr():
+        rows = leading.put_call()
+        for x in rows:
+            if x["date"] in by_date:
+                by_date[x["date"]]["pcr_oi"] = round(x["pcr_oi"], 4)
+        now = rows[-1]["pcr_oi"]
+        cards.append(_card("pcr", "台指選擇權 Put/Call 未平倉比", f"{now:.0%}", f"5 日 {pp(now - rows[-6]['pcr_oi'])}",
+                           ("高於 100%：賣權未平倉多於買權，一般解讀為下檔有支撐、偏多。" if now >= 1 else
+                            "低於 100%：買權未平倉多於賣權，一般解讀為上檔有壓、偏空。"),
+                           1 if now >= 1.1 else -1 if now < 0.9 else 0, [x["pcr_oi"] for x in rows]))
+
+    def sbl():
+        mdates = [r["date"] for r in flows if r.get("margin_bal")]
+        if QUICK or len(mdates) < 6:
+            return
+        got = twse.fetch_days([mdates[-1], mdates[-6]], leading.sbl_table, "sbl", log)
+        now_t, ref_t = got[mdates[-1]], got[mdates[-6]]
+        closes = {c: q["close"] for c, q in quotes.items() if q.get("close")}
+        total = sum(v["sbl"] * closes[c] for c, v in now_t.items() if c in closes) / 1e8
+        before = sum(v["sbl"] * closes[c] for c, v in ref_t.items() if c in closes) / 1e8
+        moves = leading.sbl_moves(now_t, ref_t, closes)
+        chg = total / before - 1 if before else None
+        extra["sbl"] = {"date": mdates[-1], "ref_date": mdates[-6], "total": total, "chg": chg,
+                        "up": moves[:15], "down": moves[::-1][:15]}
+        cards.append(_card("sbl", "借券賣出餘額（法人放空）", f"{total:,.0f} 億", f"5 日 {chg:+.1%}" if chg is not None else "",
+                           "外資與法人放空走借券，散戶才用融券。借券賣出餘額增加代表法人放空或避險加重，"
+                           "即使現股買賣超看起來中性。以最新收盤價計算市值。",
+                           -1 if (chg or 0) > 0.03 else 1 if (chg or 0) < -0.03 else 0))
+
+    for name, fn, url in (("台積電 ADR 溢價", adr, ""), ("美元／台幣動能", fx, ""),
+                          ("FRED 美國 10 年期實質殖利率", real_yield, "https://fred.stlouisfed.org"),
+                          ("Cboe VIX3M 期限結構", vix_term, "https://www.cboe.com"),
+                          ("台股廣度", lambda: breadth_of("TW", "台股"), ""), ("美股廣度", lambda: breadth_of("US", "美股"), ""),
+                          ("期交所 散戶小台／微台部位", retail, "https://openapi.taifex.com.tw"),
+                          ("期交所 選擇權 Put/Call 比", pcr, "https://openapi.taifex.com.tw"),
+                          ("證交所 借券賣出餘額", sbl, "https://www.twse.com.tw")):
+        safe(f"領先指標：{name}", fn, None, url)
+    write_json(DATA / "history" / "tw_flows.json", flows)
+    return {"cards": cards, "series": series, "sbl": extra["sbl"]}
 
 
 def margin_extra(m: dict) -> dict:

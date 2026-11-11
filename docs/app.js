@@ -76,6 +76,14 @@
   let U = []; // universe.json
   let E = []; // etf.json
   let FUNDS = []; // funds.json
+  let LEAD = { cards: [], series: {} }; // leading.json
+  // Two-level navigation: five groups, each holding the views that are read together.
+  const NAV = [
+    ["市場總覽", [["overview", "總覽與預測"], ["alerts", "漲跌預警"]]],
+    ["核心選股", [["picks", "精選 20 檔"], ["fund", "財報指標"]]],
+    ["籌碼與聰明錢", [["flows", "外資法人"], ["margin", "融資融券"], ["smart", "名人・議員・董監"]]],
+    ["資產配置", [["etf", "ETF"], ["funds", "基金"]]],
+    ["輿情與方法", [["podcast", "Podcast"], ["method", "方法與來源"]]]];
   let AI = null; // ai.json - commentary written by Claude during the weekly run
   const bySymbol = new Map();
 
@@ -442,16 +450,17 @@
           h("ul", { class: "why" }, r.reasons.map((t) => h("li", { class: "pro" }, t)), r.risks.map((t) => h("li", { class: "con" }, t)),
             !r.reasons.length && !r.risks.length ? h("li", { class: "muted" }, "目前沒有明顯訊號") : null))));
       body.push(h("div", { class: "panel" }, h("h3", {}, "參考價位與操作"),
-        h("div", { class: "plan" }, [["支撐", r.plan.support], ["停損", r.plan.stop], ["一月目標", r.plan.target]].map(([k, v]) =>
-          h("div", {}, h("div", { class: "k" }, k), h("div", { class: "v num" }, px(v))))),
-        h("p", { class: "stance", style: "margin-top:10px" }, r.plan.stance)));
+        h("div", { class: "plan" }, planCells(r)),
+        h("p", { class: "stance", style: "margin-top:10px" }, r.plan.stance),
+        h("p", { class: "chart-note" }, "風險報酬比＝（一月目標 − 現價）÷（現價 − 停損）。低於 1 代表可能賠的比可能賺的多。")));
       const kv = r.kind === "etf"
         ? [["類別", r.industry], ["近一月", pct(r.r20)], ["近一季", pct(r.r60)], ["今年以來", pct(r.ytd)], ["近一年", pct(r.r250)],
           ["一年最大回檔", pct(r.mdd)], ["年化波動", ok(r.vol_ann) ? num(r.vol_ann * 100, 0) + "%" : "–"], ["RSI(14)", num(r.rsi, 0)],
           ["外資 5 日", ok(r.foreign5) ? signed(r.foreign5, 0) + " 張" : "–"], ["投信 5 日", ok(r.trust5) ? signed(r.trust5, 0) + " 張" : "–"]]
         : r.market === "TW"
         ? [["本益比", num(r.pe, 1)], ["股價淨值比", num(r.pb, 2)], ["殖利率", ok(r.yield) ? num(r.yield, 2) + "%" : "–"],
-          ["月營收年增", pctRaw(r.rev_yoy)], ["累計營收年增", pctRaw(r.rev_cum_yoy)], ["最新季 EPS", num(r.eps, 2)],
+          ["月營收年增", pctRaw(r.rev_yoy)], ["累計營收年增", pctRaw(r.rev_cum_yoy)],
+          ["3 月／12 月營收", ok(r.rev_ratio) ? pct(r.rev_ratio - 1, 0) : "–"], ["最新季 EPS", num(r.eps, 2)],
           ["外資 5 日", ok(r.foreign5) ? signed(r.foreign5, 0) + " 張" : "–"], ["投信 5 日", ok(r.trust5) ? signed(r.trust5, 0) + " 張" : "–"],
           ["融資餘額", ok(r.margin) ? num(r.margin, 0) + " 張" : "–"], ["融資 5 日變化", pct(r.margin_chg5)],
           ["董監質押比", ok(r.insider_pledge) ? pct(r.insider_pledge).replace("+", "") : "–"], ["RSI(14)", num(r.rsi, 0)]]
@@ -485,6 +494,20 @@
       h("div", { class: "ai note" }, mdLite(text)));
   };
 
+  const planCells = (r) => [["支撐", px(r.plan.support)], ["停損", px(r.plan.stop)], ["一月目標", px(r.plan.target)],
+    ["風險報酬比", ok(r.plan.rr) ? num(r.plan.rr, 1) + " : 1" : "–"]].map(([k, v]) =>
+    h("div", {}, h("div", { class: "k" }, k), h("div", { class: "v num" }, v)));
+  const TONE = { 1: ["s1", "偏多訊號"], 0: ["s0", "中性"], "-1": ["s-1", "偏空訊號"] };
+  const leadCards = (keys) => {
+    const cards = LEAD.cards.filter((c) => !keys || keys.includes(c.key));
+    return cards.length ? h("div", { class: "leads" }, cards.map((c) => h("div", { class: "lead-card" },
+      h("div", { class: "row", style: "justify-content:space-between" }, h("span", { class: "nm" }, c.name),
+        h("span", { class: "pill " + TONE[c.tone][0] }, TONE[c.tone][1])),
+      h("div", { class: "row" }, h("b", { class: "num lv" }, c.value_text), h("span", { class: "small muted num" }, c.change_text)),
+      c.spark && c.spark.length > 2 ? spark(c.spark) : null,
+      h("p", { class: "small" }, c.reading)))) : null;
+  };
+
   const views = {
     async overview() {
       const main = S.indices.filter((i) => i.horizons);
@@ -500,6 +523,8 @@
               h("button", { class: "chip", type: "button", onclick: () => openDrawer(i.symbol) }, "看圖")), forecastGrid(i.horizons))),
             h("p", { class: "chart-note" }, "機率與區間由技術面＋籌碼面分數與歷史波動度推估；上漲機率刻意限制在 28%–72% 之間，避免過度自信。"))),
         aiBlock("AI 觀點", AI && AI.market),
+        LEAD.cards.length ? h("div", { class: "panel stack" }, h("h3", {}, "領先指標"), leadCards(),
+          h("p", { class: "chart-note" }, "這些指標通常比股價先動，用來輔助判讀。標示的偏多／偏空是市場常見的解讀方式，尚未用本站自己的資料驗證，所以不計入任何分數。")) : null,
         h("div", { class: "panel" }, h("h3", {}, "台灣加權指數"), priceChart("TWII", { range: "6m" })),
       ];
     },
@@ -516,15 +541,27 @@
           h("div", { class: "scorebar" }, "綜合", meter(r.overall), h("b", { class: "num " + cls(r.overall) }, signed(r.overall, 2)), pill({ score: r.overall, label: r.label })),
           h("div", { class: "hz" }, Object.entries(r.horizons).map(([k, f]) => h("span", {}, HZ[k] + " ", pill(f)))),
           h("ul", { class: "why" }, r.reasons.slice(0, 3).map((t) => h("li", { class: "pro" }, t)), r.risks.slice(0, 2).map((t) => h("li", { class: "con" }, t))),
-          h("div", { class: "plan" }, [["支撐", r.plan.support], ["停損", r.plan.stop], ["一月目標", r.plan.target]].map(([k, v]) =>
-            h("div", {}, h("div", { class: "k" }, k), h("div", { class: "v num" }, px(v))))),
+          h("div", { class: "plan" }, planCells(r)),
           h("div", { class: "stance" }, r.plan.stance))));
       const seg = h("div", { class: "seg", role: "group", "aria-label": "市場" }, [["ALL", "全部"], ["TW", "台股"], ["US", "美股"]].map(([k, t]) =>
         h("button", { type: "button", "aria-pressed": String(k === "ALL"), onclick: (e) => {
           filter.m = k; seg.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b === e.currentTarget))); draw();
         } }, t)));
       draw();
-      return [h("div", { class: "sec-head" }, head("精選 20 檔", `從 ${S.counts.tw} 檔台股與 ${S.counts.us} 檔美股中，依趨勢、動能、籌碼、基本面、聲量五類因子的綜合分數挑選，同產業最多 3 檔。點卡片看圖表與完整數據。`), seg), grid];
+      const trackRows = (S.picks_track || []).flatMap((c) => ["TW", "US"].filter((m) => c[m]).map((m) => ({ date: c.date, m, ...c[m] }))).reverse();
+      const track = h("div", { class: "panel stack" }, h("h3", {}, "過去精選的實際表現"),
+        trackRows.length ? table([
+          { key: "d", label: "選出日", left: true, cell: (r) => h("span", { class: "num" }, r.date) },
+          { key: "m", label: "市場", left: true, cell: (r) => mkChip(r.m) },
+          { key: "n", label: "檔數", cell: (r) => h("span", { class: "num" }, r.n) },
+          { key: "t", label: "經過交易日", cell: (r) => h("span", { class: "num" }, r.days) },
+          { key: "r", label: "精選平均報酬", cell: (r) => numEl(pct(r.ret, 2), r.ret) },
+          { key: "b", label: "同期指數", tip: "台股對加權指數，美股對 S&P 500", cell: (r) => numEl(pct(r.bench, 2), r.bench) },
+          { key: "x", label: "超額報酬", cell: (r) => numEl(pct(r.excess, 2), r.excess) },
+          { key: "w", label: "勝過指數的檔數比例", cell: (r) => h("span", { class: "num" }, num(r.win * 100, 0) + "%") }], trackRows)
+          : h("div", { class: "empty" }, "從下一次更新開始累積：每週會記下當時的精選名單，之後持續對照它們與大盤的實際漲跌"),
+        h("p", { class: "chart-note" }, "每週三的精選名單會被記錄下來，這裡列出從選出日收盤到最新收盤的等權平均報酬，對照同期指數。這是檢驗模型最直接的方式，累積的週數越多越有參考價值。"));
+      return [h("div", { class: "sec-head" }, head("精選 20 檔", `從 ${S.counts.tw} 檔台股與 ${S.counts.us} 檔美股中，依趨勢、動能、籌碼、基本面、聲量五類因子的綜合分數挑選，同產業最多 3 檔。點卡片看圖表與完整數據。`), seg), grid, track];
     },
 
     async flows() {
@@ -622,6 +659,17 @@
           statBox("融券餘額", num(s.short_units, 0) + " 張", ok(s.short_ratio) ? `券資比 ${num(s.short_ratio * 100, 1)}%` : "")),
         h("div", { class: "panel stack" }, h("div", { class: "sec-head" }, h("h3", {}, "走勢"), seg), holder,
           hasMaint ? h("p", { class: "chart-note" }, "融資維持率＝融資擔保品市值 ÷ 融資金額。證交所只公布各股融資張數與全市場融資金額，本站以每日收盤價估算擔保品市值，與券商實際逐戶計算的數字會有出入，適合看水位與方向。") : null),
+        leadCards(["retail", "pcr", "sbl"]) ? h("div", { class: "panel stack" }, h("h3", {}, "期貨、選擇權與借券部位"), leadCards(["retail", "pcr", "sbl"]),
+          h("p", { class: "chart-note" }, "融資融券是現股的散戶槓桿；期貨與借券反應更快。偏多／偏空為市場常見解讀，未計入分數。")) : null,
+        F.sbl ? h("div", { class: "grid g2" }, [["up", "借券賣出餘額增幅前 15（5 日）"], ["down", "借券賣出餘額減幅前 15（5 日）"]].map(([k, title]) =>
+          h("div", { class: "panel" }, h("h3", {}, title), table([
+            { key: "n", label: "個股", left: true, cell: (r) => nameCell(r) },
+            { key: "c", label: "借券餘額變化", val: (r) => r.chg, cell: (r) => numEl(pct(r.chg), r.chg) },
+            { key: "v", label: "餘額市值（億）", val: (r) => r.value, cell: (r) => h("span", { class: "num" }, num(r.value, 1)) },
+            { key: "s", label: "融券變化", tip: "同期散戶融券餘額的變化", val: (r) => r.short_chg, cell: (r) => numEl(pct(r.short_chg), r.short_chg) },
+            { key: "x", label: "借券÷融券", val: (r) => r.sbl_vs_short, cell: (r) => h("span", { class: "num" }, ok(r.sbl_vs_short) ? num(r.sbl_vs_short, 0) + " 倍" : "–") }],
+          F.sbl[k], { onRow: open }),
+          k === "up" ? h("p", { class: "chart-note" }, `${F.sbl.ref_date} 至 ${F.sbl.date}，僅列借券餘額市值 5 億元以上個股。借券大增而融券持平，代表放空來自法人而非散戶。`) : null))) : null,
         h("div", { class: "panel stack" }, h("h3", {}, "斷頭壓力觀察"),
           (F.margin_risk || []).length ? table(riskCols, F.margin_risk, { onRow: open })
             : h("div", { class: "empty" }, "目前沒有同時符合「融資使用率 10% 以上、近 20 日跌逾 15%、融資市值 3 億以上」的個股"),
@@ -697,6 +745,9 @@
         { key: "pb", label: "淨值比", val: (r) => r.pb, cell: (r) => h("span", { class: "num" }, num(r.pb, 2)) },
         { key: "y", label: "殖利率", val: (r) => r.yield, cell: (r) => h("span", { class: "num" }, ok(r.yield) ? num(r.yield, 1) + "%" : "–") },
         { key: "rv", label: "營收年增", tip: "台股為最新月營收，美股為最新一季", val: (r) => r.rev_yoy, cell: (r) => numEl(pctRaw(r.rev_yoy), r.rev_yoy) },
+        { key: "rm", label: "營收動能", tip: "近 3 個月平均營收 ÷ 近 12 個月平均營收 − 1（僅台股）", val: (r) => (ok(r.rev_ratio) ? r.rev_ratio - 1 : null),
+          cell: (r) => (ok(r.rev_ratio) ? h("span", {}, numEl(pct(r.rev_ratio - 1, 0), r.rev_ratio - 1),
+            r.rev_cross === "up" ? h("span", { class: "chip add", style: "margin-left:4px" }, "剛轉強") : r.rev_cross === "down" ? h("span", { class: "chip cut", style: "margin-left:4px" }, "剛轉弱") : null) : "–") },
         { key: "e", label: "EPS", tip: "台股為最新一季，美股為近四季合計", val: (r) => (r.market === "US" ? r.eps_ttm : r.eps), cell: (r) => h("span", { class: "num" }, num(r.market === "US" ? r.eps_ttm : r.eps, 2)) },
         { key: "eg", label: "EPS 年增", val: (r) => r.eps_yoy, cell: (r) => numEl(pctRaw(r.eps_yoy, 0), r.eps_yoy) },
         { key: "r", label: "RSI", val: (r) => r.rsi, cell: (r) => h("span", { class: "num" }, num(r.rsi, 0)) },
@@ -791,6 +842,8 @@
           { key: "2", label: "一月", left: true, cell: (r) => pill(r.horizons["1m"]) },
           { key: "v", label: "聲量對照數據", left: true, wrap: true, cell: (r) => h("div", { class: "stack", style: "gap:4px" },
             h("span", {}, r.view),
+            r.signal ? h("span", { class: "chip " + (r.signal.startsWith("法人先行") ? "add" : "warn") }, r.signal) : null,
+            r.weeks > 1 ? h("span", { class: "small muted" }, `已連續 ${r.weeks} 週被提及`) : null,
             notes[r.symbol] ? h("span", { class: "small muted" }, "Claude：" + notes[r.symbol]) : null,
             h("span", { class: "small muted" }, "出處：" + [...new Set(r.episodes.map((e) => e.show))].join("、"))) }],
         hot, { sort: "m", onRow: (r) => openDrawer(r.symbol) })
@@ -858,7 +911,7 @@
             table([{ key: "g", label: "因子", left: true, cell: (r) => G[r] },
               ...Object.keys(HZ).map((k) => ({ key: k, label: HZ[k], cell: (r) => h("span", { class: "num" }, nf(0).format(((W[k] || {})[r] || 0) * 100) + "%") }))],
             Object.keys(G)),
-            h("p", { class: "small" }, "每個因子先壓縮到 −1 至 +1：趨勢看均線排列與季線斜率；動能看波動度調整後的報酬、MACD、RSI；台股籌碼看外資／投信買賣超占成交量比重、連續天數與融資變化；美股籌碼看議員交易與 13F 增減；基本面看營收與 EPS 成長、本益比、殖利率。缺少的因子會自動剔除並重新分配權重。"),
+            h("p", { class: "small" }, "每個因子先壓縮到 −1 至 +1：趨勢看均線排列與季線斜率；動能看波動度調整後的報酬、MACD、RSI；台股籌碼看外資／投信買賣超占成交量比重、連續天數與融資變化；美股籌碼看議員交易與 13F 增減；基本面看營收與 EPS 成長、近 3 月對 12 月的營收動能、本益比、殖利率。缺少的因子會自動剔除並重新分配權重。"),
             h("p", { class: "small" }, "預測區間＝現價 ×（1 ＋ 分數 × 0.6σ ± σ），σ 為近 60 日波動度乘以天數平方根。綜合分數＝一週 30%＋一月 40%＋一季 30%。")),
           h("div", { class: "panel stack" }, h("h3", {}, "技術面分數回測"),
             Object.values(bt).some(Boolean) ? table([
@@ -890,13 +943,18 @@
 
   // ---------- router ----------
   const app = document.getElementById("app");
+  function drawNav(name) {
+    const gi = Math.max(0, NAV.findIndex(([, vs]) => vs.some(([v]) => v === name)));
+    document.getElementById("groups").replaceChildren(...NAV.map(([label, vs], i) =>
+      h("a", { href: "#" + vs[0][0], "aria-current": i === gi ? "page" : null }, label)));
+    const sub = NAV[gi][1].map(([v, label]) => h("a", { href: "#" + v, "aria-current": v === name ? "page" : null }, label));
+    document.getElementById("tabs").replaceChildren(...sub);
+    const cur = document.querySelector('#groups a[aria-current="page"]');
+    if (cur) cur.scrollIntoView({ block: "nearest", inline: "center" });
+  }
   async function route() {
     const name = views[location.hash.slice(1)] ? location.hash.slice(1) : "overview";
-    document.querySelectorAll("#tabs a").forEach((a) => {
-      const on = a.getAttribute("href") === "#" + name;
-      if (on) { a.setAttribute("aria-current", "page"); a.scrollIntoView({ block: "nearest", inline: "center" }); }
-      else a.removeAttribute("aria-current");
-    });
+    drawNav(name);
     closeDrawer();
     charts.clear();
     try {
@@ -908,14 +966,24 @@
     window.scrollTo(0, 0);
   }
 
+  // A stalled or failed load must end in something the reader can act on, never an endless spinner.
+  const timeout = (ms) => new Promise((_, rej) => setTimeout(() => rej(new Error(`超過 ${ms / 1000} 秒沒有回應`)), ms));
+  function loadFailed(e) {
+    app.replaceChildren(h("div", { class: "empty stack", style: "align-items:center" },
+      h("div", {}, "資料載入失敗：" + e.message),
+      h("div", { class: "small" }, "可能是網路不穩，或本週資料正在更新。"),
+      h("button", { class: "close", type: "button", onclick: () => { cache.clear(); app.replaceChildren(h("div", { class: "empty" }, "重新載入中…")); boot(); } }, "重新載入")));
+  }
+  let booted = false;
   async function boot() {
     try {
-      [S, U] = await Promise.all([load("summary"), load("universe")]);
+      [S, U] = await Promise.race([Promise.all([load("summary"), load("universe")]), timeout(15000)]);
     } catch (e) {
-      app.replaceChildren(h("div", { class: "empty" }, "找不到資料檔。請先執行 python -m pipeline.build，或等待每週三的自動更新。（" + e.message + "）"));
+      loadFailed(e);
       return;
     }
-    [E, FUNDS, AI] = await Promise.all([load("etf").catch(() => []), load("funds").catch(() => []), load("ai").catch(() => null)]);
+    [E, FUNDS, AI, LEAD] = await Promise.all([load("etf").catch(() => []), load("funds").catch(() => []),
+      load("ai").catch(() => null), load("leading").catch(() => ({ cards: [], series: {} }))]);
     FUNDS.forEach((r) => bySymbol.set(r.symbol, r));
     U.forEach((r) => bySymbol.set(r.symbol, r));
     E.forEach((r) => bySymbol.set(r.symbol, r));
@@ -924,9 +992,30 @@
       h("span", {}, "資料日 ", h("b", { class: "num" }, S.data_date)),
       h("span", {}, "更新於 ", h("b", { class: "num" }, S.generated_at.slice(0, 16).replace("T", " "))),
       h("span", {}, "下次更新 ", h("b", { class: "num" }, S.next_update + "（三）")));
-    window.addEventListener("hashchange", route);
+    if (!booted) window.addEventListener("hashchange", route);
+    booted = true;
     route();
   }
+
+  // Up/down colours: Taiwan convention (red up) by default, switchable to the US one (green up).
+  const root = document.documentElement, toggle = document.getElementById("updown");
+  const paintToggle = () => {
+    const us = root.dataset.updown === "us";
+    toggle.textContent = us ? "綠漲紅跌" : "紅漲綠跌";
+    toggle.setAttribute("aria-pressed", String(us));
+    document.getElementById("legend").replaceChildren("顏色目前為",
+      h("span", { class: "up" }, us ? "綠＝上漲／買超" : "紅＝上漲／買超"), "、", h("span", { class: "down" }, us ? "紅＝下跌／賣超" : "綠＝下跌／賣超"),
+      "，可在頁首切換。");
+  };
+  try { if (localStorage.getItem("updown") === "us") root.dataset.updown = "us"; } catch (e) { /* storage unavailable */ }
+  toggle.addEventListener("click", () => {
+    if (root.dataset.updown === "us") delete root.dataset.updown; else root.dataset.updown = "us";
+    try { localStorage.setItem("updown", root.dataset.updown || "tw"); } catch (e) { /* storage unavailable */ }
+    paintToggle();
+    retheme();
+  });
+  paintToggle();
+  drawNav(location.hash.slice(1));
 
   const retheme = () => charts.forEach((fn) => fn());
   matchMedia("(prefers-color-scheme: dark)").addEventListener("change", retheme);

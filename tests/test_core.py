@@ -473,3 +473,101 @@ def test_margin_extra_gauges():
     from pipeline import build
     assert build.margin_extra({"margin": 500, "limit": 2000, "short": 50}) == {"usage": 0.25, "short_ratio": 0.1}
     assert build.margin_extra({"margin": 0, "limit": None, "short": 5}) == {"usage": None, "short_ratio": None}
+
+
+# ---------------- leading indicators ----------------
+def test_retail_futures_position():
+    from pipeline import leading
+    inst = [{"ContractCode": "小型臺指期貨", "OpenInterest(Net)": "-8933"}, {"ContractCode": "小型臺指期貨", "OpenInterest(Net)": "-39"},
+            {"ContractCode": "小型臺指期貨", "OpenInterest(Net)": "3256"}, {"ContractCode": "臺股期貨", "OpenInterest(Net)": "-99999"}]
+    fut = [{"Contract": "MTX", "TradingSession": "一般", "OpenInterest": "30000"},
+           {"Contract": "MTX", "TradingSession": "一般", "OpenInterest": "10000"},
+           {"Contract": "MTX", "TradingSession": "盤後", "OpenInterest": "-"},      # after-hours rows carry no OI
+           {"Contract": "TX", "TradingSession": "一般", "OpenInterest": "122272"}]
+    r = leading.retail_position(inst, fut, "小型臺指期貨", "MTX")
+    assert r["net"] == 5716 and r["oi"] == 40000 and r["ratio"] == pytest.approx(0.1429, abs=1e-4)   # retail net long
+    assert leading.retail_position(inst, fut, "微型臺指期貨", "TMF") is None
+
+
+def test_adr_premium_percentile_and_term_structure():
+    from pipeline import leading
+    idx = pd.bdate_range("2026-01-05", periods=40)
+    adr = pd.Series(110.0, index=idx)
+    tw = pd.Series(600.0, index=idx.delete(3))            # Taiwan closed one day
+    fx = pd.Series(30.0, index=idx[:30])                  # FX series lags: carried forward
+    prem = leading.adr_premium(adr, tw, fx)
+    assert len(prem) == 39 and prem.iloc[-1] == pytest.approx(110 * 30 / (5 * 600) - 1)   # +10%
+    assert leading.percentile(pd.Series(range(100))) == 1.0 and leading.percentile(pd.Series([1.0] * 5)) is None
+    ts = leading.term_structure(pd.Series([30.0, 15.0], index=idx[:2]), pd.Series([25.0, 20.0], index=idx[:2]))
+    assert list(ts) == [1.2, 0.75]
+
+
+def test_breadth_counts_only_stocks_with_an_average():
+    from pipeline import leading
+    idx = pd.bdate_range("2026-01-05", periods=3)
+    def f(close, ma20, ma60):
+        return pd.DataFrame({"close": close, "ma20": ma20, "ma60": ma60}, index=idx)
+    frames = {f"U{i}": f(10.0, 9.0, 9.0) for i in range(8)}                     # above both
+    frames.update({f"D{i}": f(10.0, 11.0, 9.0) for i in range(4)})              # below 20MA only
+    frames["N"] = f(10.0, float("nan"), float("nan"))                            # too new: not counted
+    b = leading.breadth(frames)
+    assert b["above20"].iloc[-1] == pytest.approx(8 / 12) and b["above60"].iloc[-1] == 1.0
+
+
+def test_revenue_momentum_crossover():
+    from pipeline import leading
+    months = {f"2025-{m:02d}": 100.0 for m in range(1, 13)}
+    flat = leading.revenue_momentum({**months, "2026-01": 100.0})
+    assert flat["ratio"] == 1 and not flat["cross_up"] and not flat["cross_down"]
+    up = leading.revenue_momentum({**months, "2026-01": 160.0})
+    assert up["ratio"] > 1 and up["cross_up"] and up["rising"] and up["month"] == "2026-01"
+    down = leading.revenue_momentum({**months, "2026-01": 40.0})
+    assert down["cross_down"] and not down["rising"]
+    assert leading.revenue_momentum({"2026-01": 1.0}) is None
+    assert leading.revenue_momentum({**months, "2025-06": 0.0}) is None            # a zero month is not usable
+    good, notes = scoring.fund_tw({"rev_yoy": 5, "pe": 18, "rev_ratio": 1.2, "rev_cross_up": True})
+    base, _ = scoring.fund_tw({"rev_yoy": 5, "pe": 18})
+    assert good == pytest.approx(base + 0.10) and any("站上 12 月均線" in t for t, _ in notes)
+
+
+def test_parse_mops_revenue_table():
+    from pipeline import leading
+    html = ("<table><tr><th>公司代號</th><th>公司名稱</th><th>當月營收</th></tr>"
+            "<tr><td>1101</td><td>台泥</td><td align=right> 14,321,556</td><td>1</td></tr>"
+            "<tr><td>合計</td><td></td><td>99</td></tr><tr><td>2330</td><td>台積電</td><td>&nbsp;511,857,399</td></tr></table>")
+    assert leading.parse_mops_revenue(html) == {"1101": 14321556.0, "2330": 511857399.0}
+
+
+def test_cohort_results_against_benchmark():
+    from pipeline import leading
+    idx = pd.bdate_range("2026-11-02", periods=8)
+    mk = lambda vals: pd.DataFrame({"close": vals}, index=idx)   # noqa: E731
+    frames = {"A": mk([100, 100, 100, 100, 110, 110, 110, 121]), "B": mk([50] * 7 + [45]),
+              "TWII": mk([1000] * 7 + [1050])}
+    cohorts = [{"date": "2026-11-05", "picks": [{"symbol": "A", "market": "TW", "close": 100},
+                                                {"symbol": "B", "market": "TW", "close": 50},
+                                                {"symbol": "GONE", "market": "TW", "close": 9}]}]
+    r = leading.cohort_results(cohorts, frames, {"TW": "TWII"})[0]["TW"]
+    assert r["n"] == 2 and r["ret"] == pytest.approx((0.21 - 0.10) / 2) and r["bench"] == pytest.approx(0.05)
+    assert r["excess"] == pytest.approx(0.005) and r["win"] == 0.5 and r["days"] == 4
+    assert leading.cohort_results([{"date": "2026-11-11", "picks": cohorts[0]["picks"]}], frames, {"TW": "TWII"}) == []
+
+
+def test_attention_signal_and_sbl_moves():
+    from pipeline import leading
+    assert "法人先行" in leading.attention_signal(1, 1, 0.4, -0.01)
+    assert "過熱" in leading.attention_signal(4, 3, -0.5, 0.12)
+    assert leading.attention_signal(1, 1, 0.0, 0.0) is None and leading.attention_signal(2, 1, None, 0.2) is None
+    now = {"2330": {"name": "台積電", "sbl": 2_000_000, "short": 100_000}, "0050": {"name": "ETF", "sbl": 9e9, "short": 1},
+           "1101": {"name": "台泥", "sbl": 1000, "short": 0}}
+    ref = {"2330": {"name": "台積電", "sbl": 1_000_000, "short": 100_000}, "0050": {"name": "ETF", "sbl": 1e9, "short": 1},
+           "1101": {"name": "台泥", "sbl": 500, "short": 0}}
+    rows = leading.sbl_moves(now, ref, {"2330": 2000.0, "0050": 100.0, "1101": 30.0})
+    assert [r["code"] for r in rows] == ["2330"]                 # ETF code and tiny positions are left out
+    assert rows[0]["chg"] == 1.0 and rows[0]["short_chg"] == 0 and rows[0]["value"] == pytest.approx(40.0)
+
+
+def test_leading_card_accepts_series_and_lists():
+    from pipeline import build
+    c = build._card("k", "名稱", "1.0", "+0.1", "說明", 1, pd.Series([1.23456, 2.0]))
+    assert c["spark"] == [1.2346, 2.0] and build._card("k", "n", "v", "c", "r")["spark"] == []

@@ -79,6 +79,10 @@
 - `market`：四段，各以 `### ` 開頭，合計 450–750 字。
 - `market` 的籌碼面要帶到融資維持率：`tw_flow.maint` 是比值（1.48 = 148%，為估算值）、`maint_chg5` 是一週變化
   （0.05 = 5 個百分點）、`maint_cushion` 是整體擔保品距 130% 追繳線還能跌多少。說它是估算，不要寫成官方數字。
+- digest 的 `leading` 是領先指標卡片（ADR 溢價、匯率、實質利率、VIX 期限結構、廣度、散戶小台、Put/Call、借券）。
+  可在籌碼面引用 `value_text` 與 `change_text`，但它們的偏多／偏空只是市場常見解讀，未經本站資料驗證，
+  要寫成「一般解讀為」而不是定論。`picks_track` 是過去精選名單的實際表現，有資料時在操作建議中如實交代，
+  落後大盤也要寫。
 - `podcast.overview`：這兩週節目在談什麼主題（依 `podcast_hot[].episodes` 的標題與摘要），
   以及被談論的標的整體是強是弱。
 - `podcast.stocks`：`podcast_hot` 前 8 檔各寫一則（鍵用 `symbol` 欄位，至少要涵蓋前 5 檔）。

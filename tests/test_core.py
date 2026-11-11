@@ -375,3 +375,76 @@ def test_check_ai_validation():
     assert any("sections" in e for e in check_ai.validate({**good, "market": "短" * 300}, "2026-11-10", hot))
     assert any("placeholder" in e for e in check_ai.validate({**good, "etf": "TODO " * 40}, "2026-11-10", hot))
     assert check_ai.validate({**good, "podcast": {}}, "2026-11-10", []) == []                  # quiet week
+    assert any("fund" in e for e in check_ai.validate(good, "2026-11-10", hot, need_fund=True))  # funds built, no text
+    assert check_ai.validate({**good, "fund": "基金" * 80}, "2026-11-10", hot, need_fund=True) == []
+
+
+# ---------------- mutual funds ----------------
+def nav_from(prices, start="2021-01-04"):
+    return pd.Series(prices, index=pd.bdate_range(start, periods=len(prices)), dtype=float)
+
+
+def test_fund_frac_and_nav_series():
+    from pipeline import funds
+    assert funds.frac(12.5) == 0.125 and funds.frac("-3") == -0.03
+    assert funds.frac(None) is None and funds.frac("n/a") is None and funds.frac(999999.99) is None
+    s = funds.nav_series({"nav": [10.5, 10.4, 0, 10.0], "tradeDate": [1794240000, 1794153600, 1794067200, 1793894400]})
+    assert list(s) == [10.0, 10.4, 10.5] and s.index.is_monotonic_increasing     # ascending, zero dropped
+    assert funds.annualise(0.331, 3) == pytest.approx(0.1, abs=1e-3) and funds.annualise(None, 3) is None
+
+
+def test_fund_risk_metrics():
+    from pipeline import funds
+    steady = nav_from(100 * np.exp(np.cumsum(np.full(900, 0.0004))))
+    m = funds.risk_metrics(steady, None, 0.015)
+    assert m["vol_3y"] < 0.001 and m["mdd_3y"] == pytest.approx(0, abs=1e-9) and m["win_months"] == 1.0
+    crash = nav_from(list(np.linspace(100, 150, 500)) + list(np.linspace(150, 90, 100)) + list(np.linspace(90, 120, 300)))
+    c = funds.risk_metrics(crash, 0.08, 0.015)
+    assert c["mdd_3y"] == pytest.approx(-0.4, abs=0.01) and c["mdd_1y"] <= 0
+    assert c["sharpe"] == pytest.approx((0.08 - 0.015) / c["vol_3y"])
+    assert 2.9 < c["span_years"] <= 3.01
+    assert funds.risk_metrics(nav_from([10] * 20), None, 0) == {}                     # too short
+
+
+def test_fund_performance_score_and_grades():
+    from pipeline import funds
+    top = funds.performance_score({"1y": 90, "3y": 95, "5y": 85}, 0.06, 1.4, -0.12)
+    bottom = funds.performance_score({"1y": 10, "3y": 5}, -0.07, -0.2, -0.45)
+    assert top[0] > 75 and top[1] == "優異" and bottom[0] < 30 and bottom[1] == "落後"
+    assert top[2]["peer"] == pytest.approx(0.3 * 90 + 0.45 * 95 + 0.25 * 85)
+    assert funds.performance_score({"3y": 50}, 0.0, 0.5, -0.25)[0] == pytest.approx(50.0)   # all midpoints
+    # missing pieces are dropped and the rest re-weighted; a single number is not an evaluation
+    partial = funds.performance_score({}, None, 0.5, -0.25)
+    assert partial[0] == pytest.approx(50.0) and partial[2]["peer"] is None
+    assert funds.performance_score({"1y": 99}, None, None, None)[:2] == (None, None)
+
+
+def test_fund_build_record_and_verdict():
+    from pipeline import funds
+    idx = pd.bdate_range("2022-01-03", periods=1000)
+    navs = 10 * np.exp(np.cumsum(np.random.default_rng(3).normal(0.0006, 0.01, 1000)))
+    items = {"nav": list(navs[::-1]), "tradeDate": [int(t.timestamp()) for t in idx[::-1]],
+             "displayNameLocal": "測試台灣科技基金", "categoryLocal": "台灣大型股票", "classCurrencyLocal": "新台幣",
+             "riskLevel": 4, "starRating": 5, "managementFee": 1.6, "dividendDistributionFrequency": "",
+             "inceptionDate": 946684800, "totalNetAsset": 5e10, "netAssetCurrency": "TWD",
+             "netAssetDate": 1790697600, "primaryProspectusIndexName": "TAIEX", "return1YearLocal": 42.0}
+    perf = {"returns": {"return1Month": -5.0, "return1Year": 40.0, "accReturn3Year": 120.0},
+            "indexReturns": {"return1Year": 30.0, "accReturn3Year": 90.0},
+            "categoryAverages": {"return1Year": 25.0},
+            "categoryRankings": {"return1Year": {"ranking": 5, "total": 100, "surpassRate": 95},
+                                 "accReturn3Year": {"ranking": 10, "total": 90, "surpassRate": 89},
+                                 "accReturn5Year": {"ranking": None, "total": 0, "surpassRate": None}}}
+    rec, nav = funds.build_record("A00001", "台股", items, perf, {"新台幣": 1.5, "default": 2.0})
+    assert rec["symbol"] == "F-A00001" and rec["kind"] == "fund" and len(nav) == 1000
+    assert rec["ret"]["1y"] == 0.40 and rec["ret"]["3y"] == 1.20 and rec["ret"]["5y"] is None
+    assert rec["beat"] == {"1y": 95, "3y": 89} and "5y" not in rec["rank"]
+    assert rec["excess_basis"] == "3y"
+    assert rec["excess_ann"] == pytest.approx(2.2 ** (1 / 3) - 1.9 ** (1 / 3))
+    assert rec["sharpe"] == pytest.approx((2.2 ** (1 / 3) - 1 - 0.015) / rec["vol_3y"])
+    assert rec["grade"] in ("優異", "良好") and rec["aum"] == 5e10 and rec["ret_1y_twd"] == 0.42
+    assert "贏過 89% 的同類基金" in rec["verdict"] and "高於對比指數" in rec["verdict"]
+    young, _ = funds.build_record("A2", "台股", {**items, "nav": items["nav"][:150], "tradeDate": items["tradeDate"][:150]},
+                                  perf, {"default": 2.0})
+    assert young["score"] is None and young["grade"] is None            # under a year of history: no grade
+    assert "配息級別" in funds.verdict({"beat": {"1y": 20}, "dist": "Monthly", "mdd_3y": -0.3})
+    assert funds.verdict({}) == "成立時間或資料不足，暫無法評估。"

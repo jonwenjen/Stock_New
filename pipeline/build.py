@@ -12,13 +12,14 @@ import datetime as dt
 import json
 import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
 
 import pandas as pd
 
-from . import http, indicators, media, prices, scoring, twse, us_data
+from . import funds, http, indicators, media, prices, scoring, twse, us_data
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "docs" / "data"
@@ -90,7 +91,8 @@ def _clean(o):
 
 
 def fname(symbol: str) -> str:
-    return symbol.replace("^", "_").replace("=", "_").replace(".", "_")
+    """Symbol -> chart file stem ('2330.TW' -> '2330_TW', 'F-B09,005' -> 'F-B09_005')."""
+    return re.sub(r"[^A-Za-z0-9_-]", "_", symbol)
 
 
 def ret(df: pd.DataFrame, n: int) -> float | None:
@@ -655,6 +657,33 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                                              "r20", "rsi", "overall", "label", "horizons", "reasons", "risks")},
                     "kind": r.get("kind", "stock"), "mentions": n, "episodes": eps[:6], "view": hot_view(r, n)})
 
+    # ---- 8c. mutual funds: provider figures + our own evaluation --------------
+    fund_cfg = CFG.get("funds", {})
+    fund_list = fund_cfg.get("list", [])[:4] if QUICK else fund_cfg.get("list", [])
+    fund_records = []
+    for fid, group in fund_list:
+        try:
+            rec, nav = funds.build_record(fid, group, funds.fetch_nav(fid), funds.fetch_performance(fid),
+                                          fund_cfg.get("risk_free", {}))
+        except Exception as e:  # noqa: BLE001 - one fund failing must not sink the rest
+            log(f"  fund {fid}: {e}")
+            continue
+        if len(nav) < 60:
+            continue
+        sym = rec["symbol"]
+        df = pd.DataFrame({"open": nav, "high": nav, "low": nav, "close": nav, "volume": 0.0})
+        frames[sym] = df
+        meta[sym] = {"name": rec["name"], "market": "FUND", "kind": "fund", "code": fid, "scored": False,
+                     "industry": rec["industry"], "line": True}
+        trend = scoring.score_stock(scoring.tech_frame(df), None, None, None)
+        rec.update({"horizons": trend["horizons"], "trend": trend["label"], "trend_score": trend["overall"]})
+        fund_records.append(rec)
+    SOURCES.append({"name": "鉅亨網 基金淨值與同類排名", "ok": bool(fund_records) or not fund_list,
+                    "url": "https://fund.cnyes.com", "note": f"{len(fund_records)}/{len(fund_list)} 檔取得"})
+    if not fund_records:  # source down: keep last week's table
+        fund_records = read_json(DATA / "funds.json", [])
+    fund_records.sort(key=lambda r: -(r["score"] if r.get("score") is not None else -1))
+
     # ---- 9. market outlook --------------------------------------------------
     def breadth(market: str) -> float | None:
         rs = [r for r in records if r["market"] == market and r.get("ma60")]
@@ -726,7 +755,10 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                          "episodes": [{k: e[k] for k in ("show", "title", "date", "summary")} for e in h["episodes"]]}
                         for h in hot[:12]],
         "etf": [{k: r.get(k) for k in ("symbol", "name", "market", "industry", "close", "chg5d", "r20", "r60", "ytd",
-                                       "overall", "label", "foreign5")} for r in etf_records]})
+                                       "overall", "label", "foreign5")} for r in etf_records],
+        "funds": [{k: r.get(k) for k in ("symbol", "name", "group", "industry", "currency", "ret", "bench", "beat",
+                                         "excess_ann", "sharpe", "vol_3y", "mdd_3y", "score", "grade", "trend",
+                                         "dist", "bench_name")} for r in fund_records]})
 
     # ---- 10. charts (also the on-disk price store for the next run) ----------
     if prices.Yahoo.enabled:  # optional Taiwan intraday for the names people will open first
@@ -739,6 +771,8 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         payload = prices.compact(df, 5, old.get("w"))
         payload.update({"symbol": s, "name": meta[s]["name"], "i": intraday.get(s) or [],
                         "deep": bool(old.get("deep") or DEEP.get(s))})
+        if meta[s].get("line"):
+            payload["line"] = True  # NAV series: draw a line, not candles
         write_json(CHARTS / f"{fname(s)}.json", payload)
 
     # ---- 11. flows page payload --------------------------------------------
@@ -789,6 +823,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     write_json(DATA / "podcasts.json", {"shows": shows, "mentions": mentions, "hot": hot,
                                         "names": {s: meta[s]["name"] for s in mentions if s in meta}})
     write_json(DATA / "etf.json", etf_records)
+    write_json(DATA / "funds.json", fund_records)
     write_json(DATA / "tools.json", tools)
     slim = lambda r: {k: v for k, v in r.items() if k not in ("bars",)}  # noqa: E731
     write_json(DATA / "universe.json", [slim(r) for r in sorted(records, key=lambda r: -r["overall"])])
@@ -800,9 +835,11 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         "bullish": [slim(r) for r in bullish], "bearish": [slim(r) for r in bearish],
         "backtest": bt, "weights": scoring.WEIGHTS, "sources": SOURCES,
         "counts": {"tw": sum(r["market"] == "TW" for r in records),
-                   "us": sum(r["market"] == "US" for r in records), "etf": len(etf_records)}})
+                   "us": sum(r["market"] == "US" for r in records), "etf": len(etf_records),
+                   "fund": len(fund_records)}})
     bad = [s["name"] for s in SOURCES if not s["ok"]]
-    log(f"done: {len(records)} stocks, {len(etf_records)} ETFs, {len(picks)} picks, {len(hot)} podcast-hot, "
+    log(f"done: {len(records)} stocks, {len(etf_records)} ETFs, {len(fund_records)} funds, {len(picks)} picks, "
+        f"{len(hot)} podcast-hot, "
         f"failed sources: {bad or 'none'}")
     return 0
 

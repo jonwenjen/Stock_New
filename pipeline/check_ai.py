@@ -16,7 +16,7 @@ DATA = Path(__file__).resolve().parent.parent / "docs" / "data"
 MARKET_HEADINGS = 4  # 盤勢重點 / 籌碼面 / 展望 / 操作建議與風險
 
 
-def validate(ai: dict, data_date: str, hot_symbols: list[str]) -> list[str]:
+def validate(ai: dict, data_date: str, hot_symbols: list[str], need_fund: bool = False) -> list[str]:
     """Return a list of problems; empty means the file is fit to publish."""
     errs: list[str] = []
     if ai.get("data_date") != data_date:
@@ -40,6 +40,8 @@ def validate(ai: dict, data_date: str, hot_symbols: list[str]) -> list[str]:
             errs.append(f"podcast.stocks[{sym}] should be 30-400 characters")
     if len(ai.get("etf") or "") < 120:
         errs.append("etf commentary is missing or too short (< 120 characters)")
+    if need_fund and len(ai.get("fund") or "") < 150:
+        errs.append("fund commentary is missing or too short (< 150 characters)")
     blob = json.dumps(ai, ensure_ascii=False)
     for marker in ("TODO", "TBD", "XXX"):
         if marker in blob:
@@ -55,7 +57,8 @@ def main() -> int:
     except (OSError, ValueError) as e:
         print(f"cannot read data files: {e}")
         return 1
-    errs = validate(ai, summary["data_date"], [h["symbol"] for h in pod.get("hot", [])])
+    errs = validate(ai, summary["data_date"], [h["symbol"] for h in pod.get("hot", [])],
+                    need_fund=bool((summary.get("counts") or {}).get("fund")))
     for e in errs:
         print("FAIL", e)
     if not errs:

@@ -27,7 +27,7 @@
   const cls = (v) => (!ok(v) || +v === 0 ? "" : v > 0 ? "up" : "down");
   const numEl = (text, v) => h("span", { class: "num " + cls(v) }, text);
   const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-  const fileOf = (sym) => sym.replace(/[\^=.]/g, "_");
+  const fileOf = (sym) => sym.replace(/[^A-Za-z0-9_-]/g, "_");
   const HZ = { "1w": "一週", "1m": "一月", "1q": "一季" };
   const level = (s) => (s >= 0.45 ? 2 : s >= 0.15 ? 1 : s > -0.15 ? 0 : s > -0.45 ? -1 : -2);
   const ARROW = { 2: "▲", 1: "▲", 0: "■", "-1": "▼", "-2": "▼" };
@@ -75,6 +75,7 @@
   let S = null; // summary.json
   let U = []; // universe.json
   let E = []; // etf.json
+  let FUNDS = []; // funds.json
   let AI = null; // ai.json - commentary written by Claude during the weekly run
   const bySymbol = new Map();
 
@@ -203,6 +204,7 @@
     const chart = LightweightCharts.createChart(box, { ...themeOpts(), autoSize: true,
       handleScale: { axisPressedMouseMove: false }, localization: { locale: "zh-TW" } });
     const candle = chart.addCandlestickSeries({ priceLineVisible: false });
+    const navLine = chart.addLineSeries({ lineWidth: 2, priceLineVisible: false }); // funds: one NAV a day, no candles
     const vol = chart.addHistogramSeries({ priceScaleId: "vol", priceFormat: { type: "volume" }, priceLineVisible: false, lastValueVisible: false });
     chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 }, visible: false });
     chart.priceScale("right").applyOptions({ scaleMargins: { top: 0.06, bottom: 0.2 } });
@@ -214,6 +216,7 @@
       const up = css("--up"), down = css("--down");
       candle.applyOptions({ upColor: up, downColor: down, borderUpColor: up, borderDownColor: down, wickUpColor: up, wickDownColor: down });
       ["--ma1", "--ma2", "--ma3"].forEach((c, i) => mas[i].applyOptions({ color: css(c) }));
+      navLine.applyOptions({ color: css("--ink") });
       if (state.data) draw();
     };
     const show = (r) => {
@@ -221,6 +224,11 @@
       const t = typeof r[0] === "number" ? new Date(r[0] * 1000).toISOString().slice(0, 16).replace("T", " ") : r[0];
       const prev = rowsByTime.get("prev:" + r[0]);
       const chg = prev ? r[4] / prev - 1 : null;
+      if (state.data && state.data.line) {
+        readout.replaceChildren(...[h("span", {}, t), h("span", {}, "淨值 ", h("b", {}, num(r[4], r[4] < 100 ? 4 : 2))),
+          chg != null ? h("span", {}, "較前一筆 ", h("b", { class: cls(chg) }, pct(chg, 2))) : null].filter(Boolean));
+        return;
+      }
       // replaceChildren() would print a null argument as the text "null", hence the filter.
       readout.replaceChildren(...[h("span", {}, t),
         ...[["開", r[1]], ["高", r[2]], ["低", r[3]], ["收", r[4]]].map(([k, v]) => h("span", {}, k + " ", h("b", {}, px(v)))),
@@ -235,9 +243,14 @@
       rows.forEach((r, i) => { rowsByTime.set(r[0], r); if (i) rowsByTime.set("prev:" + r[0], rows[i - 1][4]); });
       // Intraday bars use numeric timestamps, daily bars use date strings; the library cannot hold
       // both at once, so every series is emptied before the new window is loaded.
-      [candle, vol, ...mas].forEach((s) => s.setData([]));
-      candle.setData(rows.map((r) => ({ time: r[0], open: r[1], high: r[2], low: r[3], close: r[4] })));
-      vol.setData(rows.map((r) => ({ time: r[0], value: r[5], color: (r[4] >= r[1] ? up : down) + "66" })));
+      [candle, navLine, vol, ...mas].forEach((s) => s.setData([]));
+      const isLine = !!state.data.line;
+      if (isLine) navLine.setData(rows.map((r) => ({ time: r[0], value: r[4] })));
+      else {
+        candle.setData(rows.map((r) => ({ time: r[0], open: r[1], high: r[2], low: r[3], close: r[4] })));
+        vol.setData(rows.map((r) => ({ time: r[0], value: r[5], color: (r[4] >= r[1] ? up : down) + "66" })));
+      }
+      chart.priceScale("right").applyOptions({ scaleMargins: { top: 0.06, bottom: isLine ? 0.06 : 0.2 } });
       // Moving averages are computed on the full daily history, then clipped to the window.
       const daily = state.data.d || [];
       const first = rows.length ? rows[0][0] : null;
@@ -248,8 +261,8 @@
       fit(chart);
       show(rows[rows.length - 1]);
       const start = (state.data.w && state.data.w[0] ? state.data.w[0][0] : daily[0] && daily[0][0]) || "";
-      note.textContent = `${unit}K・${rows.length} 根` +
-        (fallback ? "・此標的無分時資料，改以最近 5 根日 K 呈現" : "") +
+      note.textContent = (isLine ? `每日淨值・${rows.length} 筆` : `${unit}K・${rows.length} 根`) +
+        (fallback ? (isLine ? "・基金每日只有一個淨值，顯示最近 5 筆" : "・此標的無分時資料，改以最近 5 根日 K 呈現") : "") +
         (intraday ? "・分時資料為更新當下的最近交易日" : "") + (start ? `・歷史資料起始 ${start}` : "");
     }
     chart.subscribeCrosshairMove((p) => {
@@ -328,12 +341,70 @@
         h("span", { class: "small muted num" }, `區間 ${px(f.low)} – ${px(f.high)}`)),
     ]));
   }
+  const GRADE = { 優異: 2, 良好: 1, 普通: 0, 偏弱: -1, 落後: -2 };
+  const gradePill = (r) => (r.grade ? h("span", { class: "pill s" + GRADE[r.grade] }, r.grade) : h("span", { class: "muted small" }, "未滿一年"));
+  const scoreCell = (r) => (ok(r.score)
+    ? h("span", { class: "row", style: "justify-content:flex-end;flex-wrap:nowrap" }, meter((r.score - 50) / 50), h("b", { class: "num" }, num(r.score, 0)))
+    : h("span", { class: "muted" }, "–"));
+  const beatText = (v) => (ok(v) ? `贏過 ${num(v, 0)}%` : "–");
+  const FP = [["1m", "1 個月"], ["3m", "3 個月"], ["6m", "6 個月"], ["ytd", "今年以來"], ["1y", "1 年"], ["3y", "3 年累積"], ["5y", "5 年累積"], ["10y", "10 年累積"]];
+
+  function fundDrawer(r) {
+    const part = (k, label, hint) => [h("span", {}, label), ok(r.parts[k]) ? meter((r.parts[k] - 50) / 50) : h("span", { class: "muted small" }, "無資料"),
+      h("span", { class: "num", title: hint }, ok(r.parts[k]) ? num(r.parts[k], 0) : "–")];
+    const info = [["基金公司", r.company], ["類別", r.industry], ["計價幣別", r.currency], ["風險等級", r.rr ? "RR" + r.rr : null],
+      ["晨星星等", r.stars ? "★".repeat(r.stars) : null], ["經理費", ok(r.fee) ? num(r.fee, 2) + "%" : null], ["成立日", r.inception],
+      ["基金規模", ok(r.aum) ? num(r.aum / 1e8, 0) + " 億 " + (r.aum_currency || "") : null], ["配息", r.dist || "不配息／累積"],
+      ["經理人", r.manager], ["對比指數", r.bench_name]].filter(([, v]) => v);
+    return [
+      h("div", { class: "drawer-head" },
+        h("div", {}, h("div", { class: "t" }, r.name, h("span", { class: "chip mk" }, r.group), gradePill(r)),
+          h("div", { class: "row" }, h("span", { class: "p num" }, num(r.close, r.close < 100 ? 4 : 2)), numEl(pct(r.chg1d, 2), r.chg1d),
+            h("span", { class: "muted small" }, `淨值日 ${r.date}・${r.currency}`))),
+        h("button", { class: "close", type: "button", onclick: closeDrawer }, "關閉")),
+      h("div", { class: "panel" }, priceChart(r.symbol, { range: "2y" })),
+      h("div", { class: "panel stack" }, h("div", { class: "sec-head" }, h("h3", {}, "績效評估"), scoreCell(r)),
+        h("p", {}, r.verdict),
+        h("div", { class: "factors" },
+          part("peer", "同類排名", "近 1／3／5 年贏過同類基金的比例"), part("excess", "勝過指數", "年化報酬與對比指數的差距"),
+          part("sharpe", "風險調整報酬", "Sharpe ratio"), part("drawdown", "抗跌", "三年內最大回檔")),
+        h("p", { class: "chart-note" }, "四個面向各換算成 0–100 分，權重為同類排名 40%、勝過指數 20%、風險調整報酬 25%、抗跌 15%。")),
+      h("div", { class: "panel" }, h("h3", {}, "各期間報酬與同類排名"), table([
+        { key: "p", label: "期間", left: true, cell: ([, label]) => label },
+        { key: "f", label: "本基金", cell: ([k]) => numEl(pct(r.ret[k]), r.ret[k]) },
+        { key: "b", label: "對比指數", cell: ([k]) => numEl(pct(r.bench[k]), r.bench[k]) },
+        { key: "c", label: "同類平均", cell: ([k]) => numEl(pct(r.cat[k]), r.cat[k]) },
+        { key: "r", label: "同類排名", cell: ([k]) => h("span", { class: "num" }, r.rank[k] ? `${r.rank[k].rank} / ${r.rank[k].total}` : "–") },
+        { key: "w", label: "贏過同類", cell: ([k]) => h("span", { class: "num" }, r.rank[k] ? num(r.rank[k].beat, 0) + "%" : "–") }],
+      FP.filter(([k]) => ok(r.ret[k]))),
+        h("p", { class: "chart-note" }, `報酬為${r.currency}計價、含配息，來源為鉅亨網（晨星資料）。` + (ok(r.ret_1y_twd) && r.currency !== "新台幣" ? `換算新台幣的近一年報酬為 ${pct(r.ret_1y_twd)}。` : ""))),
+      h("div", { class: "grid g2" },
+        h("div", { class: "panel" }, h("h3", {}, "風險"), h("div", { class: "kv" }, [
+          ["年化波動（3 年）", ok(r.vol_3y) ? num(r.vol_3y * 100, 1) + "%" : "–"], ["年化波動（1 年）", ok(r.vol_1y) ? num(r.vol_1y * 100, 1) + "%" : "–"],
+          ["最大回檔（3 年）", pct(r.mdd_3y)], ["最大回檔（1 年）", pct(r.mdd_1y)], ["Sharpe（3 年）", num(r.sharpe, 2)],
+          ["正報酬月份比例", ok(r.win_months) ? num(r.win_months * 100, 0) + "%" : "–"]].map(([k, v]) =>
+          h("div", {}, h("div", { class: "k" }, k), h("div", { class: "v num" }, v)))),
+          h("p", { class: "chart-note", style: "margin-top:10px" }, "風險數字由每日淨值計算，淨值不含配息還原。")),
+        h("div", { class: "panel" }, h("h3", {}, "基金資料"), h("div", { class: "src" }, info.map(([k, v]) => [h("span", { class: "muted" }, k), h("span", {}, v)])))),
+      h("div", { class: "panel" }, h("h3", {}, "淨值趨勢（技術面）"), forecastGrid(r.horizons),
+        h("p", { class: "chart-note" }, "只看淨值走勢的趨勢與動能，與上方的績效評估是兩回事：績效看過去值不值得持有，趨勢看目前的方向。")),
+    ];
+  }
+
   function openDrawer(symbol) {
     closeDrawer();
     lastFocus = document.activeElement;
     const r = bySymbol.get(symbol), ix = S.indices.find((i) => i.symbol === symbol);
     const item = r || ix;
     if (!item) return;
+    if (r && r.kind === "fund") {
+      const fd = h("div", { class: "drawer", role: "dialog", "aria-modal": "true", "aria-label": r.name + " 績效評估" }, fundDrawer(r));
+      drawerEl = h("div", { class: "scrim", onclick: (e) => { if (e.target === drawerEl) closeDrawer(); } }, fd);
+      document.body.append(drawerEl);
+      document.body.style.overflow = "hidden";
+      fd.querySelector(".close").focus();
+      return;
+    }
     const body = [];
     body.push(h("div", { class: "drawer-head" },
       h("div", {}, h("div", { class: "t" }, item.name, r ? h("span", { class: "num muted small" }, r.code) : null, r ? mkChip(r.market) : null,
@@ -586,6 +657,46 @@
       ];
     },
 
+    async funds() {
+      const state = { g: "ALL" };
+      const groups = [...new Set(FUNDS.map((r) => r.group))];
+      const cols = [
+        { key: "n", label: "基金", left: true, wrap: true, cell: (r) => h("span", {}, h("b", { style: "font-weight:500" }, r.name), " ", h("span", { class: "chip" }, r.currency)) },
+        { key: "g", label: "類型", left: true, cell: (r) => h("span", { class: "chip mk" }, r.group) },
+        { key: "e", label: "績效評等", left: true, val: (r) => r.score, cell: (r) => gradePill(r) },
+        { key: "s", label: "評分", val: (r) => r.score, cell: (r) => scoreCell(r) },
+        { key: "1m", label: "1 月", val: (r) => r.ret["1m"], cell: (r) => numEl(pct(r.ret["1m"]), r.ret["1m"]) },
+        { key: "3m", label: "3 月", val: (r) => r.ret["3m"], cell: (r) => numEl(pct(r.ret["3m"]), r.ret["3m"]) },
+        { key: "1y", label: "1 年", val: (r) => r.ret["1y"], cell: (r) => numEl(pct(r.ret["1y"]), r.ret["1y"]) },
+        { key: "3y", label: "3 年累積", val: (r) => r.ret["3y"], cell: (r) => numEl(pct(r.ret["3y"], 0), r.ret["3y"]) },
+        { key: "x", label: "年化勝過指數", tip: "年化報酬減對比指數年化報酬（百分點）", val: (r) => r.excess_ann, cell: (r) => numEl(ok(r.excess_ann) ? signed(r.excess_ann * 100, 1) + " pp" : "–", r.excess_ann) },
+        { key: "b1", label: "同類 1 年", val: (r) => r.beat["1y"], cell: (r) => h("span", { class: "num" }, beatText(r.beat["1y"])) },
+        { key: "b3", label: "同類 3 年", val: (r) => r.beat["3y"], cell: (r) => h("span", { class: "num" }, beatText(r.beat["3y"])) },
+        { key: "sh", label: "Sharpe", val: (r) => r.sharpe, cell: (r) => h("span", { class: "num" }, num(r.sharpe, 2)) },
+        { key: "v", label: "年化波動", val: (r) => r.vol_3y, cell: (r) => h("span", { class: "num" }, ok(r.vol_3y) ? num(r.vol_3y * 100, 0) + "%" : "–") },
+        { key: "d", label: "最大回檔", val: (r) => r.mdd_3y, cell: (r) => numEl(pct(r.mdd_3y, 0), r.mdd_3y) },
+        { key: "t", label: "淨值趨勢", left: true, cell: (r) => (r.horizons ? pill(r.horizons["1m"]) : "–") }];
+      const tbl = table(cols, FUNDS, { sort: "s", onRow: (r) => openDrawer(r.symbol) });
+      const seg = h("div", { class: "seg", role: "group", "aria-label": "基金類型" }, [["ALL", "全部"], ...groups.map((g) => [g, g])].map(([k, v]) =>
+        h("button", { type: "button", "aria-pressed": String(k === "ALL"), onclick: (e) => {
+          state.g = k; seg.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b === e.currentTarget)));
+          tbl.setRows(FUNDS.filter((r) => state.g === "ALL" || r.group === state.g));
+        } }, v)));
+      const graded = FUNDS.filter((r) => ok(r.score));
+      const top = (rows) => rows.slice(0, 2).map((r) => `${r.name.slice(0, 14)}（${num(r.score, 0)}）`).join("、") || "–";
+      return [
+        head("基金", "台灣投資人常買的境內與境外基金。除了報酬，更重要的是這份報酬是怎麼來的：有沒有贏過同類基金與對比指數、承擔了多少波動與回檔。"),
+        FUNDS.length ? h("div", { class: "stats" }, groups.map((g) => {
+          const rows = graded.filter((r) => r.group === g);
+          return statBox(`${g}・評分最高`, top(rows), `${rows.length} 檔有評等`);
+        })) : null,
+        aiBlock("本週基金觀察", AI && AI.fund),
+        FUNDS.length ? h("div", { class: "panel stack" }, seg, tbl,
+          h("p", { class: "chart-note" }, "績效評分 0–100：同類排名 40%、年化勝過對比指數 20%、風險調整報酬（Sharpe）25%、抗跌（三年最大回檔）15%。75 以上優異、60 良好、45 普通、30 偏弱。報酬為原幣計價、含配息；點列看完整評估。"))
+          : h("div", { class: "empty" }, "尚無基金資料，下次更新後會出現"),
+      ];
+    },
+
     async alerts() {
       const list = (rows, kind) => table([
         { key: "n", label: "個股", left: true, cell: (r) => h("span", {}, nameCell(r), " ", mkChip(r.market)) },
@@ -703,8 +814,11 @@
         h("div", { class: "panel" }, h("h3", {}, "本週資料來源狀態"), h("div", { class: "src" }, S.sources.map((s) => [
           h("span", { class: "dot " + (s.ok ? "ok" : "bad") }, s.ok ? "✓ 成功" : "✕ 未取得"),
           h("span", {}, s.url ? h("a", { href: s.url, target: "_blank", rel: "noopener noreferrer" }, s.name) : s.name, s.note ? h("span", { class: "muted" }, "　" + s.note) : null)]))),
+        h("div", { class: "panel stack" }, h("h3", {}, "基金績效怎麼評"),
+          h("p", { class: "small" }, "報酬、對比指數報酬、同類平均與同類排名採用鉅亨網基金頁提供的晨星資料（含配息）；年化波動、最大回檔、Sharpe、正報酬月份比例由本站用每日淨值自行計算。評分把四個面向各換算成 0–100 分再加權：同類排名 40%（近 1／3／5 年贏過同類的比例，3 年權重最高）、年化報酬勝過對比指數 20%（±10 個百分點對應 0／100 分）、Sharpe 25%（0.5 為中點）、三年最大回檔 15%。成立未滿一年不評等。"),
+          h("p", { class: "small muted" }, "限制：淨值不含配息還原，配息級別的回檔會被高估，所以名單優先選累積級別；Sharpe 的無風險利率依計價幣別取固定值；過去績效不代表未來。")),
         h("div", { class: "panel stack" }, h("h3", {}, "更新方式與 AI 觀點"),
-          h("p", { class: "small" }, "每週三由 Claude 排程自動執行：抓取資料、計算分數、撰寫觀點，然後直接推送到 GitHub。「AI 觀點」「Podcast 話題解讀」「ETF 觀察」三段文字由當次執行的 Claude 只根據本頁同一批數據撰寫，並經過程式檢查資料日期一致才會發布；其餘數字與判讀全部由固定規則計算。")),
+          h("p", { class: "small" }, "每週三由 Claude 排程自動執行：抓取資料、計算分數、撰寫觀點，然後直接推送到 GitHub。「AI 觀點」「Podcast 話題解讀」「ETF 觀察」「基金觀察」四段文字由當次執行的 Claude 只根據本頁同一批數據撰寫，並經過程式檢查資料日期一致才會發布；其餘數字與判讀全部由固定規則計算。")),
         tools.length ? h("div", { class: "panel" }, h("h3", {}, "參考的開源投資與 AI 工具（GitHub 星數排序）"), table([
           { key: "n", label: "專案", left: true, cell: (r) => h("a", { href: r.url, target: "_blank", rel: "noopener noreferrer" }, r.name) },
           { key: "s", label: "星數", cell: (r) => h("span", { class: "num" }, nf(0).format(r.stars)) },
@@ -741,7 +855,8 @@
       app.replaceChildren(h("div", { class: "empty" }, "找不到資料檔。請先執行 python -m pipeline.build，或等待每週三的自動更新。（" + e.message + "）"));
       return;
     }
-    [E, AI] = await Promise.all([load("etf").catch(() => []), load("ai").catch(() => null)]);
+    [E, FUNDS, AI] = await Promise.all([load("etf").catch(() => []), load("funds").catch(() => []), load("ai").catch(() => null)]);
+    FUNDS.forEach((r) => bySymbol.set(r.symbol, r));
     U.forEach((r) => bySymbol.set(r.symbol, r));
     E.forEach((r) => bySymbol.set(r.symbol, r));
     [...S.picks, ...S.bullish, ...S.bearish].forEach((r) => bySymbol.set(r.symbol, r));

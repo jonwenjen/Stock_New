@@ -88,6 +88,10 @@
 - `picks`、`bullish`、`bearish` 每檔有 `tactical`（短線分）、`structural`（結構分）與 `setup`（兩者的組合判讀），
   操作建議中可以用它區分「結構佳但短線弱，等轉強」與「短線強但結構弱，僅宜短打」。`picks_track` 是過去精選名單的實際表現，有資料時在操作建議中如實交代，
   落後大盤也要寫。
+- `market` 也要用到 `market_safety`：「本週盤勢重點」帶出風險分數（`risk.score`、`risk.name`，並說明最高的兩三項
+  `risk.parts`）與市場週期（`regime.name`、`regime.days`）；「籌碼面」帶出外資台指期（`futures.net_oi`、`futures.chg5`）；
+  「操作建議與風險」依 `alerts` 中 level 2 的項目提醒，並可從 `accumulating`、`weakening` 各舉一兩檔。
+  `accuracy` 顯示模型區分力有限時（`brier` 不低於 `base_brier`）要照實說，不要把機率寫得比數據更有把握。
 - `podcast.overview`：這兩週節目在談什麼主題（依 `podcast_hot[].episodes` 的標題與摘要），
   以及被談論的標的整體是強是弱。
 - `podcast.stocks`：`podcast_hot` 前 8 檔各寫一則（鍵用 `symbol` 欄位，至少要涵蓋前 5 檔）。

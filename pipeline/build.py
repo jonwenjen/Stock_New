@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import funds, http, indicators, leading, media, prices, scoring, twse, us_data
+from . import funds, http, indicators, leading, market, media, prices, scoring, twse, us_data
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "docs" / "data"
@@ -948,6 +948,9 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
             item["reasons"] = [t for t, _ in scoring.tech_reasons(row)]
         indices_out.append(item)
 
+    mkt = safe("市場安全（風險分數、週期、連動、準確度）", lambda: build_market(
+        frames, tframes, stocks, meta, flows, lead, tw_flow, records, tactical_prev, indices_out,
+        trading_days[-1], today), None) or read_json(DATA / "market.json", {})
     narrative = build_narrative(indices_out, tw_flow, picks, bullish, bearish)
     brief = lambda r: {k: r.get(k) for k in ("code", "name", "market", "industry", "close", "chg5d", "r20",  # noqa: E731
                                              "overall", "label", "tactical", "structural", "setup",
@@ -959,6 +962,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         "tw_flow": tw_flow, "narrative": narrative, "backtest": bt,
         "leading": [{k: c.get(k) for k in ("name", "value_text", "change_text", "reading")} for c in lead["cards"]],
         "regime": lead.get("regime"),
+        "market_safety": market_digest(mkt),
         "options": [{k: o.get(k) for k in ("expiry", "call_wall", "put_wall", "max_pain")} for o in lead.get("options") or []],
         "trust_first": [{k: r.get(k) for k in ("code", "name", "streak", "quiet", "value")} for r in trust_first[:8]],
         "picks_track": track[-8:],
@@ -1061,6 +1065,8 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     write_json(DATA / "leading.json", {"cards": lead["cards"], "series": lead["series"],
                                        "options": lead.get("options"), "regime": lead.get("regime")})
     write_json(DATA / "tools.json", tools)
+    if mkt:
+        write_json(DATA / "market.json", mkt)
     slim = lambda r: {k: v for k, v in r.items() if k not in ("bars",)}  # noqa: E731
     write_json(DATA / "universe.json", [slim(r) for r in sorted(records, key=lambda r: -r["overall"])])
     write_json(DATA / "summary.json", {
@@ -1079,6 +1085,193 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         f"{len(hot)} podcast-hot, "
         f"failed sources: {bad or 'none'}")
     return 0
+
+
+# ----------------------------- market safety ----------------------------- #
+def update_futures_history(today: dt.date) -> dict[str, dict]:
+    """Foreign TX net open interest per day. The first run backfills about 13 months, later runs the last one."""
+    path = DATA / "history" / "tw_futures.json"
+    hist = read_json(path, {})
+    months = 1 if QUICK or len(hist) >= 200 else 13
+    end = today
+    for _ in range(months):
+        start = end - dt.timedelta(days=30)
+        try:
+            hist.update(market.futures_history(start.isoformat(), end.isoformat()))
+        except Exception as e:  # noqa: BLE001 - one missing month only shortens the history
+            log(f"  futures history {start}..{end}: {str(e)[:80]}")
+        end = start - dt.timedelta(days=1)
+    hist = {d: hist[d] for d in sorted(hist)[-520:]}
+    write_json(path, hist)
+    return hist
+
+
+RISK_READ = {
+    "trend": lambda x: f"加權指數處於「{market.REGIMES[x['regime']]}」，距一年高點 {x['drawdown']:+.1%}",
+    "breadth": lambda x: f"廣度指數 {x['breadth']:.0f}（0–100，越低代表越少個股站上均線）",
+    "foreign": lambda x: f"外資近 20 日買賣超占成交值 {x['foreign20_ratio']:+.1%}，連續 {abs(x.get('foreign_streak') or 0)} 日"
+                         + ("買超" if (x.get("foreign_streak") or 0) > 0 else "賣超"),
+    "futures": lambda x: f"台指期淨未平倉 {x['fut_net']:+,.0f} 口，" + ("是過去一年最偏空的水準" if x["fut_pct"] <= 0.01 else
+                                                               f"比過去一年 {1 - x['fut_pct']:.0%} 的日子更偏空"),
+    "margin": lambda x: f"大盤融資維持率估算約 {x['maint']:.0%}（170% 以上視為安全，140% 以下危險）",
+    "vol": lambda x: f"VIX {x['vix']:.1f}" + (f"，期限結構 {x['vix_term']:.2f}" if x.get("vix_term") is not None else ""),
+    "credit": lambda x: f"美國高收益債利差 {x['oas']:.2f}%，10 日 {x.get('oas_chg10') or 0:+.2f} 個百分點",
+    "intl": lambda x: f"SOXX 20 日 {x['soxx_r20']:+.1%}、那斯達克 {x['ndq_r20']:+.1%}、美元／台幣 {x['fx_r20']:+.1%}",
+    "stress": lambda x: f"OFR 金融壓力指數 {x['fsi']:+.2f}（0 為長期平均，負值代表壓力低於平均）",
+}
+
+
+def build_market(frames: dict, tframes: dict, stocks: list[str], meta: dict, flows: list[dict], lead: dict,  # noqa: C901, PLR0915
+                 tw_flow: dict, records: list[dict], tactical_prev: dict, indices_out: list[dict],
+                 data_date: str, today: dt.date) -> dict:
+    """Is the market safe, which stocks are gathering or losing momentum, and how good were past calls."""
+    twii = frames["TWII"]["close"]
+    iso = lambda d: d.strftime("%Y-%m-%d")  # noqa: E731
+    r20 = lambda s: float(s.iloc[-1] / s.iloc[-21] - 1) if len(s) > 21 else None  # noqa: E731
+    x: dict = {}
+
+    # breadth index and whether the index's highs / lows are confirmed by it
+    b = leading.breadth({s: tframes[s] for s in stocks if meta[s]["market"] == "TW"}, n=250)
+    ad = [r for r in flows if r.get("adv") is not None][-10:]
+    ad_ratio = sum(r["adv"] for r in ad) / max(1, sum(r["dec"] for r in ad)) if ad else None
+    bidx = market.breadth_index(b, ad_ratio)
+    breakout = market.breakout_check(twii, bidx)
+    x.update({"breadth": float(bidx.iloc[-1]), "breakout": breakout,
+              "breadth_chg5": float(bidx.iloc[-1] - bidx.iloc[-6]) if len(bidx) > 6 else None})
+    breadth_out = {"value": x["breadth"], "chg5": x["breadth_chg5"], "above20": float(b["above20"].iloc[-1]),
+                   "above60": float(b["above60"].iloc[-1]), "ad_ratio": ad_ratio, "breakout": breakout,
+                   "series": [{"date": iso(d), "v": float(v), "twii": float(twii.get(d)) if d in twii.index else None}
+                              for d, v in bidx.items()]}
+
+    # regime
+    states = market.regime_states(twii)
+    reg = market.regime_now(states)
+    x.update({"regime": reg["state"], "drawdown": float(twii.iloc[-1] / twii.tail(250).max() - 1)})
+    reg.update({"ma60": float(twii.rolling(60).mean().iloc[-1]), "ma200": float(twii.rolling(200).mean().iloc[-1]),
+                "close": float(twii.iloc[-1]), "drawdown": x["drawdown"],
+                "stats": market.forward_stats(states, twii), "sample_from": iso(states.index[0])})
+
+    # foreign futures
+    fut_out, fut_risk = None, None
+    fh = safe("期交所 外資台指期未平倉歷史", lambda: update_futures_history(today), None, "https://www.taifex.com.tw")
+    if fh:
+        fs = pd.Series({pd.Timestamp(d): v["net_oi"] for d, v in fh.items()}).sort_index()
+        x.update({"fut_net": float(fs.iloc[-1]), "fut_pct": leading.percentile(fs),
+                  "fut_chg5": float(fs.iloc[-1] - fs.iloc[-6]) if len(fs) > 6 else None})
+        fut_risk = (1 - fs.rolling(250, min_periods=120).rank(pct=True)) * 100
+        fut_out = {"date": iso(fs.index[-1]), "net_oi": x["fut_net"], "chg5": x["fut_chg5"],
+                   "chg20": float(fs.iloc[-1] - fs.iloc[-21]) if len(fs) > 21 else None, "pct": x["fut_pct"],
+                   "min_250": float(fs.tail(250).min()), "max_250": float(fs.tail(250).max()),
+                   "series": [{"date": iso(d), "v": float(v), "twii": float(twii.get(d)) if d in twii.index else None}
+                              for d, v in fs.tail(250).items()]}
+
+    # global financial stress (OFR)
+    stress_out, fsi = None, safe("OFR 金融壓力指數", market.ofr_fsi, None, "https://www.financialresearch.gov/financial-stress-index/")
+    if fsi is not None and len(fsi) > 30:
+        last = fsi.iloc[-1]
+        x.update({"fsi": float(last["fsi"]), "fsi_chg20": float(last["fsi"] - fsi["fsi"].iloc[-21])})
+        stress_out = {"date": iso(fsi.index[-1]), "value": x["fsi"], "chg20": x["fsi_chg20"],
+                      "pct_5y": leading.percentile(fsi["fsi"], 1250),
+                      "parts": [{"name": n, "value": float(last[k]), "chg20": float(last[k] - fsi[k].iloc[-21])}
+                                for k, n in (("credit", "信用"), ("equity", "股票估值"), ("funding", "融資"),
+                                             ("safe", "避險資產"), ("vol", "波動率"))],
+                      "series": [[iso(d), float(v)] for d, v in fsi["fsi"].tail(500).items()]}
+
+    # the rest of today's readings
+    turnover, f20 = tw_flow.get("turnover"), tw_flow.get("foreign_20d")
+    soxx, ndq, fxs, vix = (frames[k]["close"] if k in frames else None for k in ("SOXX", "NDQ", "USDTWD", "VIX"))
+    rg, vt, oas_full = lead.get("regime") or {}, lead.get("vix_term_full"), lead.get("oas_full")
+    x.update({"foreign20_ratio": f20 / (turnover * 20) if turnover and f20 is not None else None,
+              "foreign_streak": tw_flow.get("foreign_streak"), "maint": tw_flow.get("maint"),
+              "vix": float(vix.iloc[-1]) if vix is not None else None,
+              "vix_term": float(vt.iloc[-1]) if vt is not None else None,
+              "oas": rg.get("oas"), "oas_chg10": rg.get("oas_chg10"),
+              "soxx_r20": r20(soxx) if soxx is not None else None, "ndq_r20": r20(ndq) if ndq is not None else None,
+              "fx_r20": r20(fxs) if fxs is not None else None})
+    parts = market.risk_parts(x)
+    for p in parts:
+        p["reading"] = RISK_READ[p["key"]](x)
+    total = market.risk_total(parts)
+
+    # the score's own history, from the components that reach back years, and how the index did afterwards
+    hs = {"trend": states.map(market.REGIME_RISK).astype(float)}
+    if vix is not None:
+        hs["vol"] = market.vol_risk(vix)
+    if oas_full is not None:
+        hs["credit"] = market.credit_risk(oas_full)
+    if all(v is not None for v in (soxx, ndq, fxs)):
+        al = lambda s: s.reindex(s.index.union(twii.index)).ffill().reindex(twii.index)  # noqa: E731
+        hs["intl"] = market.intl_risk(al(soxx).pct_change(20), al(ndq).pct_change(20), al(fxs).pct_change(20)).dropna()
+    if fsi is not None:
+        hs["stress"] = market.lin(fsi["fsi"], -2.5, 2.0)
+    if fut_risk is not None:
+        hs["futures"] = fut_risk.dropna()
+    hist = market.risk_history(hs, states.index)
+    risk_out = {"score": total, **market.risk_level(total), "parts": parts,
+                "history_parts": [n for k, n, _w in market.RISK_PARTS if k in hs],
+                "buckets": market.bucket_stats(hist, twii), "sample_from": iso(hist.index[0]) if len(hist) else None,
+                "series": [{"date": iso(d), "v": float(v), "twii": float(twii.get(d))} for d, v in hist.tail(500).items()]}
+
+    # cross-market linkage
+    link = None
+    if all(v is not None for v in (soxx, ndq, fxs)):
+        link = market.linkage(twii, [("SOXX", "費城半導體（SOXX）", soxx, True), ("NDQ", "那斯達克綜合", ndq, True),
+                                     ("USDTWD", "美元／台幣", fxs, False)])
+        if link:
+            for d, s in zip(link["drivers"], (soxx, ndq, fxs)):
+                d.update({"date": iso(s.index[-1]), "r5": float(s.iloc[-1] / s.iloc[-6] - 1), "r20": r20(s)})
+
+    # forecasts: log today's, score the ones whose horizon has passed
+    log_path = DATA / "history" / "forecasts.json"
+    flog = read_json(log_path, {"stk": {}, "idx": {}})
+    hz = list(scoring.HORIZONS)
+    flog["stk"][data_date] = {r["symbol"]: [r["close"]] + [r["horizons"][h]["score"] for h in hz] for r in records}
+    flog["idx"][data_date] = {i["symbol"]: {"close": i["close"], "h": {h: [i["horizons"][h]["p_up"], i["horizons"][h]["low"],
+                                                                         i["horizons"][h]["high"]] for h in hz}}
+                              for i in indices_out if i.get("horizons")}
+    for k in ("stk", "idx"):
+        flog[k] = {d: flog[k][d] for d in sorted(flog[k])[-30:]}
+    write_json(log_path, flog)
+    past = lambda k: {d: v for d, v in flog[k].items() if d < data_date}  # noqa: E731
+    accuracy = {"backtest": market.calibration({s: tframes[s] for s in stocks}, scoring.HORIZONS),
+                "live": market.evaluate_log(past("stk"), frames, scoring.HORIZONS),
+                "index_log": market.evaluate_index_log(past("idx"), frames, scoring.HORIZONS)[-40:],
+                "snapshots": len(flog["stk"]), "first_snapshot": min(flog["stk"])}
+
+    acc, weak = market.momentum_lists(records, tactical_prev)
+
+    # alerts need the previous run to tell what changed
+    hist_path = DATA / "history" / "market.json"
+    runs = [r for r in read_json(hist_path, []) if r["date"] != data_date]
+    prev = runs[-1] if runs else {}
+    x.update({"risk": total, "risk_prev": prev.get("risk"), "regime_prev_run": prev.get("regime")})
+    alerts = market.alerts(x)
+    runs.append({"date": data_date, "risk": total, "breadth": x["breadth"], "regime": reg["state"],
+                 "fut_net": x.get("fut_net"), "alerts": len([a for a in alerts if a["level"] == 2])})
+    write_json(hist_path, runs[-260:])
+
+    tw = next((i for i in indices_out if i["symbol"] == "TWII"), None)
+    return {"date": data_date, "risk": risk_out, "risk_prev": prev.get("risk"), "regime": reg, "breadth": breadth_out,
+            "futures": fut_out, "stress": stress_out, "linkage": link, "accuracy": accuracy,
+            "accumulating": acc, "weakening": weak, "alerts": alerts, "runs": runs[-26:],
+            "index_outlook": {h: {**tw["horizons"][h], "days": d,
+                                  "base": (reg["stats"].get(reg["state"]) or {}).get(h)}
+                              for h, d in scoring.HORIZONS.items()} if tw else None}
+
+
+def market_digest(m: dict) -> dict | None:
+    """The part of market.json the weekly commentary may quote."""
+    if not m:
+        return None
+    strip = lambda d, *drop: None if d is None else {k: v for k, v in d.items() if k not in drop}  # noqa: E731
+    return {"risk": strip(m["risk"], "series"), "risk_prev": m.get("risk_prev"),
+            "regime": m["regime"], "breadth": strip(m["breadth"], "series"),
+            "futures": strip(m["futures"], "series"), "stress": strip(m["stress"], "series"),
+            "linkage": m["linkage"], "alerts": m["alerts"], "index_outlook": m["index_outlook"],
+            "accuracy": {"backtest": {h: strip(v, "bins") for h, v in m["accuracy"]["backtest"].items()},
+                         "live": m["accuracy"]["live"]},
+            "accumulating": [{k: r[k] for k in ("code", "name", "market", "chg5d", "tactical", "tags")} for r in m["accumulating"][:8]],
+            "weakening": [{k: r[k] for k in ("code", "name", "market", "chg5d", "tactical", "tags")} for r in m["weakening"][:8]]}
 
 
 def update_revenue_history(revenue: dict) -> dict[str, dict]:
@@ -1200,6 +1393,7 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
         ts = leading.term_structure(frames["VIX"]["close"], prices.cboe_daily("_VIX3M")["close"])
         now = float(ts.iloc[-1])
         series["vix_term"] = dated(ts)
+        extra["vix_term_full"] = ts
         cards.append(_card("vixts", "VIX 期限結構（VIX ÷ VIX3M）", f"{now:.2f}", f"5 日 {now - float(ts.iloc[-6]):+.2f}",
                            ("高於 1：短期恐慌高過三個月後的預期，屬於恐慌狀態；由高點回落常出現在急跌尾聲。"
                             if now >= 1 else "低於 1：屬正常狀態，短期避險需求不高。"), -1 if now >= 1 else 0, ts.tail(60)))
@@ -1277,6 +1471,7 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
         ratio = (frames["SOXX"]["close"] / frames["SPY"]["close"]).dropna()
         rg = leading.risk_regime(oas, ratio)
         extra["regime"] = rg
+        extra["oas_full"] = oas
         series["hy_oas"] = dated(oas)
         series["semis_rel"] = dated(ratio)
         cards.append(_card("hy", "美國高收益債利差", f"{rg['oas']:.2f}%", f"10 日 {rg['oas_chg10']:+.2f} 個百分點",

@@ -83,7 +83,7 @@
   const CARD_KB = { vixts: "vix", breadth_tw: "breadth", breadth_us: "breadth" };
   // Two-level navigation: five groups, each holding the views that are read together.
   const NAV = [
-    ["市場總覽", [["overview", "總覽與預測"], ["alerts", "漲跌預警"]]],
+    ["市場總覽", [["overview", "總覽與預測"], ["safety", "市場安全"], ["alerts", "漲跌預警"]]],
     ["核心選股", [["picks", "精選 20 檔"], ["fund", "財報指標"]]],
     ["籌碼與聰明錢", [["flows", "外資法人"], ["margin", "融資融券"], ["smart", "名人・議員・董監"]]],
     ["資產配置", [["etf", "ETF"], ["funds", "基金"]]],
@@ -902,6 +902,135 @@
         FUNDS.length ? h("div", { class: "panel stack" }, seg, tbl,
           h("p", { class: "chart-note" }, "績效評分 0–100：同類排名 40%、年化勝過對比指數 20%、風險調整報酬（Sharpe）25%、抗跌（三年最大回檔）15%。75 以上優異、60 良好、45 普通、30 偏弱。報酬為原幣計價、含配息；點列看完整評估。"))
           : h("div", { class: "empty" }, "尚無基金資料，下次更新後會出現"),
+      ];
+    },
+
+    // Is the market safe, what is gathering or losing momentum, and how good were past calls (market.json).
+    async safety() {
+      const M = await load("market");
+      const R = M.risk, G = M.regime, B = M.breadth, F = M.futures, L = M.linkage, A = M.accuracy, X = M.stress;
+      const HD = { "1w": "5 日", "1m": "20 日", "1q": "60 日" };
+      const riskBar = (v) => {
+        const bar = h("i");
+        bar.style.cssText = `left:0;width:${Math.max(2, Math.min(100, v))}%;background:var(${v >= 50 ? "--warn" : "--ink-3"});opacity:${v >= 70 || v < 30 ? 1 : 0.6}`;
+        return h("span", { class: "meter plain", role: "img", "aria-label": `風險 ${num(v, 0)}` }, bar);
+      };
+      const LV = { 2: ["s-2", "警戒"], 1: ["s-1", "留意"], 0: ["s1", "改善"] };
+      const fwd = (c) => (c ? h("span", { class: "num" }, num(c.up * 100, 0) + "%", h("span", { class: "muted small" }, `（${pct(c.avg)}）`)) : "–");
+      const fwdCols = Object.entries(HD).map(([k, t]) => ({ key: k, label: `之後 ${t}上漲比率（平均報酬）`, val: (r) => r[k] && r[k].up, cell: (r) => fwd(r[k]) }));
+      const O = M.index_outlook;
+      const bo = B.breakout || {};
+      const BO = { confirmed: ["真突破：指數創高、廣度同步", "s1"], false_risk: ["假突破風險：指數創高、廣度沒跟上", "s-2"],
+        washout: ["超賣：指數破底、廣度極低", "s-1"], divergence_up: ["底部背離：指數破底、廣度回升", "s1"], none: ["指數不在近 20 日高低點，沒有突破要驗證", "s0"] };
+      const momTable = (rows) => table([
+        { key: "n", label: "個股", left: true, cell: (r) => h("span", {}, nameCell(r), " ", mkChip(r.market)) },
+        { key: "c", label: "收盤", cell: (r) => h("span", { class: "num" }, px(r.close)) },
+        { key: "w", label: "週漲跌", val: (r) => r.chg5d, cell: (r) => numEl(pct(r.chg5d), r.chg5d) },
+        { key: "t", label: "短線分", val: (r) => r.tactical, cell: (r) => numEl(signed(r.tactical, 2), r.tactical) },
+        { key: "d", label: "較上週", val: (r) => r.tactical_chg, cell: (r) => numEl(ok(r.tactical_chg) ? signed(r.tactical_chg, 2) : "–", r.tactical_chg) },
+        ...Object.entries(HD).map(([k, t]) => ({ key: k, label: t + "上漲機率", val: (r) => r.p_up[k], cell: (r) => h("span", { class: "num" }, num(r.p_up[k] * 100, 0) + "%") })),
+        { key: "g", label: "符合條件", left: true, wrap: true, cell: (r) => r.tags.map((t) => h("span", { class: "chip", style: "margin:0 4px 2px 0" }, t)) }],
+      rows, { onRow: (r) => openDrawer(r.symbol) });
+      const calib = (k) => {
+        const c = A.backtest[k];
+        if (!c) return null;
+        return h("div", { class: "stack" }, h("h4", {}, `${HD[k]}：${nf(0).format(c.n)} 筆`),
+          table([{ key: "l", label: "標籤", left: true, cell: (r) => r.label },
+            { key: "n", label: "筆數", cell: (r) => h("span", { class: "num" }, nf(0).format(r.n)) },
+            { key: "p", label: "模型機率", cell: (r) => h("span", { class: "num" }, ok(r.p) ? num(r.p * 100, 0) + "%" : "–") },
+            { key: "u", label: "實際上漲", cell: (r) => h("span", { class: "num" }, ok(r.up) ? num(r.up * 100, 0) + "%" : "–") },
+            { key: "a", label: "平均報酬", cell: (r) => numEl(pct(r.avg), r.avg) }], c.bins),
+          h("p", { class: "small" }, `方向命中率 ${num(c.hit * 100, 0)}%（只算非中性的分數）；全體上漲比率 ${num(c.base_up * 100, 0)}%。Brier 分數 ${num(c.brier, 4)}，` +
+            `永遠回答「全體上漲比率」的對照組是 ${num(c.base_brier, 4)}：` + (c.brier < c.base_brier ? "模型較低，機率有參考價值。" : "模型沒有比對照組低，代表機率的區分力不足。")));
+      };
+      const live = Object.entries(HD).map(([k, t]) => ({ k, t, ...(A.live[k] || { n: 0 }) }));
+      return [
+        head("市場安全", "把分散在各頁的訊號合成五個問題的答案：現在大盤是否安全、哪些股票正在累積上漲動能、未來 5／20／60 日上漲機率、哪些股票可能轉弱、過去的判斷準不準。所有切點都是固定規則，並附上它們過去的實際表現。"),
+        h("div", { class: "stats" },
+          statBox("市場風險分數（0–100）", num(R.score, 0), `${R.name}風險・參考持股 ${R.exposure}` + (ok(M.risk_prev) ? `・上次 ${num(M.risk_prev, 0)}` : "")),
+          statBox("市場週期", G.name, `自 ${G.since} 起第 ${G.days} 個交易日` + (G.prev_name ? `・前一階段 ${G.prev_name}` : "")),
+          statBox("廣度指數（0–100）", num(B.value, 0), `月線上 ${num(B.above20 * 100, 0)}%・季線上 ${num(B.above60 * 100, 0)}%`),
+          F ? statBox("外資台指期淨未平倉", signed(F.net_oi, 0) + " 口", `5 日 ${signed(F.chg5, 0)}・` + (F.pct <= 0.01 ? "一年來最偏空" : `比過去一年 ${num((1 - F.pct) * 100, 0)}% 的日子偏空`)) : null,
+          O ? statBox("加權指數上漲機率", Object.entries(HD).map(([k]) => num(O[k].p_up * 100, 0) + "%").join(" / "), "未來 5 / 20 / 60 個交易日") : null),
+        h("div", { class: "panel stack" }, h("div", { class: "sec-head" }, h("h3", {}, "風險警報", help("alerts", "自動風險警報")),
+          h("span", { class: "small muted" }, `${M.alerts.filter((a) => a.level === 2).length} 項警戒・${M.alerts.filter((a) => a.level === 1).length} 項留意`)),
+          M.alerts.length ? h("div", { class: "alert-list" }, M.alerts.map((a) => h("div", { class: "alert lv" + a.level },
+            h("span", { class: "pill " + LV[a.level][0] }, LV[a.level][1]), h("div", {}, h("b", {}, a.title), h("div", { class: "small" }, a.text)))))
+            : h("p", { class: "muted" }, "目前沒有觸發任何警報。"),
+          h("p", { class: "chart-note" }, "警報由固定規則在每次更新時自動檢查（風險分數、週期轉變、廣度、外資現貨與期貨、融資維持率、VIX、信用利差、半導體、匯率、金融壓力）。本站每週更新一次，警報反映的是資料日當天的狀態。")),
+        h("div", { class: "grid g2" },
+          h("div", { class: "panel stack" }, h("div", { class: "sec-head" }, h("h3", {}, "風險分數的組成", help("riskscore", "市場風險分數")), h("span", { class: "pill " + R.tone }, `${num(R.score, 0)}・${R.name}風險`)),
+            h("div", { class: "risk-parts" }, R.parts.map((p) => h("div", { class: "rp" },
+              h("div", { class: "row", style: "justify-content:space-between" }, h("b", {}, p.name, h("span", { class: "muted small" }, ` 權重 ${p.weight}%`)), h("span", { class: "num" }, num(p.risk, 0))),
+              riskBar(p.risk), h("div", { class: "small" }, p.reading)))),
+            h("p", { class: "chart-note" }, "每項 0 代表安全、100 代表危險，依權重加權平均；缺資料的項目會被剔除。30 以下低風險、30–50 中等、50–70 偏高、70 以上高風險。參考持股水位是依風險等級給的一般性區間，不是個人化建議。")),
+          h("div", { class: "panel stack" }, h("div", { class: "sec-head" }, h("h3", {}, "市場週期", help("cycle", "市場週期判斷")), h("span", { class: "pill " + (G.state === "bull" ? "s1" : G.state === "bear" ? "s-2" : G.state === "range" ? "s0" : "s-1") }, G.name)),
+            h("div", { class: "kv" }, [["加權指數", px(G.close)], ["季線（60 日）", px(G.ma60)], ["年線（200 日）", px(G.ma200)], ["距一年高點", pct(G.drawdown)]].map(([k, v]) =>
+              h("div", {}, h("div", { class: "k" }, k), h("div", { class: "v num" }, v)))),
+            table([{ key: "s", label: "階段", left: true, cell: (r) => h("span", {}, r.name, r.cur ? h("span", { class: "chip mk", style: "margin-left:6px" }, "目前") : null) },
+              { key: "sh", label: "占比", cell: (r) => h("span", { class: "num" }, num(r.share * 100, 0) + "%") }, ...fwdCols],
+            ["bull", "range", "pullback", "rebound", "bear"].filter((k) => G.stats[k]).map((k) => ({ name: { bull: "多頭趨勢", range: "高檔盤整", pullback: "多頭回檔", rebound: "空頭反彈", bear: "空頭趨勢" }[k], cur: k === G.state, ...G.stats[k] }))),
+            h("p", { class: "chart-note" }, `依收盤價與季線、年線的位置分成五個階段，新階段須連續 3 日成立才算轉變。各欄為該階段之後 5／20／60 個交易日的上漲比率，括號內為平均報酬。統計自 ${G.sample_from} 起的每一個交易日，樣本彼此重疊，且這段期間台股整體大漲，各階段之後的上漲比率都偏高，請比較階段之間的差異而不是絕對數字。`))),
+        O ? h("div", { class: "panel stack" }, h("h3", {}, "加權指數：未來 5／20／60 日", help("pup", "上漲機率")),
+          table([{ key: "h", label: "期間", left: true, cell: (r) => r.t },
+            { key: "l", label: "模型判讀", left: true, cell: (r) => pill(r) },
+            { key: "p", label: "模型上漲機率", cell: (r) => h("span", { class: "num" }, num(r.p_up * 100, 0) + "%") },
+            { key: "r", label: "預估區間", cell: (r) => h("span", { class: "num" }, `${px(r.low)} – ${px(r.high)}`) },
+            { key: "b", label: `歷史上「${G.name}」階段之後的上漲比率`, cell: (r) => (r.base ? h("span", { class: "num" }, `${num(r.base.up * 100, 0)}%（平均 ${pct(r.base.avg)}，${r.base.n} 日）`) : "–") }],
+          Object.entries(HD).map(([k, t]) => ({ t, ...O[k] }))),
+          h("p", { class: "chart-note" }, "兩欄來源不同：模型機率由目前的技術面與籌碼分數換算；歷史比率只看指數處在同一週期階段時之後的實際結果。兩者差距大時，代表模型的短線訊號與長期統計不一致，判斷應更保守。")) : null,
+        R.series.length ? h("div", { class: "panel stack" }, h("h3", {}, "風險分數的歷史與驗證"),
+          flowChart(R.series, "v", "風險分數（可回溯版）", "0–100", { line: true, digits: 0, marks: [[70, "高風險"], [30, "低風險"]] }),
+          table([{ key: "l", label: "當時的風險等級", left: true, cell: (r) => r.level }, { key: "s", label: "占比", cell: (r) => h("span", { class: "num" }, num(r.share * 100, 0) + "%") }, ...fwdCols], R.buckets),
+          h("p", { class: "chart-note" }, `歷史分數只用能回溯多年的項目（${R.history_parts.join("、")}），所以與上方的今日分數不完全相同。統計自 ${R.sample_from} 起；樣本重疊、期間以多頭為主，高風險等級的天數很少，結論只能當參考。`)) : null,
+        h("div", { class: "grid g2" },
+          h("div", { class: "panel stack" }, h("div", { class: "sec-head" }, h("h3", {}, "市場廣度指數", help("breadthidx", "廣度指數")), h("span", { class: "pill " + (BO[bo.kind] || BO.none)[1] }, (BO[bo.kind] || BO.none)[0])),
+            flowChart(B.series, "v", "廣度指數", "0–100", { line: true, digits: 0, marks: [[80, "過熱"], [20, "超賣"]] }),
+            h("p", { class: "chart-note" }, `台股觀察名單中站上月線與季線的個股比例各半，最新一日另以近 10 日漲跌家數比（${ok(B.ad_ratio) ? num(B.ad_ratio, 2) : "–"}）微調。指數創 20 日新高時廣度在 60 以上且沒有下降，才算有多數個股支持的真突破。`)),
+          F ? h("div", { class: "panel stack" }, h("div", { class: "sec-head" }, h("h3", {}, "外資台指期淨未平倉", help("fut", "外資台指期")), h("span", { class: "small muted num" }, F.date)),
+            flowChart(F.series, "v", "淨未平倉", "口", { line: true, digits: 0 }),
+            h("p", { class: "chart-note" }, `過去一年區間 ${signed(F.min_250, 0)} 至 ${signed(F.max_250, 0)} 口，目前${F.pct <= 0.01 ? "是一年來最偏空的水準" : `比其中 ${num((1 - F.pct) * 100, 0)}% 的日子更偏空`}；20 日變化 ${signed(F.chg20, 0)} 口。外資長期持有大量現股，期貨淨空單有一部分是避險，所以看的是相對自己過去的水位與變化方向，而不是絕對值。`)) : null),
+        h("div", { class: "grid g2" },
+          L ? h("div", { class: "panel stack" }, h("h3", {}, "國際市場連動", help("linkage", "國際連動")),
+            table([{ key: "n", label: "市場", left: true, cell: (r) => r.name },
+              { key: "5", label: "近 5 日", cell: (r) => numEl(pct(r.r5), r.r5) }, { key: "20", label: "近 20 日", cell: (r) => numEl(pct(r.r20), r.r20) },
+              { key: "c", label: "相關係數", tip: `近 ${L.n} 個交易日`, cell: (r) => h("span", { class: "num" }, signed(r.corr, 2)) },
+              { key: "b", label: "敏感度", tip: "該市場變動 1% 時，加權指數平均變動幾 %", cell: (r) => h("span", { class: "num" }, signed(r.beta, 2)) },
+              { key: "d", label: "資料日", cell: (r) => h("span", { class: "num small" }, r.date.slice(5)) }], L.drivers),
+            h("p", { class: "small" }, `三者合計可解釋加權指數近 ${L.n} 日每日漲跌的 ${num(L.r2 * 100, 0)}%。` + (L.has_pending
+              ? `在最新台股收盤之後，這些市場又有變動，依敏感度推算對下一個交易日的影響約 ${pct(L.implied_next, 2)}。` : "美股最新收盤已反映在台股最近一個交易日，目前沒有尚未反映的變動。")),
+            h("p", { class: "chart-note" }, "美股以前一晚收盤對應台股當日（美股先收盤），匯率以當日對應。相關係數為正代表同向，美元／台幣為負代表台幣貶值時台股傾向下跌。相關不等於因果，且關係會隨時間改變。匯率資料來自 Fed，有數日落差。")) : null,
+          X ? h("div", { class: "panel stack" }, h("div", { class: "sec-head" }, h("h3", {}, "全球金融壓力（OFR FSI）", help("fsi", "金融壓力指數")), h("span", { class: "small muted num" }, X.date)),
+            h("div", { class: "row" }, h("b", { class: "num", style: "font-size:22px" }, signed(X.value, 2)), h("span", { class: "small muted" }, `20 日 ${signed(X.chg20, 2)}・高於過去五年 ${num(X.pct_5y * 100, 0)}% 的日子`)),
+            h("div", { class: "spark-wide" }, spark(X.series.slice(-250).map((r) => r[1]))),
+            h("div", { class: "kv" }, X.parts.map((p) => h("div", {}, h("div", { class: "k" }, p.name), h("div", { class: "v num" }, signed(p.value, 2), h("span", { class: "small muted" }, `（${signed(p.chg20, 2)}）`))))),
+            h("p", { class: "chart-note" }, "美國財政部金融研究辦公室（OFR）每日公布，由 33 個金融市場變數合成，分為信用、股票估值、融資、避險資產、波動率五類。0 代表長期平均，正值代表壓力高於平均；括號內為 20 日變化。適合判斷全球資金面是否出問題。")) : null),
+        h("div", { class: "panel stack" }, h("h3", {}, "正在累積上漲動能", help("accum", "動能累積與轉弱")),
+          M.accumulating.length ? momTable(M.accumulating) : h("p", { class: "muted" }, "本週沒有符合條件的個股。"),
+          h("p", { class: "chart-note" }, "短線分數為正，且六項條件至少符合四項：站上月線、月漲幅未過熱（0–15%）、RSI 45–68、法人連買、短線分數較上週上升、結構面佳。找的是「剛開始轉強、還沒漲多」的股票，不是已經漲最多的。")),
+        h("div", { class: "panel stack" }, h("h3", {}, "可能即將轉弱", help("accum", "動能累積與轉弱")),
+          M.weakening.length ? momTable(M.weakening) : h("p", { class: "muted" }, "本週沒有符合條件的個股。"),
+          h("p", { class: "chart-note" }, "股價仍在季線之上或綜合評分尚未轉空，但六項警訊至少出現三項：短線分數下滑、跌破月線、超買後回落、外資連賣、融資增而股價跌、動能落後趨勢。已經明顯走空的股票請看「漲跌預警」。")),
+        h("div", { class: "panel stack" }, h("h3", {}, "過去的預測準不準", help("accuracy", "預測準確度")),
+          h("h4", {}, "一、本站實際發布過的預測"),
+          table([{ key: "t", label: "期間", left: true, cell: (r) => r.t },
+            { key: "n", label: "已到期筆數", cell: (r) => h("span", { class: "num" }, r.n ? `${nf(0).format(r.n)}（${r.snapshots} 次發布）` : "尚未到期") },
+            { key: "h", label: "方向命中率", cell: (r) => h("span", { class: "num" }, ok(r.hit) ? num(r.hit * 100, 0) + "%" : "–") },
+            { key: "u", label: "偏多組平均報酬", cell: (r) => numEl(pct(r.bull_ret), r.bull_ret) },
+            { key: "d", label: "偏空組平均報酬", cell: (r) => numEl(pct(r.bear_ret), r.bear_ret) },
+            { key: "b", label: "Brier（對照組）", cell: (r) => h("span", { class: "num" }, ok(r.brier) ? `${num(r.brier, 4)}（${num(r.base_brier, 4)}）` : "–") }], live),
+          h("p", { class: "small" }, `自 ${A.first_snapshot} 起，每次更新都會把所有個股與指數的預測存檔（目前 ${A.snapshots} 次），期間走完後自動與實際結果比對。累積的次數還少時，這張表的數字不具代表性。`),
+          A.index_log.length ? table([{ key: "d", label: "發布日", left: true, cell: (r) => h("span", { class: "num" }, r.date) },
+            { key: "s", label: "指數", left: true, cell: (r) => (bySymbol.get(r.symbol) || S.indices.find((i) => i.symbol === r.symbol) || { name: r.symbol }).name },
+            { key: "h", label: "期間", left: true, cell: (r) => HD[r.h] },
+            { key: "p", label: "當時上漲機率", cell: (r) => h("span", { class: "num" }, num(r.p_up * 100, 0) + "%") },
+            { key: "r", label: "實際漲跌", cell: (r) => numEl(pct(r.ret), r.ret) },
+            { key: "o", label: "方向", cell: (r) => (r.dir_ok == null ? "中性" : r.dir_ok ? "✓" : "✗") },
+            { key: "i", label: "落在區間內", cell: (r) => (r.in_range ? "✓" : "✗") }], [...A.index_log].reverse()) : null,
+          h("h4", {}, "二、技術面分數的歷史回測（約三年）"),
+          h("div", { class: "grid g3" }, Object.keys(HD).map(calib)),
+          h("p", { class: "small" }, "讀法：「模型機率」是當時分數換算出的上漲機率，「實際上漲」是之後真的上漲的比例。兩欄越接近、且由強勢偏空往強勢偏多逐步升高，模型越可信。"),
+          h("p", { class: "chart-note" }, "回測只能重建技術面分數（籌碼與基本面沒有歷史快照），樣本是現在的熱門股（倖存者偏差），且期間以多頭為主。若高分組的實際上漲比率沒有明顯高於低分組，就表示分數的區分力有限：請把它當成篩選與排序工具，搭配上方的市場風險與部位控制使用。精選個股的實際表現見「精選 20 檔」頁。")),
       ];
     },
 

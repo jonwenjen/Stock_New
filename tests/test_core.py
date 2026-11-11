@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 from pipeline import indicators as ind
-from pipeline import media, scoring, twse, us_data
+from pipeline import market, media, scoring, twse, us_data
 
 
 def make_df(prices):
@@ -733,3 +733,128 @@ def test_calibrate_costs_matches_market_ratio_then_respects_call_line():
     untouched = {"1111": [100.0, 1000]}
     leading.calibrate_costs(untouched, {"1111": 100.0}, None)                     # no market figure: only the floor applies
     assert untouched["1111"][0] == 100.0
+
+
+# ---------------- market safety ----------------
+def test_lin_maps_safe_to_zero_and_danger_to_hundred_either_direction():
+    assert market.lin(14, 14, 32) == 0 and market.lin(32, 14, 32) == 100 and market.lin(50, 14, 32) == 100
+    assert market.lin(1.70, 1.70, 1.40) == 0 and market.lin(1.55, 1.70, 1.40) == pytest.approx(50)
+
+
+def test_parse_futures_csv_keeps_foreign_tx_rows_only():
+    text = ("日期,商品名稱,身份別,a,b,c,d,多空交易口數淨額,e,f,g,h,i,多空未平倉口數淨額,j\n"
+            "2026/10/01,臺股期貨,投信,1,1,1,1,776,1,1,1,1,1,74615,1\n"
+            "2026/10/01,臺股期貨,外資及陸資,1,1,1,1,-1389,1,1,1,1,1,-79554,1\n"
+            "2026/10/01,小型臺指期貨,外資及陸資,1,1,1,1,5,1,1,1,1,1,9,1\n")
+    assert market.parse_futures_csv(text) == {"2026-10-01": {"net_oi": -79554.0, "net_trade": -1389.0}}
+
+
+def test_breadth_index_and_breakout_check():
+    idx = pd.bdate_range("2024-01-01", periods=40)
+    b = pd.DataFrame({"above20": 0.8, "above60": 0.6}, index=idx)
+    bi = market.breadth_index(b)
+    assert bi.iloc[0] == 70 and market.breadth_index(b, ad_ratio=0.6).iloc[-1] == pytest.approx(56)
+    rising = pd.Series(np.linspace(100, 140, 40), index=idx)
+    assert market.breakout_check(rising, bi)["kind"] == "confirmed"
+    thin = pd.Series(np.linspace(80, 35, 40), index=idx)  # breadth falling while the index makes highs
+    assert market.breakout_check(rising, thin)["kind"] == "false_risk"
+    falling = pd.Series(np.linspace(140, 100, 40), index=idx)
+    assert market.breakout_check(falling, pd.Series(15.0, index=idx))["kind"] == "washout"
+    assert market.breakout_check(falling, pd.Series(np.linspace(30, 45, 40), index=idx))["kind"] == "divergence_up"
+
+
+def test_regime_states_follow_the_averages_and_need_confirmation():
+    up = pd.Series(np.linspace(100, 300, 400), index=pd.bdate_range("2022-01-03", periods=400))
+    st = market.regime_states(up)
+    assert st.iloc[-1] == "bull" and len(st) == 400 - 199
+    crash = pd.concat([up, pd.Series(np.linspace(295, 120, 80), index=pd.bdate_range(up.index[-1] + pd.Timedelta(days=1), periods=80))])
+    st = market.regime_states(crash)
+    assert st.iloc[-1] == "bear" and "pullback" in set(st)
+    now = market.regime_now(st)
+    assert now["state"] == "bear" and now["prev"] == "pullback" and now["days"] >= 1
+    blip = up.copy()
+    blip.iloc[-1] = float(up.rolling(60).mean().iloc[-1]) * 0.99  # one close under the 60-day average
+    assert market.regime_states(blip).iloc[-1] == "bull"
+    stats = market.forward_stats(market.regime_states(up), up)
+    assert stats["bull"]["1w"]["up"] == 1.0 and stats["bull"]["share"] == 1.0
+
+
+def test_align_uses_the_prior_close_for_overnight_markets():
+    us = pd.Series([1.0, 2.0, 3.0], index=pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"]))
+    tw = pd.to_datetime(["2024-01-03", "2024-01-04", "2024-01-05"])
+    assert list(market.align(us, tw, prior=True)) == [1.0, 2.0, 3.0]
+    assert list(market.align(us, tw, prior=False)) == [2.0, 3.0, 3.0]
+
+
+def test_linkage_recovers_beta_and_pending_move():
+    rng = np.random.default_rng(3)
+    days = pd.bdate_range("2023-01-02", periods=200)
+    us_ret = rng.normal(0, 0.01, 200)
+    us = pd.Series(100 * np.exp(np.cumsum(us_ret)), index=days)
+    tw_ret = np.concatenate([[0.0], 0.5 * us_ret[:-1]]) + rng.normal(0, 0.001, 200)  # follows last night's US move
+    tw = pd.Series(100 * np.exp(np.cumsum(tw_ret)), index=days)
+    res = market.linkage(tw, [("US", "us", us, True)])
+    d = res["drivers"][0]
+    assert d["beta"] == pytest.approx(0.5, abs=0.05) and d["corr"] > 0.9 and res["r2"] > 0.8
+    assert res["has_pending"] and res["implied_next"] == pytest.approx(0.5 * us_ret[-1], abs=0.002)
+
+
+def test_risk_parts_total_and_levels():
+    calm = {"regime": "bull", "drawdown": 0.0, "breadth": 80.0, "foreign20_ratio": 0.03, "foreign_streak": 4,
+            "fut_pct": 0.9, "maint": 1.75, "vix": 13.0, "vix_term": 0.85, "oas": 2.8, "oas_chg10": 0.0,
+            "soxx_r20": 0.1, "ndq_r20": 0.06, "fx_r20": -0.03, "fsi": -3.0}
+    parts = market.risk_parts(calm)
+    assert len(parts) == 9 and market.risk_total(parts) < 10 and market.risk_level(market.risk_total(parts))["name"] == "低"
+    panic = {"regime": "bear", "drawdown": -0.3, "breadth": 5.0, "foreign20_ratio": -0.08, "foreign_streak": -12,
+             "fut_pct": 0.0, "maint": 1.35, "vix": 40.0, "vix_term": 1.2, "oas": 7.0, "oas_chg10": 1.5,
+             "soxx_r20": -0.2, "ndq_r20": -0.1, "fx_r20": 0.04, "fsi": 3.0}
+    total = market.risk_total(market.risk_parts(panic))
+    assert total > 90 and market.risk_level(total)["name"] == "高"
+    some = market.risk_parts({"vix": 23.0, "maint": None})  # missing inputs are dropped, weights renormalise
+    assert [p["key"] for p in some] == ["vol"] and market.risk_total(some) == pytest.approx(50)
+
+
+def test_risk_history_and_bucket_stats():
+    idx = pd.bdate_range("2023-01-02", periods=300)
+    comps = {"trend": pd.Series(10.0, index=idx), "vol": pd.Series(20.0, index=idx), "credit": pd.Series(80.0, index=idx[100:])}
+    hist = market.risk_history(comps, idx)
+    assert len(hist) == 200 and hist.iloc[0] == pytest.approx((20 * 10 + 10 * 20 + 10 * 80) / 40, abs=0.1)
+    close = pd.Series(np.linspace(100, 200, 300), index=idx)
+    rows = market.bucket_stats(hist, close)
+    assert rows[0]["level"] == "中等" and rows[0]["1w"]["up"] == 1.0
+
+
+def test_calibration_flags_a_score_with_no_skill():
+    frames = {f"S{i}": scoring.tech_frame(make_df(trend(500, 0.0005, seed=i))) for i in range(30)}
+    cal = market.calibration(frames, scoring.HORIZONS)
+    c = cal["1m"]
+    assert c["n"] > 200 and sum(b["n"] for b in c["bins"]) == c["n"]
+    assert 0 <= c["hit"] <= 1 and c["brier"] > 0 and c["base_brier"] <= 0.25
+
+
+def test_evaluate_logs_only_count_matured_forecasts():
+    f = make_df(np.linspace(100, 160, 60))
+    d0, d_late = f.index[10].strftime("%Y-%m-%d"), f.index[58].strftime("%Y-%m-%d")
+    log = {d0: {"A": [f["close"].iloc[10], 0.5, 0.5, -0.5], "B": [1, 0.5, None, None]}, d_late: {"A": [1, 0.5, 0.5, 0.5]}}
+    res = market.evaluate_log(log, {"A": f}, scoring.HORIZONS)
+    assert res["1w"] == {**res["1w"], "n": 1, "snapshots": 1, "hit": 1.0} and res["1m"]["hit"] == 1.0
+    assert res["1q"] == {"n": 0, "snapshots": 0}  # 63 sessions have not passed
+    ilog = {d0: {"A": {"close": 1, "h": {"1w": [0.6, 0.0, 1.0], "1m": [0.4, 0.0, 1e9]}}}}
+    rows = market.evaluate_index_log(ilog, {"A": f}, scoring.HORIZONS)
+    assert [(r["h"], r["dir_ok"], r["in_range"]) for r in rows] == [("1w", True, False), ("1m", False, True)]
+
+
+def test_momentum_lists_and_alerts():
+    base = {"code": "1", "market": "TW", "ma20": 100.0, "ma60": 95.0, "horizons": {"1w": {"p_up": 0.6}}, "factors": {"trend": 0.5, "momentum": 0.5}}
+    strong = {**base, "symbol": "A", "name": "a", "close": 105.0, "tactical": 0.4, "r20": 0.05, "rsi": 55, "foreign_streak": 4, "structural": 0.3}
+    fading = {**base, "symbol": "B", "name": "b", "close": 98.0, "tactical": 0.1, "r20": -0.02, "rsi": 50, "foreign_streak": -5,
+              "factors": {"trend": 0.6, "momentum": 0.1}, "overall": 0.1}
+    acc, weak = market.momentum_lists([strong, fading], {"A": 0.2, "B": 0.4})
+    assert [r["symbol"] for r in acc] == ["A"] and "短線分數上升" in acc[0]["tags"]
+    assert [r["symbol"] for r in weak] == ["B"] and {"短線分數下滑", "跌破月線", "外資連賣"} <= set(weak[0]["tags"])
+    al = market.alerts({"risk": 75.0, "risk_prev": 60.0, "regime": "bear", "regime_prev_run": "pullback", "foreign_streak": -10,
+                        "maint": 1.38, "vix_term": 1.1, "fut_pct": 0.0, "fut_net": -100000.0, "soxx_r20": -0.2})
+    titles = [a["title"] for a in al]
+    assert al[0]["level"] == 2 and "市場週期轉變" in titles and "融資維持率偏低" in titles and "VIX 期限結構倒掛" in titles
+    assert market.alerts({"risk": 20.0, "regime": "bull", "foreign_streak": 6}) == [
+        {"level": 0, "title": "外資連續買超", "text": "外資已連續 6 日買超。"}]

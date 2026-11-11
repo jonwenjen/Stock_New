@@ -177,6 +177,7 @@ def insiders() -> dict[str, dict]:
 
 def margin_latest() -> dict[str, dict]:
     return {r["股票代號"].strip(): {"margin": num(r["融資今日餘額"]), "margin_prev": num(r["融資前日餘額"]),
+                                    "limit": num(r.get("融資限額")),
                                     "short": num(r["融券今日餘額"]), "name": r["股票名稱"].strip()}
             for r in http.get_json(f"{OPENAPI}/exchangeReport/MI_MARGN")}
 
@@ -219,7 +220,45 @@ def margin_stocks(date: str) -> dict[str, dict]:
     """Per-stock margin/short balances (lots) on a given date."""
     j = _rwd("marginTrading/MI_MARGN", date=date.replace("-", ""), selectType="ALL")
     table = next(t for t in j["tables"] if t.get("data") and len(t["data"][0]) >= 13)
-    return {r[0].strip(): {"margin": num(r[6]), "short": num(r[12])} for r in table["data"]}
+    return {r[0].strip(): {"margin": num(r[6]), "limit": num(r[7]), "short": num(r[12])} for r in table["data"]}
+
+
+MAINT_CALL = 1.30         # below this a margin account gets a call (追繳), then forced selling (斷頭)
+MAINT_INITIAL = 1 / 0.6   # listed stocks are financed at 60%, so a new position starts near 166.7%
+
+
+def maintenance_ratio(margin: dict[str, dict], closes: dict[str, float], margin_amount: float) -> dict | None:
+    """Market-wide margin maintenance ratio (estimate) = collateral value / loans outstanding.
+
+    The exchange publishes margin balances in lots per security and the total amount
+    lent, but not the ratio itself; valuing every margin position at that day's close
+    gives the figure the market usually quotes as 大盤融資維持率.
+    margin: {code: {"margin": lots}}, closes: {code: close}, margin_amount: TWD.
+    Returns None when too many positions have no price that day to trust the result.
+    """
+    value = priced = total = 0.0
+    for code, m in margin.items():
+        lots = m.get("margin") or 0
+        total += lots
+        close = closes.get(code)
+        if lots and close:
+            value += lots * 1000 * close
+            priced += lots
+    if not margin_amount or not total or priced / total < 0.9:
+        return None
+    return {"maint": value / margin_amount, "collateral": value / 1e8, "coverage": priced / total}
+
+
+def maint_status(ratio: float | None) -> str:
+    if ratio is None:
+        return "無資料"
+    if ratio >= 1.60:
+        return "充裕"
+    if ratio >= 1.50:
+        return "正常"
+    if ratio >= 1.40:
+        return "偏低"
+    return "斷頭壓力大"
 
 
 def inst_stocks(date: str) -> dict[str, tuple[float, float, float]]:
@@ -233,7 +272,7 @@ def inst_stocks(date: str) -> dict[str, tuple[float, float, float]]:
 
 
 def day_quotes(date: str) -> dict[str, tuple]:
-    """Official daily OHLCV for every listed common stock: {code: (o, h, l, c, shares)}."""
+    """Official daily OHLCV for every listed security (stocks and ETFs): {code: (o, h, l, c, shares)}."""
     j = _rwd("afterTrading/MI_INDEX", date=date.replace("-", ""), type="ALLBUT0999")
     table = next(t for t in j["tables"] if "證券代號" in (t.get("fields") or []))
     f = table["fields"]
@@ -241,8 +280,6 @@ def day_quotes(date: str) -> dict[str, tuple]:
     out = {}
     for r in table["data"]:
         code = r[0].strip()
-        if not tracked(code):
-            continue
         o, h, l, c, v = (num(r[i]) for i in ix)
         if c:  # no trade that day -> skip
             out[code] = (o or c, h or c, l or c, c, v or 0)

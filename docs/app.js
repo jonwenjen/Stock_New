@@ -278,8 +278,10 @@
   }
 
   // ---------- flow chart (bars with sign colour + TAIEX line in its own panel) ----------
-  function flowChart(history, series, label, unit) {
-    const rows = history.filter((r) => ok(r[series]));
+  // opts: { line, scale, digits, marks: [[value, title], ...] } - marks draw labelled reference lines.
+  function flowChart(history, series, label, unit, opts = {}) {
+    const scale = opts.scale || 1, digits = opts.digits || 0;
+    const rows = history.filter((r) => ok(r[series])).map((r) => ({ ...r, [series]: r[series] * scale }));
     const readout = h("div", { class: "readout" });
     const top = h("div", { class: "chart sm" }), bottom = h("div", { class: "chart sm" });
     const state = { n: 60 };
@@ -290,16 +292,30 @@
       h("h4", {}, `${label}（${unit}）`), top, h("h4", {}, "加權指數"), bottom);
     const mk = (el) => LightweightCharts.createChart(el, { ...themeOpts(), autoSize: true, handleScroll: false, handleScale: false });
     const c1 = mk(top), c2 = mk(bottom);
-    const isLine = series === "margin_bal" || series === "short_units";
+    const isLine = !!opts.line || series === "margin_bal" || series === "short_units";
     const whole = { type: "price", precision: 0, minMove: 1 };
-    const s1 = isLine ? c1.addLineSeries({ lineWidth: 2, priceLineVisible: false, priceFormat: whole })
+    const fmt = { type: "price", precision: digits, minMove: 1 / 10 ** digits };
+    const s1 = isLine ? c1.addLineSeries({ lineWidth: 2, priceLineVisible: false, priceFormat: fmt })
       : c1.addHistogramSeries({ priceLineVisible: false, lastValueVisible: false, priceFormat: whole });
+    const markLines = (opts.marks || []).map(([price, title]) =>
+      s1.createPriceLine({ price, title, lineWidth: 1, lineStyle: 2, axisLabelVisible: true, color: "#888" }));
+    if (markLines.length) {  // keep the reference levels in view: the distance to them is the point of the chart
+      const lv = opts.marks.map(([p]) => p);
+      s1.applyOptions({ autoscaleInfoProvider: (orig) => {
+        const r = orig();
+        if (r && r.priceRange) {
+          r.priceRange.minValue = Math.min(r.priceRange.minValue, Math.min(...lv) - 3);
+          r.priceRange.maxValue = Math.max(r.priceRange.maxValue, Math.max(...lv) + 3);
+        }
+        return r;
+      } });
+    }
     const s2 = c2.addLineSeries({ lineWidth: 2, priceLineVisible: false, priceFormat: whole });
     const byDate = new Map(rows.map((r) => [r.date, r]));
     const show = (r) => {
       if (!r) return;
       readout.replaceChildren(...[h("span", {}, r.date), h("span", {}, label + " ", h("b", { class: isLine ? "" : cls(r[series]) },
-        (isLine ? num(r[series], 0) : signed(r[series], 1)) + " " + unit)),
+        (isLine ? num(r[series], digits) : signed(r[series], 1)) + " " + unit)),
         ok(r.twii) ? h("span", {}, "加權 ", h("b", {}, num(r.twii, 0))) : null].filter(Boolean));
     };
     const applyTheme = () => { c1.applyOptions(themeOpts()); c2.applyOptions(themeOpts()); draw(); };
@@ -308,6 +324,7 @@
       const win = rows.slice(-state.n), up = css("--up"), down = css("--down");
       s1.setData(win.map((r) => (isLine ? { time: r.date, value: r[series] } : { time: r.date, value: r[series], color: r[series] >= 0 ? up : down })));
       if (isLine) s1.applyOptions({ color: css("--ma1") });
+      markLines.forEach((l) => l.applyOptions({ color: css("--ink-3") }));
       s2.applyOptions({ color: css("--ink-2") });
       s2.setData(win.filter((r) => ok(r.twii)).map((r) => ({ time: r.date, value: r.twii })));
       fit(c1); fit(c2);
@@ -557,25 +574,68 @@
     async margin() {
       const F = await load("flows"), s = F.summary || {};
       const open = (r) => bySymbol.has(r.code + ".TW") && openDrawer(r.code + ".TW");
+      const usage = { key: "u", label: "融資使用率", tip: "融資餘額 ÷ 融資限額", val: (r) => r.usage, cell: (r) => h("span", { class: "num" }, ok(r.usage) ? num(r.usage * 100, 1) + "%" : "–") };
+      const shortR = { key: "sr", label: "券資比", tip: "融券餘額 ÷ 融資餘額", val: (r) => r.short_ratio, cell: (r) => h("span", { class: "num" }, ok(r.short_ratio) ? num(r.short_ratio * 100, 1) + "%" : "–") };
       const cols = [
         { key: "n", label: "個股", left: true, cell: (r) => nameCell(r) },
         { key: "m", label: "融資餘額（張）", val: (r) => r.margin, cell: (r) => h("span", { class: "num" }, num(r.margin, 0)) },
         { key: "c", label: "5 日變化", val: (r) => r.chg, cell: (r) => numEl(pct(r.chg), r.chg) },
         { key: "p", label: "股價 5 日", val: (r) => r.price_chg5, cell: (r) => numEl(pct(r.price_chg5), r.price_chg5) },
+        usage, shortR,
         { key: "f", label: "訊號", left: true, cell: (r) => (r.chg > 0.05 && r.price_chg5 < -0.02 ? h("span", { class: "chip warn" }, "資增價跌")
           : r.chg < -0.03 && r.price_chg5 > 0.01 ? h("span", { class: "chip" }, "資減價漲") : "") }];
+      const riskCols = [
+        { key: "n", label: "個股", left: true, cell: (r) => nameCell(r) },
+        { key: "r", label: "近 20 日股價", val: (r) => r.r20, cell: (r) => numEl(pct(r.r20), r.r20) },
+        usage,
+        { key: "v", label: "融資市值（億）", val: (r) => r.value, cell: (r) => h("span", { class: "num" }, num(r.value, 1)) },
+        { key: "c", label: "融資 5 日變化", val: (r) => r.chg, cell: (r) => numEl(pct(r.chg), r.chg) },
+        shortR,
+        { key: "f", label: "狀態", left: true, cell: (r) => (ok(r.chg) && r.chg > 0.02 ? h("span", { class: "chip warn" }, "仍在加碼融資")
+          : ok(r.chg) && r.chg < -0.1 ? h("span", { class: "chip" }, "融資大減，可能已斷頭") : "") }];
+      const state = { key: "maint" };
+      const SER = {
+        maint: ["融資維持率", () => flowChart(F.history, "maint", "大盤融資維持率（估算）", "%",
+          { line: true, scale: 100, digits: 1, marks: [[130, "追繳線 130%"], [166.7, "新倉起始 167%"]] })],
+        margin_bal: ["融資餘額", () => flowChart(F.history, "margin_bal", "融資餘額", "億元")],
+        short_units: ["融券餘額", () => flowChart(F.history, "short_units", "融券餘額", "張")] };
+      const hasMaint = F.history.some((r) => ok(r.maint));
+      if (!hasMaint) state.key = "margin_bal";
+      const holder = h("div");
+      const drawChart = () => holder.replaceChildren(SER[state.key][1]());
+      const seg = h("div", { class: "seg", role: "group", "aria-label": "指標" }, Object.entries(SER).filter(([k]) => k !== "maint" || hasMaint).map(([k, [label]]) =>
+        h("button", { type: "button", "aria-pressed": String(k === state.key), onclick: (e) => {
+          state.key = k; seg.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b === e.currentTarget))); drawChart();
+        } }, label)));
+      drawChart();
+      const tone = { 充裕: "mk", 正常: "", 偏低: "warn", 斷頭壓力大: "warn" }[s.maint_status] || "";
       return [
-        head("融資融券", "融資是散戶槓桿的溫度計。融資增而股價跌，代表散戶接刀、籌碼凌亂；融資減而股價漲，代表籌碼沉澱。"),
+        head("融資融券", "融資是散戶槓桿的溫度計。融資維持率看的是這些槓桿離被迫賣出還有多遠：低於 130% 會被追繳，補不出錢就斷頭，賣壓會再把股價往下推。"),
         h("div", { class: "stats" },
-          statBox("融資餘額", num(s.margin_bal, 0) + " 億", "集中市場"),
-          statBox("近一週變化", pct(s.margin_chg5), "", cls(s.margin_chg5)),
-          statBox("近一月變化", pct(s.margin_chg20), "", cls(s.margin_chg20)),
-          statBox("融券餘額", num(s.short_units, 0) + " 張", "")),
-        h("div", { class: "panel" }, h("h3", {}, "融資餘額走勢"), flowChart(F.history, "margin_bal", "融資餘額", "億元")),
+          ok(s.maint) ? h("div", { class: "stat" }, h("div", { class: "k" }, "大盤融資維持率（估算）"),
+            h("div", { class: "v num" }, num(s.maint * 100, 1) + "%"),
+            h("div", { class: "s" }, h("span", { class: "chip " + tone }, s.maint_status), ok(s.maint_chg5) ? ` 一週 ${signed(s.maint_chg5 * 100, 1)} 個百分點` : "")) : null,
+          ok(s.maint_cushion) ? statBox("距追繳線的緩衝", num(s.maint_cushion * 100, 1) + "%", "擔保品再跌這麼多，整體就到 130%") : null,
+          ok(s.maint_low20) ? statBox("近 20 日最低維持率", num(s.maint_low20 * 100, 1) + "%", "") : null,
+          statBox("融資餘額", num(s.margin_bal, 0) + " 億", ok(s.margin_days) ? `約 ${num(s.margin_days, 1)} 日成交值` : "集中市場"),
+          statBox("融資一週／一月", `${pct(s.margin_chg5)}／${pct(s.margin_chg20)}`, "", cls(s.margin_chg5)),
+          statBox("融券餘額", num(s.short_units, 0) + " 張", ok(s.short_ratio) ? `券資比 ${num(s.short_ratio * 100, 1)}%` : "")),
+        h("div", { class: "panel stack" }, h("div", { class: "sec-head" }, h("h3", {}, "走勢"), seg), holder,
+          hasMaint ? h("p", { class: "chart-note" }, "融資維持率＝融資擔保品市值 ÷ 融資金額。證交所只公布各股融資張數與全市場融資金額，本站以每日收盤價估算擔保品市值，與券商實際逐戶計算的數字會有出入，適合看水位與方向。") : null),
+        h("div", { class: "panel stack" }, h("h3", {}, "斷頭壓力觀察"),
+          (F.margin_risk || []).length ? table(riskCols, F.margin_risk, { onRow: open })
+            : h("div", { class: "empty" }, "目前沒有同時符合「融資使用率 10% 以上、近 20 日跌逾 15%、融資市值 3 億以上」的個股"),
+          h("p", { class: "chart-note" }, "條件：融資使用率 10% 以上、近 20 日股價跌逾 15%、融資市值 3 億元以上。個股的融資維持率需要每戶的融資成本，交易所不公布，所以這裡用「跌多少＋融資用了多少」來找壓力大的地方。")),
         h("div", { class: "grid g2" },
           h("div", { class: "panel" }, h("h3", {}, "融資增幅前 15（5 日）"), table(cols, F.margin_up, { onRow: open }),
             h("p", { class: "chart-note" }, `比較基準日 ${F.margin_ref_date || "–"}，僅列融資餘額 2,000 張以上個股。`)),
           h("div", { class: "panel" }, h("h3", {}, "融資減幅前 15（5 日）"), table(cols, F.margin_down, { onRow: open }))),
+        h("div", { class: "panel stack" }, h("h3", {}, "怎麼看這些指標"), h("div", { class: "src" }, [
+          ["融資維持率", "167% 左右是新融資部位的起點（上市股票融資六成）。150% 以上屬正常；跌到 140% 附近代表多數融資戶已虧損；逼近 130% 時追繳與斷頭會形成連鎖賣壓，但也常是急跌的尾聲。"],
+          ["融資使用率", "融資餘額占該股融資限額的比例。越高代表散戶槓桿越集中，下跌時賣壓越重。"],
+          ["券資比", "融券餘額 ÷ 融資餘額。偏高代表放空的人多，股價轉強時容易出現回補買盤（軋空）。"],
+          ["融資相當於幾日成交值", "融資餘額 ÷ 當日成交值。數字越大，融資一旦集中出場，市場越難消化。"]]
+          .map(([k, v]) => [h("b", {}, k), h("span", { class: "small" }, v)]))),
       ];
     },
 

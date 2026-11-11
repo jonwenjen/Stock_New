@@ -448,3 +448,28 @@ def test_fund_build_record_and_verdict():
     assert young["score"] is None and young["grade"] is None            # under a year of history: no grade
     assert "配息級別" in funds.verdict({"beat": {"1y": 20}, "dist": "Monthly", "mdd_3y": -0.3})
     assert funds.verdict({}) == "成立時間或資料不足，暫無法評估。"
+
+
+# ---------------- margin maintenance ----------------
+def test_maintenance_ratio_estimate():
+    margin = {"2330": {"margin": 1000}, "2317": {"margin": 2000}, "0050": {"margin": 500}}
+    closes = {"2330": 1000.0, "2317": 200.0, "0050": 100.0}
+    # collateral = 1000*1000*1000 + 2000*1000*200 + 500*1000*100 = 1.45e9 against 1e9 lent
+    m = twse.maintenance_ratio(margin, closes, 1e9)
+    assert m["maint"] == pytest.approx(1.45) and m["collateral"] == pytest.approx(14.5) and m["coverage"] == 1
+    # a small unpriced position is tolerated, a large one makes the estimate untrustworthy
+    assert twse.maintenance_ratio({**margin, "9999": {"margin": 100}}, closes, 1e9)["maint"] == pytest.approx(1.45)
+    assert twse.maintenance_ratio({**margin, "9999": {"margin": 5000}}, closes, 1e9) is None
+    assert twse.maintenance_ratio(margin, closes, 0) is None and twse.maintenance_ratio({}, closes, 1e9) is None
+
+
+def test_maintenance_status_and_cushion():
+    assert [twse.maint_status(x) for x in (1.70, 1.55, 1.45, 1.35, None)] == ["充裕", "正常", "偏低", "斷頭壓力大", "無資料"]
+    assert twse.MAINT_INITIAL == pytest.approx(1.6667, abs=1e-4)
+    assert 1 - twse.MAINT_CALL / 1.625 == pytest.approx(0.20)   # at 162.5% a 20% fall reaches the call line
+
+
+def test_margin_extra_gauges():
+    from pipeline import build
+    assert build.margin_extra({"margin": 500, "limit": 2000, "short": 50}) == {"usage": 0.25, "short_ratio": 0.1}
+    assert build.margin_extra({"margin": 0, "limit": None, "short": 5}) == {"usage": None, "short_ratio": None}

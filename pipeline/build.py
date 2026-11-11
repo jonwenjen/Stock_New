@@ -133,6 +133,46 @@ def update_flow_history(trading_days: list[str], twii: pd.DataFrame) -> list[dic
     return rows
 
 
+def update_maintenance(flows: list[dict]) -> tuple[str | None, dict, dict, dict]:
+    """Estimate the market margin maintenance ratio for recent days and store it in the flow history.
+
+    Needs, per day, every security's margin balance (one request) and close (the daily
+    quote table, usually already cached by the price update). Newest days first, so a
+    throttled run still gets the latest figure. Returns (reference date ~5 days back,
+    that day's per-stock margin table, closes on that day, closes ~20 days back) for
+    the per-stock tables.
+    """
+    rows = [r for r in flows if r.get("margin_bal")]
+    if not rows:
+        raise RuntimeError("no margin balance history")
+    window = rows[-(3 if QUICK else CFG["maint_days"]):]
+    ref_date = rows[-6]["date"] if len(rows) >= 6 else None
+    need = [r["date"] for r in window if "maint" not in r]
+    dates = list(dict.fromkeys(need[::-1] + ([ref_date] if ref_date else [])))
+    tables = twse.fetch_days(dates, twse.margin_stocks, "margin-stocks", log)
+    by_date = {r["date"]: r for r in rows}
+    done = 0
+    for d in need[::-1]:
+        if d not in tables or twse.THROTTLED and not (DAY_CACHE / f"{d}.json").exists():
+            continue
+        try:
+            closes = {c: bar[3] for c, bar in cached_day(d).items()}
+        except Exception as e:  # noqa: BLE001 - no quote table for that day yet
+            log(f"  maintenance {d}: {e}")
+            continue
+        m = twse.maintenance_ratio(tables[d], closes, by_date[d]["margin_bal"] * 1e8)
+        if m:
+            by_date[d].update({"maint": round(m["maint"], 4), "collateral": round(m["collateral"], 1)})
+            done += 1
+    write_json(DATA / "history" / "tw_flows.json", flows)
+    log(f"maintenance ratio: {done}/{len(need)} days computed")
+    def closes_on(d: str | None) -> dict:  # from the local day cache only: never worth an extra request
+        path = DAY_CACHE / f"{d}.json"
+        return {c: bar[3] for c, bar in read_json(path, {}).items()} if d and path.exists() else {}
+
+    return ref_date, tables.get(ref_date, {}), closes_on(ref_date), closes_on(window[0]["date"])
+
+
 def stock_flows(trading_days: list[str]) -> tuple[list[str], dict[str, list[tuple]]]:
     """Per-stock net shares (foreign, trust) for the latest N trading days.
 
@@ -289,7 +329,8 @@ def update_tw_prices(trading_days: list[str], universe: list[str]) -> dict[str, 
     day_rows: dict[str, list] = {}
     for d, table in sorted(tables.items()):
         for code, bar in table.items():
-            day_rows.setdefault(code, []).append((d, *bar))
+            if twse.tracked(code):  # the day tables hold every security; the price store keeps ours
+                day_rows.setdefault(code, []).append((d, *bar))
     out: dict[str, pd.DataFrame] = {}
     # Stocks that only just entered the universe have no history on file. Back-fill a
     # few of them per run, month by month (13 requests each), unless this run was
@@ -390,9 +431,8 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                  read_json(DATA / "history" / "tw_flows.json", []), "https://www.twse.com.tw")
     sf = safe("證交所 三大法人 (個股)", lambda: stock_flows(trading_days), None, "https://www.twse.com.tw")
     flow_dates, flow_map = sf if sf else ([], {})
-    margin_ref_date = flow_dates[-6] if len(flow_dates) >= 6 else (flow_dates[0] if flow_dates else None)
-    margin_ref = (safe("證交所 個股融資 (5日前)", lambda: twse.margin_stocks(margin_ref_date), {},
-                       "https://www.twse.com.tw") if margin_ref_date and not QUICK else {})
+    mres = safe("證交所 個股融資 (逐日) 與融資維持率", lambda: update_maintenance(flows), None, "https://www.twse.com.tw")
+    margin_ref_date, margin_ref, closes_5, closes_20 = mres if mres else (None, {}, {}, {})
 
     # ---- 3. universes -------------------------------------------------------
     forced = [k for k in CFG["aliases"] if k.isdigit()]
@@ -711,6 +751,20 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                    "margin_bal": mrows[-1]["margin_bal"] if mrows else None, "margin_chg5": m5,
                    "margin_chg20": m20, "short_units": mrows[-1].get("short_units") if mrows else None,
                    "last_date": fl_rows[-1]["date"], "futures": futures, "breadth": b}
+        mt = [r for r in flows if r.get("maint")]
+        turnover = sum(q["value"] or 0 for q in quotes.values()) / 1e8
+        if mt:
+            last = mt[-1]
+            tw_flow.update({
+                "maint": last["maint"], "maint_date": last["date"], "maint_status": twse.maint_status(last["maint"]),
+                "maint_chg5": last["maint"] - mt[-6]["maint"] if len(mt) >= 6 else None,
+                "maint_low20": min(r["maint"] for r in mt[-20:]),
+                # how far the collateral could fall before the market as a whole sits on the call line
+                "maint_cushion": 1 - twse.MAINT_CALL / last["maint"], "collateral": last.get("collateral")})
+        if mrows and mrows[-1].get("margin_units"):
+            tw_flow["short_ratio"] = (mrows[-1].get("short_units") or 0) / mrows[-1]["margin_units"]
+        if mrows and turnover:
+            tw_flow.update({"turnover": turnover, "margin_days": mrows[-1]["margin_bal"] / turnover})
     vix = frames.get("VIX")
     us_chips = None
     if vix is not None:
@@ -792,17 +846,31 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         m0 = margin_ref.get(code, {}).get("margin")
         if not twse.COMMON_STOCK.match(code) or not m0 or m0 < 2000 or mnow["margin"] is None:
             continue
-        s = f"{code}.TW"
+        q, c5 = quotes.get(code) or {}, closes_5.get(code)
         margin_moves.append({"code": code, "name": mnow["name"], "margin": mnow["margin"],
-                             "chg": mnow["margin"] / m0 - 1,
-                             "price_chg5": ret(frames[s], 5) if s in frames else None})
+                             "chg": mnow["margin"] / m0 - 1, **margin_extra(mnow),
+                             "price_chg5": q["close"] / c5 - 1 if q.get("close") and c5 else None})
     margin_moves.sort(key=lambda r: -r["chg"])
+    # Forced-selling watch: heavily margined names that have already fallen hard this month.
+    margin_risk = []
+    for code, mnow in margin_now.items():
+        q, old = quotes.get(code), closes_20.get(code)
+        if not twse.COMMON_STOCK.match(code) or not q or not q.get("close") or not old or not mnow["margin"]:
+            continue
+        value, r20 = mnow["margin"] * 1000 * q["close"] / 1e8, q["close"] / old - 1
+        extra = margin_extra(mnow)
+        if value >= 3 and r20 <= -0.15 and (extra["usage"] or 0) >= 0.10:
+            m0 = margin_ref.get(code, {}).get("margin")
+            margin_risk.append({"code": code, "name": mnow["name"], "value": value, "r20": r20, **extra,
+                                "chg": mnow["margin"] / m0 - 1 if m0 else None})
+    margin_risk.sort(key=lambda r: r["r20"])
 
     write_json(DATA / "flows.json", {
         "history": flows, "summary": tw_flow, "dates": flow_dates,
         "foreign_buy": top_flow(0, 1) if flow_map else [], "foreign_sell": top_flow(0, -1) if flow_map else [],
         "trust_buy": top_flow(1, 1) if flow_map else [], "trust_sell": top_flow(1, -1) if flow_map else [],
-        "margin_up": margin_moves[:15], "margin_down": margin_moves[::-1][:15], "margin_ref_date": margin_ref_date})
+        "margin_up": margin_moves[:15], "margin_down": margin_moves[::-1][:15], "margin_ref_date": margin_ref_date,
+        "margin_risk": margin_risk[:20]})
 
     tw_ins = []
     for r in records:
@@ -842,6 +910,12 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         f"{len(hot)} podcast-hot, "
         f"failed sources: {bad or 'none'}")
     return 0
+
+
+def margin_extra(m: dict) -> dict:
+    """Per-stock margin gauges that need no cost basis: quota used and short/margin ratio."""
+    lots, limit, short = m.get("margin") or 0, m.get("limit") or 0, m.get("short") or 0
+    return {"usage": lots / limit if limit else None, "short_ratio": short / lots if lots else None}
 
 
 def etf_category(code: str, name: str) -> str:
@@ -943,6 +1017,12 @@ def build_narrative(indices: list[dict], fl: dict, picks: list[dict], bull: list
             if fl.get("margin_chg20") is not None:
                 txt += f"、一月 {fl['margin_chg20']:+.1%}"
             txt += "。"
+            if fl.get("maint"):
+                txt += (f"大盤融資維持率估算約 {fl['maint']:.0%}（{fl['maint_status']}"
+                        + (f"，一週 {fl['maint_chg5'] * 100:+.0f} 個百分點" if fl.get("maint_chg5") is not None else "")
+                        + f"），整體擔保品再跌約 {fl['maint_cushion']:.0%} 會碰到 130% 追繳線。")
+                if fl["maint"] < 1.40:
+                    txt += "維持率已低，續跌容易引發追繳與斷頭賣壓。"
             if (fl.get("margin_chg5") or 0) > 0.02 and fl["foreign_5d"] < 0:
                 txt += "外資賣、融資增，籌碼由法人流向散戶，須提防多殺多。"
             elif (fl.get("margin_chg5") or 0) < -0.02 and fl["foreign_5d"] > 0:

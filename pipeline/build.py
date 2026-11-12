@@ -1088,12 +1088,16 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
 
 
 # ----------------------------- market safety ----------------------------- #
-def update_futures_history(today: dt.date) -> dict[str, dict]:
-    """Foreign TX net open interest per day. The first run backfills about 13 months, later runs the last one."""
+def update_futures_history(last_day: dt.date) -> dict[str, dict]:
+    """Foreign TX net open interest per day. The first run backfills about 13 months, later runs the last one.
+
+    The query must end on a day that has data (the site returns nothing for a range ending
+    after its latest report), so it ends on the last trading day rather than today.
+    """
     path = DATA / "history" / "tw_futures.json"
     hist = read_json(path, {})
     months = 1 if QUICK or len(hist) >= 200 else 13
-    end = today
+    end = last_day
     for _ in range(months):
         start = end - dt.timedelta(days=30)
         try:
@@ -1103,6 +1107,8 @@ def update_futures_history(today: dt.date) -> dict[str, dict]:
         end = start - dt.timedelta(days=1)
     hist = {d: hist[d] for d in sorted(hist)[-520:]}
     write_json(path, hist)
+    if not hist or (last_day - dt.date.fromisoformat(max(hist))).days > 7:
+        raise RuntimeError(f"futures history ends at {max(hist) if hist else 'nothing'}")  # stale: do not score it
     return hist
 
 
@@ -1153,7 +1159,7 @@ def build_market(frames: dict, tframes: dict, stocks: list[str], meta: dict, flo
 
     # foreign futures
     fut_out, fut_risk = None, None
-    fh = safe("期交所 外資台指期未平倉歷史", lambda: update_futures_history(today), None, "https://www.taifex.com.tw")
+    fh = safe("期交所 外資台指期未平倉歷史", lambda: update_futures_history(dt.date.fromisoformat(data_date)), None, "https://www.taifex.com.tw")
     if fh:
         fs = pd.Series({pd.Timestamp(d): v["net_oi"] for d, v in fh.items()}).sort_index()
         x.update({"fut_net": float(fs.iloc[-1]), "fut_pct": leading.percentile(fs),

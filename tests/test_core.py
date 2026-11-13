@@ -64,7 +64,7 @@ def test_tech_frame_has_no_lookahead():
 def test_blend_renormalises_missing_groups():
     assert scoring.blend("1m", {"tech": 0.5, "chips": None, "fund": None, "buzz": None}) == pytest.approx(0.5)
     mixed = scoring.blend("1m", {"tech": 1.0, "chips": -1.0, "fund": None, "buzz": None})
-    assert mixed == pytest.approx((0.45 - 0.25) / 0.70)
+    assert mixed == pytest.approx((0.50 - 0.25) / 0.75)
 
 
 def test_forecast_is_bounded_and_ordered():
@@ -690,12 +690,14 @@ def test_tactical_structural_and_slow_chip_weights():
     fast = scoring.score_stock(tf, 0.8, -0.5, 0.0)
     slow = scoring.score_stock(tf, 0.8, -0.5, 0.0, slow_chips=True)
     t1w = float(tf["t_1w"].iloc[-1])
-    assert fast["tactical"] == pytest.approx((0.60 * t1w + 0.35 * 0.8) / 1.0, abs=1e-3)
+    assert fast["tactical"] == pytest.approx(0.65 * t1w + 0.35 * 0.8, abs=1e-3)
     assert fast["structural"] == pytest.approx(-0.5)                              # daily flows are not structural
-    assert slow["tactical"] == pytest.approx(0.60 * t1w / 0.65, abs=1e-3)         # late filings are not tactical
+    assert slow["tactical"] == pytest.approx(t1w, abs=1e-3)                       # late filings are not tactical
     assert slow["structural"] == pytest.approx(0.7 * -0.5 + 0.3 * 0.8)
     # filings weigh 10% of a one-week call instead of 35%
-    assert slow["horizons"]["1w"]["score"] == pytest.approx(0.80 * t1w + 0.10 * 0.8 + 0.05 * -0.5, abs=2e-3)
+    assert slow["horizons"]["1w"]["score"] == pytest.approx(0.85 * t1w + 0.10 * 0.8 + 0.05 * -0.5, abs=2e-3)
+    # podcast attention carries no weight in any score
+    assert scoring.score_stock(tf, 0.8, -0.5, 0.3)["overall"] == fast["overall"]
     assert scoring.score_stock(tf, None, None, None)["structural"] is None
     assert scoring.setup_tag(0.3, 0.4) == "結構與短線同步偏多"
     assert scoring.setup_tag(0.3, 0.4, tactical_prev=0.0) == "結構佳，短線剛轉強"
@@ -802,16 +804,18 @@ def test_linkage_recovers_beta_and_pending_move():
 def test_risk_parts_total_and_levels():
     calm = {"regime": "bull", "drawdown": 0.0, "breadth": 80.0, "foreign20_ratio": 0.03, "foreign_streak": 4,
             "fut_pct": 0.9, "maint": 1.75, "vix": 13.0, "vix_term": 0.85, "oas": 2.8, "oas_chg10": 0.0,
-            "soxx_r20": 0.1, "ndq_r20": 0.06, "fx_r20": -0.03, "fsi": -3.0}
+            "soxx_r20": 0.1, "ndq_r20": 0.06, "fx_r20": -0.03, "fsi": 3.0, "liq_chg13": 0.04}
     parts = market.risk_parts(calm)
     assert len(parts) == 9 and market.risk_total(parts) < 10 and market.risk_level(market.risk_total(parts))["name"] == "低"
     panic = {"regime": "bear", "drawdown": -0.3, "breadth": 5.0, "foreign20_ratio": -0.08, "foreign_streak": -12,
              "fut_pct": 0.0, "maint": 1.35, "vix": 40.0, "vix_term": 1.2, "oas": 7.0, "oas_chg10": 1.5,
-             "soxx_r20": -0.2, "ndq_r20": -0.1, "fx_r20": 0.04, "fsi": 3.0}
+             "soxx_r20": -0.2, "ndq_r20": -0.1, "fx_r20": 0.04, "fsi": -3.0, "liq_chg13": -0.06}
     total = market.risk_total(market.risk_parts(panic))
     assert total > 90 and market.risk_level(total)["name"] == "高"
     some = market.risk_parts({"vix": 23.0, "maint": None})  # missing inputs are dropped, weights renormalise
     assert [p["key"] for p in some] == ["vol"] and market.risk_total(some) == pytest.approx(50)
+    # the stress index overlaps the volatility and credit components, so it is not a component itself
+    assert "stress" not in [p["key"] for p in parts] and "liquidity" in [p["key"] for p in parts]
 
 
 def test_risk_history_and_bucket_stats():
@@ -858,3 +862,80 @@ def test_momentum_lists_and_alerts():
     assert al[0]["level"] == 2 and "市場週期轉變" in titles and "融資維持率偏低" in titles and "VIX 期限結構倒掛" in titles
     assert market.alerts({"risk": 20.0, "regime": "bull", "foreign_streak": 6}) == [
         {"level": 0, "title": "外資連續買超", "text": "外資已連續 6 日買超。"}]
+
+
+# ---------------- third batch: calibration, residual momentum, liquidity, pick changes ----------------
+def _noise_frames(n_stocks=30, n=500, edge=0.0):
+    """Synthetic technical frames: each stock has a fixed score, and `edge` sets how much daily drift it earns."""
+    rng = np.random.default_rng(7)
+    idx = pd.bdate_range("2023-01-02", periods=n)
+    frames = {}
+    for i in range(n_stocks):
+        lvl = float(rng.uniform(-1, 1))
+        score = pd.Series(lvl, index=idx)
+        close = pd.Series(100 * np.exp(np.cumsum(rng.normal(0, 0.01, n) + edge * lvl * 0.004)), index=idx)
+        frames[f"S{i}"] = pd.DataFrame({"close": close, "t_1w": score, "t_1m": score, "t_1q": score})
+    return frames
+
+
+def test_fit_slopes_follows_the_evidence():
+    none = market.fit_slopes(_noise_frames(edge=0.0), {"1w": 5})["1w"]
+    assert abs(none["fit"]) < 0.04 and none["k"] <= 0.04                            # no skill -> about the floor
+    assert none["brier"] <= none["brier_fixed"]                                     # and that beats the fixed slope
+    real = market.fit_slopes(_noise_frames(edge=1.0), {"1w": 5})["1w"]
+    assert real["fit"] > none["fit"] + 0.05 and 0.03 <= real["k"] <= 0.22
+    assert market.fit_slopes({"A": _noise_frames(1, 80)["S0"]}, {"1w": 5})["1w"] is None
+
+
+def test_forecast_uses_the_calibrated_slope():
+    base = scoring.forecast(100, 0.02, 1.0, 21)
+    assert base["p_up"] == 0.72
+    scoring.P_SLOPE[21] = 0.05
+    try:
+        cal = scoring.forecast(100, 0.02, 1.0, 21)
+        assert cal["p_up"] == pytest.approx(0.55) and cal["label"] == base["label"]
+        assert 0 < cal["exp_ret"] < base["exp_ret"]                                 # the range leans less, too
+        assert cal["high"] - cal["low"] == pytest.approx(base["high"] - base["low"], abs=0.02)
+    finally:
+        scoring.P_SLOPE.clear()
+
+
+def test_residual_momentum_ignores_what_the_market_explains():
+    rng = np.random.default_rng(3)
+    idx = pd.bdate_range("2024-01-01", periods=320)
+    mkt_r = rng.normal(0.001, 0.01, 320)
+    bench = pd.Series(100 * np.exp(np.cumsum(mkt_r)), index=idx)
+    noise = rng.normal(0, 0.004, 320)
+    passenger = pd.Series(50 * np.exp(np.cumsum(1.5 * mkt_r + noise)), index=idx)            # only beta
+    own = pd.Series(50 * np.exp(np.cumsum(1.5 * mkt_r + noise + 0.002)), index=idx)          # beta plus its own drift
+    a, b = scoring.residual_momentum(passenger, bench), scoring.residual_momentum(own, bench)
+    assert abs(a.iloc[-1]) < 1.0 and b.iloc[-1] > a.iloc[-1] + 1.5
+    assert scoring.residual_momentum(passenger.head(100), bench).empty
+    ic = scoring.factor_ic({"A": a}, {"A": passenger})
+    assert set(ic) == {"1w", "1m", "1q"} and ic["1w"] is None                                # one stock is no cross-section
+
+
+def test_net_liquidity_units_and_alignment():
+    from pipeline import leading
+    w = pd.date_range("2026-01-07", periods=3, freq="W-WED")
+    walcl = pd.Series([6_700_000.0, 6_750_000.0, 6_760_000.0], index=w)
+    tga = pd.Series([900_000.0, 950_000.0, 910_000.0], index=w)
+    rrp = pd.Series([100.0, 50.0], index=[w[0] - pd.Timedelta(days=1), w[1] + pd.Timedelta(days=2)])  # daily, billions
+    nl = leading.net_liquidity(walcl, tga, rrp)
+    assert nl.iloc[0] == pytest.approx(6.7 - 0.9 - 0.1) and nl.iloc[1] == pytest.approx(6.75 - 0.95 - 0.1)
+    assert nl.iloc[2] == pytest.approx(6.76 - 0.91 - 0.05)
+    assert float(market.liquidity_risk(0.03)) == 0 and float(market.liquidity_risk(-0.05)) == 100
+
+
+def test_pick_changes_compare_with_the_previous_week():
+    from pipeline import leading
+    mk = lambda d, syms: {"date": d, "picks": [{"symbol": x} for x in syms]}  # noqa: E731
+    earlier = [mk("2026-10-28", ["A", "B", "C"]), mk("2026-11-04", ["B", "A", "D"]), mk("2026-11-10", ["Z", "A"])]
+    ch = leading.pick_changes(["A", "E", "B"], earlier, "2026-11-11")   # 11/10 is the same week: not the reference
+    assert ch["ref_date"] == "2026-11-04" and ch["dropped"] == ["D"]
+    assert ch["by_symbol"]["A"] == {"new": False, "prev_rank": 2, "move": 1, "weeks": 3}
+    assert ch["by_symbol"]["B"]["move"] == -2 and ch["by_symbol"]["E"] == {"new": True, "prev_rank": None, "move": None, "weeks": 1}
+    only = leading.pick_changes(["A"], [mk("2026-11-10", ["Z", "A"])], "2026-11-11")       # nothing older: use what there is
+    assert only["ref_date"] == "2026-11-10" and only["by_symbol"]["A"]["prev_rank"] == 2
+    assert only["by_symbol"]["A"]["weeks"] == 1                                             # same week: still the first
+    assert leading.pick_changes(["A"], [], "2026-11-11")["ref_date"] is None

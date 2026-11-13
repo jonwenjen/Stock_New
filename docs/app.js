@@ -81,17 +81,65 @@
   const help = (id, label) => h("a", { class: "help", href: "#learn?k=" + id, title: "看這個指標的解說",
     "aria-label": (label || "") + "解說", onclick: (e) => e.stopPropagation() }, "?");
   const CARD_KB = { vixts: "vix", breadth_tw: "breadth", breadth_us: "breadth" };
+  const calibNote = () => {
+    const C = S.calibration || {};
+    if (!Object.keys(C).length) return null;
+    return h("div", { class: "stack" }, table([
+      { key: "h", label: "期間", left: true, cell: ([k]) => HZ[k] },
+      { key: "k", label: "採用的斜率", tip: "上漲機率＝50% ＋ 斜率 × 分數", cell: ([, v]) => h("b", { class: "num" }, num(v.k, 3)) },
+      { key: "f", label: "回測估計值", tip: "未設上下限前的估計", cell: ([, v]) => h("span", { class: "num" }, signed(v.fit, 3)) },
+      { key: "b", label: "Brier：校準後", cell: ([, v]) => h("span", { class: "num" }, num(v.brier, 4)) },
+      { key: "x", label: "固定斜率 0.22", cell: ([, v]) => h("span", { class: "num" }, num(v.brier_fixed, 4)) },
+      { key: "c", label: "一律 50%", cell: ([, v]) => h("span", { class: "num" }, num(v.brier_coin, 4)) }], Object.entries(C), { csv: false }),
+      h("p", { class: "small" }, "Brier 分數越低越準。三欄都是樣本外結果：把約三年的資料切成五段，每一段只用它之前的資料估計斜率再預測。校準後的機率接近 50%，是因為技術面分數對漲跌方向的區分力很弱；分數的用處在排序，見下方的 IC。",
+        help("pup", "上漲機率")));
+  };
   // Two-level navigation: five groups, each holding the views that are read together.
   const NAV = [
     ["市場總覽", [["overview", "總覽與預測"], ["safety", "市場安全"], ["alerts", "漲跌預警"]]],
-    ["核心選股", [["picks", "精選 20 檔"], ["fund", "財報指標"]]],
+    ["核心選股", [["picks", "精選 20 檔"], ["fund", "財報指標"], ["watch", "自選股"]]],
     ["籌碼與聰明錢", [["flows", "外資法人"], ["margin", "融資融券"], ["smart", "名人・議員・董監"]]],
     ["資產配置", [["etf", "ETF"], ["funds", "基金"]]],
     ["輿情與知識", [["podcast", "Podcast"], ["learn", "指標與模型解說"], ["method", "方法與來源"]]]];
   let AI = null; // ai.json - commentary written by Claude during the weekly run
+  let MK = null; // market.json - risk score, regime, alerts (optional)
+  // Personal watchlist, kept in this browser only.
+  const WATCH = new Set();
+  try { JSON.parse(localStorage.getItem("watch") || "[]").forEach((x) => WATCH.add(x)); } catch (e) { /* storage unavailable */ }
+  const paintWatch = () => { const el = document.getElementById("watch-chip"); if (el) el.textContent = `★ 自選 ${WATCH.size}`; };
+  const toggleWatch = (sym) => {
+    if (WATCH.has(sym)) WATCH.delete(sym); else WATCH.add(sym);
+    try { localStorage.setItem("watch", JSON.stringify([...WATCH])); } catch (e) { /* storage unavailable */ }
+    paintWatch();
+  };
+  // A star that works inside a card that is itself a button (so it cannot be a <button>).
+  const star = (sym) => {
+    const el = h("span", { class: "star", role: "button", tabindex: 0, "aria-pressed": String(WATCH.has(sym)), title: "加入或移出自選股" }, WATCH.has(sym) ? "★" : "☆");
+    const flip = (e) => { e.stopPropagation(); e.preventDefault(); toggleWatch(sym);
+      el.textContent = WATCH.has(sym) ? "★" : "☆"; el.setAttribute("aria-pressed", String(WATCH.has(sym))); };
+    el.addEventListener("click", flip);
+    el.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") flip(e); });
+    return el;
+  };
+  const tagChips = (r, max = 99) => ((r.tags || []).length ? h("div", { class: "tags" }, r.tags.slice(0, max).map(([t, tone]) =>
+    h("span", { class: "chip " + (tone > 0 ? "add" : tone < 0 ? "cut" : "") }, t))) : null);
+  const diffBadges = (r) => {
+    const d = r.diff;
+    if (!d) return null;
+    return [d.new ? h("span", { class: "chip mk" }, "NEW") : d.move ? h("span", { class: "chip " + (d.move > 0 ? "add" : "cut") }, (d.move > 0 ? "↑" : "↓") + Math.abs(d.move)) : null,
+      d.weeks >= 2 ? h("span", { class: "chip" }, `連續 ${d.weeks} 週`) : null];
+  };
   const bySymbol = new Map();
 
   // ---------- sortable table ----------
+  // Rows and cards that open a chart carry data-sym; hovering or touching one starts fetching its chart file.
+  const rowSym = (r) => (r && typeof r === "object" ? (r.symbol && bySymbol.has(r.symbol) ? r.symbol
+    : r.code && bySymbol.has(r.code + ".TW") ? r.code + ".TW" : r.ticker && bySymbol.has(r.ticker) ? r.ticker : null) : null);
+  const preload = (e) => { const el = e.target.closest && e.target.closest("[data-sym]"); if (el) load("charts/" + fileOf(el.dataset.sym)).catch(() => {}); };
+  document.addEventListener("pointerover", preload, { passive: true });
+  document.addEventListener("focusin", preload);
+  document.addEventListener("touchstart", preload, { passive: true });
+
   function table(cols, rows, opts = {}) {
     let sortKey = opts.sort || null, dir = opts.dir || -1;
     const tbody = h("tbody");
@@ -107,7 +155,7 @@
         return (x - y) * dir;
       }) : rows;
       tbody.replaceChildren(...data.map((r) => {
-        const tr = h("tr", { class: opts.onRow ? "click" : null, tabindex: opts.onRow ? 0 : null },
+        const tr = h("tr", { class: opts.onRow ? "click" : null, tabindex: opts.onRow ? 0 : null, "data-sym": rowSym(r) },
           cols.map((c) => h("td", { class: [c.left ? "l" : "", c.wrap ? "wrap" : ""].join(" ").trim() || null }, c.cell(r))));
         if (opts.onRow) {
           tr.addEventListener("click", () => opts.onRow(r));
@@ -126,15 +174,29 @@
       });
     });
     draw();
-    const el = h("div", { class: "tbl-wrap" }, h("table", {}, h("thead", {}, h("tr", {}, ths)), tbody));
+    const wrap = h("div", { class: "tbl-wrap" }, h("table", {}, h("thead", {}, h("tr", {}, ths)), tbody));
+    // Export what is on screen: the current filter and sort order, as text.
+    const exportCsv = () => downloadCsv(opts.csv || "table",
+      [cols.map((c) => c.label), ...[...tbody.rows].map((tr) => [...tr.cells].map((td) => td.textContent.replace(/\s+/g, " ").trim()))]);
+    const el = h("div", { class: "tbl" }, wrap, opts.csv === false || (!opts.csv && rows.length < 6) ? null : h("div", { class: "tbl-tools" },
+      h("button", { class: "linkish", type: "button", onclick: exportCsv }, "匯出 CSV")));
     el.setRows = (r) => { rows = r; draw(); };
     return el;
+  }
+  function downloadCsv(name, lines) {
+    const esc = (v) => (/[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v);
+    // The byte-order mark makes Excel read the file as UTF-8, so Chinese text is not garbled.
+    const blob = new Blob(["\uFEFF" + lines.map((l) => l.map(esc).join(",")).join("\r\n")], { type: "text/csv;charset=utf-8" });
+    const a = h("a", { href: URL.createObjectURL(blob), download: `${name}-${S ? S.data_date : "data"}.csv` });
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
   }
 
   // ---------- price chart (candles + volume + MAs, switchable range) ----------
   const RANGES = [["1d", "天"], ["1w", "週"], ["1m", "月"], ["3m", "季"], ["6m", "2季"],
     ["ytd", "當年"], ["2y", "2年"], ["5y", "5年"], ["all", "所有"]];
-  const charts = new Set();
+  const charts = new Set();      // re-theme callbacks of the charts on screen
+  const liveCharts = new Set();  // their disposers: a view's charts are destroyed when the view is left
 
   function themeOpts() {
     return {
@@ -200,7 +262,7 @@
   function priceChart(symbol, opts = {}) {
     const state = { range: opts.range || "6m", data: null };
     const readout = h("div", { class: "readout", "aria-live": "off" });
-    const box = h("div", { class: "chart" + (opts.small ? " sm" : "") });
+    const box = h("div", { class: "chart loading" + (opts.small ? " sm" : "") });
     const note = h("div", { class: "chart-note" });
     const seg = h("div", { class: "seg", role: "group", "aria-label": "圖表區間" },
       RANGES.map(([k, label]) => h("button", { type: "button", "data-r": k, "aria-pressed": String(k === state.range),
@@ -211,6 +273,8 @@
         k.style.background = `var(${c})`;
         return h("span", {}, k, t);
       }));
+    const coneKey = h("span", { hidden: true }, h("span", { class: "key dash" }), "預測區間（±1σ）");
+    legend.append(coneKey);
     const root = h("div", { class: "stack" }, h("div", { class: "chart-bar" }, seg, legend), readout, box, note);
 
     const chart = LightweightCharts.createChart(box, { ...themeOpts(), autoSize: true,
@@ -221,6 +285,11 @@
     chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 }, visible: false });
     chart.priceScale("right").applyOptions({ scaleMargins: { top: 0.06, bottom: 0.2 } });
     const mas = [20, 60, 120].map(() => chart.addLineSeries({ lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false }));
+    // Forecast cone: the model's one-standard-deviation range, drawn into the days after the last bar.
+    const cone = [0, 1, 2].map((i) => chart.addLineSeries({ lineWidth: 1, lineStyle: i === 2 ? 3 : 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false }));
+    const fcOf = () => { const it = bySymbol.get(symbol) || (S && S.indices.find((x) => x.symbol === symbol)); return it && it.horizons; };
+    const nextDays = (iso, n) => { const out = []; let t = Date.parse(iso + "T00:00:00Z");
+      while (out.length < n) { t += 864e5; const d = new Date(t).getUTCDay(); if (d !== 0 && d !== 6) out.push(new Date(t).toISOString().slice(0, 10)); } return out; };
     let rowsByTime = new Map();
 
     const applyTheme = () => {
@@ -228,6 +297,7 @@
       const up = css("--up"), down = css("--down");
       candle.applyOptions({ upColor: up, downColor: down, borderUpColor: up, borderDownColor: down, wickUpColor: up, wickDownColor: down });
       ["--ma1", "--ma2", "--ma3"].forEach((c, i) => mas[i].applyOptions({ color: css(c) }));
+      cone.forEach((c) => c.applyOptions({ color: css("--ink-3") }));
       navLine.applyOptions({ color: css("--ink") });
       if (state.data) draw();
     };
@@ -255,7 +325,7 @@
       rows.forEach((r, i) => { rowsByTime.set(r[0], r); if (i) rowsByTime.set("prev:" + r[0], rows[i - 1][4]); });
       // Intraday bars use numeric timestamps, daily bars use date strings; the library cannot hold
       // both at once, so every series is emptied before the new window is loaded.
-      [candle, navLine, vol, ...mas].forEach((s) => s.setData([]));
+      [candle, navLine, vol, ...mas, ...cone].forEach((s) => s.setData([]));
       const isLine = !!state.data.line;
       if (isLine) navLine.setData(rows.map((r) => ({ time: r[0], value: r[4] })));
       else {
@@ -269,13 +339,33 @@
       const showMA = !intraday && unit === "日" && rows.length > 5;
       mas.forEach((s, i) => s.setData(showMA ? sma(daily, [20, 60, 120][i]).filter((p) => p.time >= first) : []));
       legend.hidden = !showMA;
+      const fc = fcOf();
+      const steps = { "1m": 21, "3m": 21, "6m": 63, ytd: 63, "2y": 63 }[state.range];
+      const hasCone = !!(fc && steps && !intraday && unit === "日" && rows.length > 5 && rows[rows.length - 1][0] === daily[daily.length - 1][0]);
+      if (hasCone) {
+        const last = rows[rows.length - 1], days = nextDays(last[0], steps);
+        const anchors = [[0, "low", "high"], [5, fc["1w"]], [21, fc["1m"]], [63, fc["1q"]]].filter(([d]) => d <= steps);
+        const at = (d, key) => { // straight lines between the horizons the model actually forecasts
+          for (let i = 1; i < anchors.length; i++) {
+            const [d0, f0] = [anchors[i - 1][0], anchors[i - 1][1]], [d1, f1] = anchors[i];
+            if (d <= d1) { const v0 = d0 === 0 ? last[4] : (key === "mid" ? (f0.low + f0.high) / 2 : f0[key]);
+              const v1 = key === "mid" ? (f1.low + f1.high) / 2 : f1[key]; return v0 + ((v1 - v0) * (d - d0)) / (d1 - d0); }
+          }
+          return null;
+        };
+        ["high", "low", "mid"].forEach((key, i) => cone[i].setData([{ time: last[0], value: last[4] },
+          ...days.map((t, j) => ({ time: t, value: at(j + 1, key) }))]));
+      }
+      coneKey.hidden = !hasCone;
+      legend.hidden = !showMA && !hasCone;
       chart.applyOptions({ timeScale: { timeVisible: !!intraday, secondsVisible: false } });
       fit(chart);
       show(rows[rows.length - 1]);
       const start = (state.data.w && state.data.w[0] ? state.data.w[0][0] : daily[0] && daily[0][0]) || "";
       note.textContent = (isLine ? `每日淨值・${rows.length} 筆` : `${unit}K・${rows.length} 根`) +
         (fallback ? (isLine ? "・基金每日只有一個淨值，顯示最近 5 筆" : "・此標的無分時資料，改以最近 5 根日 K 呈現") : "") +
-        (intraday ? "・分時資料為更新當下的最近交易日" : "") + (start ? `・歷史資料起始 ${start}` : "");
+        (intraday ? "・分時資料為更新當下的最近交易日" : "") + (start ? `・歷史資料起始 ${start}` : "") +
+        (hasCone ? "・右側虛線是模型對未來的一個標準差區間（約三分之二的情況落在其中），不是目標價" : "");
     }
     chart.subscribeCrosshairMove((p) => {
       if (!p.time) { const { rows } = selectBars(state.data || {}, state.range); show(rows[rows.length - 1]); return; }
@@ -283,9 +373,11 @@
       show(rowsByTime.get(key));
     });
     charts.add(applyTheme);
-    root.destroy = () => { charts.delete(applyTheme); chart.remove(); };
-    load("charts/" + fileOf(symbol)).then((d) => { state.data = d; applyTheme(); })
-      .catch(() => { box.replaceChildren(h("div", { class: "empty" }, "這檔標的目前沒有圖表資料")); });
+    let alive = true;
+    root.destroy = () => { if (!alive) return; alive = false; charts.delete(applyTheme); liveCharts.delete(root.destroy); chart.remove(); };
+    liveCharts.add(root.destroy);
+    load("charts/" + fileOf(symbol)).then((d) => { if (!alive) return; state.data = d; box.classList.remove("loading"); applyTheme(); })
+      .catch(() => { if (alive) { box.classList.remove("loading"); box.replaceChildren(h("div", { class: "empty" }, "這檔標的目前沒有圖表資料")); } });
     return root;
   }
 
@@ -349,6 +441,9 @@
     };
     c1.subscribeCrosshairMove(onMove); c2.subscribeCrosshairMove(onMove);
     charts.add(applyTheme);
+    const dispose = () => { charts.delete(applyTheme); liveCharts.delete(dispose); c1.remove(); c2.remove(); };
+    root.destroy = dispose;
+    liveCharts.add(dispose);
     applyTheme();
     return root;
   }
@@ -455,9 +550,10 @@
     const body = [];
     body.push(h("div", { class: "drawer-head" },
       h("div", {}, h("div", { class: "t" }, item.name, r ? h("span", { class: "num muted small" }, r.code) : null, r ? mkChip(r.market) : null,
-        r ? h("span", { class: "chip" }, r.industry) : null),
+        r ? h("span", { class: "chip" }, r.industry) : null, r ? star(symbol) : null),
       h("div", { class: "row" }, h("span", { class: "p num" }, px(item.close)), numEl(pct(item.chg1d, 2), item.chg1d),
-        h("span", { class: "muted small" }, "資料日 " + item.date))),
+        h("span", { class: "muted small" }, "資料日 " + item.date)),
+      r ? tagChips(r) : null),
       h("button", { class: "close", type: "button", onclick: closeDrawer }, "關閉")));
     body.push(h("div", { class: "panel" }, priceChart(symbol, { range: "6m" })));
     if (item.horizons) body.push(h("div", { class: "panel" }, h("h3", {}, "趨勢預測", help("labels", "預測標籤")), forecastGrid(item.horizons)));
@@ -493,10 +589,12 @@
           ["融資餘額", ok(r.margin) ? num(r.margin, 0) + " 張" : "–"], ["融資 5 日變化", pct(r.margin_chg5)],
           ["估算融資維持率", ok(r.maint_est) ? num(r.maint_est * 100, 0) + "%" : "–"],
           ["合約負債季增", ok(r.cl_qoq) && !/金融|保險/.test(r.industry) ? pct(r.cl_qoq, 0) : "–"],
-          ["董監質押比", ok(r.insider_pledge) ? pct(r.insider_pledge).replace("+", "") : "–"], ["RSI(14)", num(r.rsi, 0)]]
+          ["董監質押比", ok(r.insider_pledge) ? pct(r.insider_pledge).replace("+", "") : "–"], ["RSI(14)", num(r.rsi, 0)],
+          ["純超額強度", ok(r.imom) ? signed(r.imom, 1) : "–"]]
         : [["本益比 (TTM)", num(r.pe, 1)], ["EPS (TTM)", num(r.eps_ttm, 2)], ["EPS 年增", pctRaw(r.eps_yoy, 0)],
           ["營收年增", pctRaw(r.rev_yoy, 0)], ["議員買 / 賣", `${r.congress_buys ?? 0} / ${r.congress_sells ?? 0}`],
-          ["名人基金淨加碼", signed(r.guru_net, 0)], ["RSI(14)", num(r.rsi, 0)], ["年化波動", ok(r.vol_ann) ? num(r.vol_ann * 100, 0) + "%" : "–"]];
+          ["名人基金淨加碼", signed(r.guru_net, 0)], ["RSI(14)", num(r.rsi, 0)], ["年化波動", ok(r.vol_ann) ? num(r.vol_ann * 100, 0) + "%" : "–"],
+          ["純超額強度", ok(r.imom) ? signed(r.imom, 1) : "–"]];
       body.push(h("div", { class: "panel" }, h("h3", {}, "關鍵數據"), h("div", { class: "kv" },
         kv.map(([k, v]) => h("div", {}, h("div", { class: "k" }, k), h("div", { class: "v num " + (/^[+-][\d.,]+%$/.test(v) ? cls(parseFloat(v)) : "") }, v))))));
     }
@@ -581,11 +679,34 @@
   const views = {
     async overview() {
       const main = S.indices.filter((i) => i.horizons);
+      const funnel = () => {
+        if (!MK || !MK.risk) return null;
+        const R = MK.risk, G = MK.regime, D = S.picks_diff || {}, warn = MK.alerts.filter((a) => a.level === 2);
+        const mark = h("i"); mark.style.left = Math.max(0, Math.min(100, R.score)) + "%";
+        const step = (n, title, body, href, link) => h("div", { class: "fn" }, h("div", { class: "fn-h" }, h("span", { class: "fn-n" }, n), h("b", {}, title)), body,
+          h("a", { class: "small", href }, link));
+        return h("div", { class: "panel stack" }, h("div", { class: "sec-head" }, h("h3", {}, "本週決策順序"), h("span", { class: "small muted" }, "先看能放多少部位，再看放在哪裡")),
+          h("div", { class: "funnel" },
+            step("1", "市場風險與持股水位", h("div", { class: "stack", style: "gap:6px" },
+              h("div", { class: "row" }, h("b", { class: "num", style: "font-size:22px" }, num(R.score, 0)), h("span", { class: "pill " + R.tone }, R.name + "風險"),
+                ok(MK.risk_prev) ? h("span", { class: "small muted num" }, `上次 ${num(MK.risk_prev, 0)}`) : null),
+              h("div", { class: "riskbar", role: "img", "aria-label": `風險分數 ${num(R.score, 0)}，滿分 100` }, mark),
+              h("div", {}, "參考持股水位 ", h("b", {}, R.exposure)),
+              h("div", { class: "small muted" }, `市場週期：${G.name}（第 ${G.days} 個交易日）`)), "#safety", "看九項組成與歷史驗證"),
+            step("2", "要先留意的警報", warn.length ? h("ul", { class: "why" }, warn.slice(0, 4).map((a) => h("li", { class: "con" }, a.title)),
+              warn.length > 4 ? h("li", { class: "muted" }, `另有 ${warn.length - 4} 項`) : null) : h("p", { class: "muted" }, "目前沒有警戒等級的警報。"), "#safety", `全部 ${MK.alerts.length} 項警報`),
+            step("3", "本週名單的變化", h("div", { class: "stack", style: "gap:6px" },
+              h("div", {}, S.picks.slice(0, 3).map((r) => r.name).join("、"), h("span", { class: "muted small" }, " 等 20 檔")),
+              D.ref_date ? h("div", { class: "small" }, `較 ${D.ref_date.slice(5)} 名單：新進 ${D.new} 檔` + (D.dropped.length ? `，移出 ${D.dropped.map((x) => x.name).join("、")}` : "，沒有移出")) : h("div", { class: "small muted" }, "下次更新起顯示與上期名單的差異"),
+              h("div", { class: "small muted" }, "每檔附部位上限：風險高時，總部位先縮，再談選股。")), "#picks", "看精選 20 檔")),
+          h("p", { class: "chart-note" }, "持股水位是依風險等級給的一般性區間，不是個人化建議；風險分數的切點與歷史表現見「市場安全」。"));
+      };
       return [
         h("div", { class: "tiles" }, S.indices.map((i) => h("button", { class: "tile", type: "button", onclick: () => openDrawer(i.symbol) },
           h("span", { class: "nm" }, i.name), h("span", { class: "px num" }, px(i.close)),
           h("span", { class: "chg" }, h("span", { class: "num " + cls(i.chg1d) }, "日 " + pct(i.chg1d, 2)), h("span", { class: "num " + cls(i.chg5d) }, "週 " + pct(i.chg5d))),
           spark(i.spark)))),
+        funnel(),
         h("div", { class: "grid g2" },
           h("div", { class: "panel note" }, h("h3", {}, "本週判讀"), S.narrative.map((n) => h("div", {}, h("h4", {}, n.title), h("p", {}, n.text)))),
           h("div", { class: "panel stack" }, h("h3", {}, "趨勢預測：一週／一月／一季"),
@@ -607,13 +728,14 @@
       const filter = { m: "ALL" };
       const grid = h("div", { class: "picks" });
       const draw = () => grid.replaceChildren(...S.picks.filter((r) => filter.m === "ALL" || r.market === filter.m).map((r, i) =>
-        h("button", { class: "pick", type: "button", onclick: () => openDrawer(r.symbol) },
+        h("button", { class: "pick", type: "button", "data-sym": r.symbol, onclick: () => openDrawer(r.symbol) },
           h("div", { class: "pick-top" },
-            h("div", { class: "pick-id" }, h("div", { class: "rk" }, `#${i + 1}・${r.industry}`),
-              h("div", { class: "t" }, r.name, h("span", { class: "num muted small" }, r.code), mkChip(r.market))),
+            h("div", { class: "pick-id" }, h("div", { class: "rk" }, `#${i + 1}・${r.industry}`, diffBadges(r)),
+              h("div", { class: "t" }, r.name, h("span", { class: "num muted small" }, r.code), mkChip(r.market), star(r.symbol))),
             h("div", { class: "pick-px" }, h("div", { class: "p num" }, px(r.close)), h("div", { class: "num small " + cls(r.chg5d) }, "週 " + pct(r.chg5d)))),
           h("div", { class: "scorebar" }, "綜合", meter(r.overall), h("b", { class: "num " + cls(r.overall) }, signed(r.overall, 2)), pill({ score: r.overall, label: r.label })),
           dual(r),
+          tagChips(r, 5),
           h("div", { class: "hz" }, Object.entries(r.horizons).map(([k, f]) => h("span", {}, HZ[k] + " ", pill(f)))),
           h("ul", { class: "why" }, r.reasons.slice(0, 3).map((t) => h("li", { class: "pro" }, t)), r.risks.slice(0, 2).map((t) => h("li", { class: "con" }, t))),
           h("div", { class: "plan" }, planCells(r)),
@@ -638,7 +760,10 @@
         h("p", { class: "chart-note" }, "每週三的精選名單會被記錄下來，這裡列出從選出日收盤到最新收盤的等權平均報酬，對照同期指數。這是檢驗模型最直接的方式，累積的週數越多越有參考價值。"));
       return [h("div", { class: "sec-head" }, head("精選 20 檔", `從 ${S.counts.tw} 檔台股與 ${S.counts.us} 檔美股中，依趨勢、動能、籌碼、基本面、聲量五類因子的綜合分數挑選，同產業最多 3 檔。點卡片看圖表與完整數據。`), seg),
         h("p", { class: "small muted" }, "「短線」只看每天更新的價量與籌碼，「結構」只看財報與申報持股；部位上限＝願意承擔 1% 資金虧損時，這檔最多買多少。",
-          h("a", { href: "#learn?k=tactical" }, "看解說")), grid, track];
+          h("a", { href: "#learn?k=tactical" }, "看解說")),
+        (S.picks_diff || {}).ref_date ? h("p", { class: "small" }, `與 ${S.picks_diff.ref_date} 的名單相比：新進 ${S.picks_diff.new} 檔（標示 NEW）` +
+          (S.picks_diff.dropped.length ? `；移出 ${S.picks_diff.dropped.map((x) => x.name).join("、")}。` : "；沒有移出。") + "↑↓ 是名次變化，「連續 n 週」是連續上榜的週數。") : null,
+        grid, track];
     },
 
     async flows() {
@@ -761,7 +886,7 @@
             { key: "s", label: "融券變化", tip: "同期散戶融券餘額的變化", val: (r) => r.short_chg, cell: (r) => numEl(pct(r.short_chg), r.short_chg) },
             { key: "x", label: "借券÷融券", val: (r) => r.sbl_vs_short, cell: (r) => h("span", { class: "num" }, ok(r.sbl_vs_short) ? num(r.sbl_vs_short, 0) + " 倍" : "–") }],
           F.sbl[k], { onRow: open }),
-          k === "up" ? h("p", { class: "chart-note" }, `${F.sbl.ref_date} 至 ${F.sbl.date}，僅列借券餘額市值 5 億元以上個股。借券大增而融券持平，代表放空來自法人而非散戶。`) : null))) : null,
+          k === "up" ? h("p", { class: "chart-note" }, (F.sbl.stale ? "本次更新未取得借券資料，以下沿用上次的結果。" : "") + `${F.sbl.ref_date} 至 ${F.sbl.date}，僅列借券餘額市值 5 億元以上個股。借券大增而融券持平，代表放空來自法人而非散戶。`) : null))) : null,
         h("div", { class: "panel stack" }, h("h3", {}, "斷頭壓力觀察：個股融資維持率（估算）", help("maint_stock", "個股融資維持率")),
           (F.margin_risk || []).length ? table(riskCols, F.margin_risk, { onRow: open })
             : h("div", { class: "empty" }, "目前沒有估算維持率低於 145%、或「融資使用率 10% 以上且近 20 日跌逾 15%」的個股"),
@@ -788,14 +913,21 @@
         { key: "t", label: "代號", left: true, cell: (r) => h("b", { class: "num" }, r.ticker) },
         { key: "k", label: "買賣", left: true, cell: (r) => h("span", { class: "chip " + (r.type === "buy" ? "add" : r.type === "sell" ? "cut" : "") }, r.type === "buy" ? "買進" : r.type === "sell" ? "賣出" : "其他") },
         { key: "a", label: "金額區間", left: true, cell: (r) => h("span", { class: "num" }, r.amount) },
-        { key: "f", label: "申報日", cell: (r) => h("span", { class: "num muted" }, r.filed) }], C.trades.slice(0, 60));
+        { key: "f", label: "申報日", cell: (r) => h("span", { class: "num muted" }, r.filed) }], C.trades.slice(0, 20), { csv: "congress-trades" });
+      // Twenty rows keep this panel as tall as its neighbour; the rest is one click away.
+      const cap = { n: 20 };
+      const filtered = () => { const v = q.value.trim().toLowerCase();
+        return C.trades.filter((r) => !v || r.name.toLowerCase().includes(v) || r.ticker.toLowerCase().includes(v)); };
+      const more = h("button", { class: "linkish", type: "button", onclick: () => { cap.n = cap.n === 20 ? 200 : 20; redraw(); } });
+      const redraw = () => { const all = filtered(); tradeTbl.setRows(all.slice(0, cap.n));
+        more.textContent = cap.n === 20 ? `顯示全部 ${Math.min(all.length, 200)} 筆` : "只顯示 20 筆"; more.hidden = all.length <= 20; };
       const q = h("input", { type: "search", id: "congress-q", placeholder: "篩選議員或代號，例如 Pelosi、NVDA", "aria-label": "篩選議員交易",
-        oninput: () => { const v = q.value.trim().toLowerCase();
-          tradeTbl.setRows(C.trades.filter((r) => !v || r.name.toLowerCase().includes(v) || r.ticker.toLowerCase().includes(v)).slice(0, 60)); } });
+        oninput: () => redraw() });
+      redraw();
       const ACT = { new: "新建倉", add: "加碼", cut: "減碼", hold: "持平", exit: "出清" };
       return [
         head("名人・議員・董監持股", "美國國會議員依法申報的交易、知名投資人 13F 季報持股，以及台股董監事持股與質押。申報都有時間差，請當作方向參考而非即時訊號。"),
-        h("div", { class: "grid g2" },
+        h("div", { class: "grid g2 top" },
           h("div", { class: "panel" }, h("h3", {}, "議員近 90 日交易最多的股票"), table([
             { key: "t", label: "代號", left: true, cell: (r) => h("b", { class: "num" }, r.ticker) },
             { key: "b", label: "買進筆數", val: (r) => r.buys, cell: (r) => numEl(r.buys, r.buys) },
@@ -803,10 +935,10 @@
             { key: "n", label: "淨買", val: (r) => r.net, cell: (r) => numEl(signed(r.net), r.net) },
             { key: "m", label: "議員", left: true, wrap: true, cell: (r) => r.members.slice(0, 4).join("、") + (r.members.length > 4 ? ` 等 ${r.members.length} 人` : "") }],
           C.by_ticker.slice(0, 20), { onRow: (r) => bySymbol.has(r.ticker) && openDrawer(r.ticker) })),
-          h("div", { class: "panel stack" }, h("div", { class: "sec-head" }, h("h3", {}, "最新議員交易申報"), q), tradeTbl,
+          h("div", { class: "panel stack" }, h("div", { class: "sec-head" }, h("h3", {}, "最新議員交易申報"), q), tradeTbl, more,
             C.live === false ? h("p", { class: "chart-note" }, "本週來源無法連線，顯示上次成功取得的資料。") : null)),
         h("h3", {}, "名人基金 13F 持股（美國 SEC 季報）"),
-        h("div", { class: "grid g2" }, (M.gurus || []).map((g) => h("div", { class: "panel" },
+        h("div", { class: "grid g2 top" }, (M.gurus || []).map((g) => h("div", { class: "panel" },
           h("div", { class: "guru-head" }, h("div", {}, h("b", {}, g.person), h("div", { class: "small muted" }, g.name)),
             h("div", { class: "small muted num" }, `${g.period} 季報・${num(g.total_value / 1e8, 0)} 億美元・${g.positions} 檔`)),
           table([
@@ -845,12 +977,49 @@
         { key: "e", label: "EPS", tip: "台股為最新一季，美股為近四季合計", val: (r) => (r.market === "US" ? r.eps_ttm : r.eps), cell: (r) => h("span", { class: "num" }, num(r.market === "US" ? r.eps_ttm : r.eps, 2)) },
         { key: "eg", label: "EPS 年增", val: (r) => r.eps_yoy, cell: (r) => numEl(pctRaw(r.eps_yoy, 0), r.eps_yoy) },
         { key: "r", label: "RSI", val: (r) => r.rsi, cell: (r) => h("span", { class: "num" }, num(r.rsi, 0)) },
+        { key: "im", label: "純超額強度", tip: "扣掉大盤漲跌後，個股自己的動能（約為標準差倍數）", val: (r) => r.imom, cell: (r) => numEl(ok(r.imom) ? signed(r.imom, 1) : "–", r.imom) },
+        { key: "tc", label: "短線分", tip: "只用每天更新的資料", val: (r) => r.tactical, cell: (r) => numEl(ok(r.tactical) ? signed(r.tactical, 2) : "–", r.tactical) },
         { key: "st", label: "結構分", tip: "基本面＋申報持股", val: (r) => r.structural, cell: (r) => numEl(ok(r.structural) ? signed(r.structural, 2) : "–", r.structural) },
         { key: "fs", label: "基本面分", val: (r) => r.factors.fund, cell: (r) => numEl(ok(r.factors.fund) ? signed(r.factors.fund, 2) : "–", r.factors.fund) },
         { key: "o", label: "綜合分", val: (r) => r.overall, cell: (r) => h("span", { class: "row", style: "justify-content:flex-end;flex-wrap:nowrap" }, meter(r.overall), numEl(signed(r.overall, 2), r.overall)) }];
-      const tbl = table(cols, U, { sort: "o", onRow: (r) => openDrawer(r.symbol) });
-      const apply = () => tbl.setRows(U.filter((r) => (state.m === "ALL" || r.market === state.m) &&
-        (!state.q || (r.name + r.code + r.industry).toLowerCase().includes(state.q))));
+      const tbl = table(cols, U, { sort: "o", csv: "fundamentals", onRow: (r) => openDrawer(r.symbol) });
+      const QUAD = { ALL: ["全部", () => true], pp: ["結構佳・短線強", (r) => r.structural >= 0 && r.tactical >= 0], pn: ["結構佳・短線弱", (r) => r.structural >= 0 && r.tactical < 0],
+        np: ["結構弱・短線強", (r) => r.structural < 0 && r.tactical >= 0], nn: ["結構弱・短線弱", (r) => r.structural < 0 && r.tactical < 0] };
+      state.quad = "ALL";
+      const shown = () => U.filter((r) => (state.m === "ALL" || r.market === state.m) &&
+        (!state.q || (r.name + r.code + r.industry).toLowerCase().includes(state.q)) &&
+        (state.quad === "ALL" || (ok(r.tactical) && ok(r.structural) && QUAD[state.quad][1](r))));
+      // Scatter: x = short-term read, y = structural read. Click a dot for the stock, a corner label to filter the table.
+      const NS = "http://www.w3.org/2000/svg", W = 640, H = 340, P = 34;
+      const sx = (v) => P + ((v + 1) / 2) * (W - 2 * P), sy = (v) => H - P - ((v + 1) / 2) * (H - 2 * P);
+      const svg = document.createElementNS(NS, "svg");
+      svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("class", "scatter"); svg.setAttribute("role", "img");
+      svg.setAttribute("aria-label", "短線分與結構分的象限散佈圖");
+      const el = (tag, attrs, text) => { const n = document.createElementNS(NS, tag); Object.entries(attrs).forEach(([k, v]) => n.setAttribute(k, v)); if (text != null) n.textContent = text; return n; };
+      const quadBtns = h("div", { class: "seg", role: "group", "aria-label": "象限" }, Object.entries(QUAD).map(([k, [t]]) =>
+        h("button", { type: "button", "data-q": k, "aria-pressed": String(k === "ALL"), onclick: () => { state.quad = k; apply(); } }, t)));
+      const drawScatter = () => {
+        const rows = shown().filter((r) => ok(r.tactical) && ok(r.structural));
+        svg.replaceChildren(
+          el("rect", { x: P, y: P, width: W - 2 * P, height: H - 2 * P, class: "sc-frame" }),
+          el("line", { x1: sx(0), y1: P, x2: sx(0), y2: H - P, class: "sc-axis" }), el("line", { x1: P, y1: sy(0), x2: W - P, y2: sy(0), class: "sc-axis" }),
+          el("text", { x: W - P - 6, y: P + 14, "text-anchor": "end", class: "sc-q" }, "結構佳・短線強"), el("text", { x: P + 6, y: P + 14, class: "sc-q" }, "結構佳・短線弱（等轉強）"),
+          el("text", { x: W - P - 6, y: H - P - 6, "text-anchor": "end", class: "sc-q" }, "結構弱・短線強（僅宜短打）"), el("text", { x: P + 6, y: H - P - 6, class: "sc-q" }, "結構弱・短線弱"),
+          el("text", { x: W / 2, y: H - 8, "text-anchor": "middle", class: "sc-l" }, "短線分 →"), el("text", { x: 12, y: H / 2, "text-anchor": "middle", class: "sc-l", transform: `rotate(-90 12 ${H / 2})` }, "結構分 →"),
+          ...rows.map((r) => { const c = el("circle", { cx: sx(r.tactical), cy: sy(r.structural), r: S.picks.some((x) => x.symbol === r.symbol) ? 5.5 : 4,
+            class: "sc-dot " + (r.market === "TW" ? "tw" : "us") + (S.picks.some((x) => x.symbol === r.symbol) ? " pick" : ""), "data-sym": r.symbol, tabindex: 0 });
+            c.append(el("title", {}, `${r.name} ${r.code}｜短線 ${signed(r.tactical, 2)}・結構 ${signed(r.structural, 2)}・綜合 ${signed(r.overall, 2)}`));
+            c.addEventListener("click", () => openDrawer(r.symbol));
+            c.addEventListener("keydown", (e) => { if (e.key === "Enter") openDrawer(r.symbol); });
+            return c; }));
+      };
+      const apply = () => { tbl.setRows(shown()); drawScatter();
+        quadBtns.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.q === state.quad))); };
+      // table row <-> dot: hovering a row rings its dot
+      tbl.addEventListener("pointerover", (e) => { const tr = e.target.closest("tr[data-sym]");
+        svg.querySelectorAll(".sc-dot.hl").forEach((n) => n.classList.remove("hl"));
+        if (tr) { const dot = svg.querySelector(`.sc-dot[data-sym="${CSS.escape(tr.dataset.sym)}"]`); if (dot) { dot.classList.add("hl"); svg.append(dot); } } });
+      drawScatter();
       const seg = h("div", { class: "seg", role: "group", "aria-label": "市場" }, [["ALL", "全部"], ["TW", "台股"], ["US", "美股"]].map(([k, t]) =>
         h("button", { type: "button", "aria-pressed": String(k === "ALL"), onclick: (e) => {
           state.m = k; seg.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b === e.currentTarget))); apply();
@@ -860,8 +1029,53 @@
       return [
         head("財報與各項指標", "觀察名單全部個股的評價、成長與技術指標。點欄位標題排序，點列看圖表。台股財報來自證交所公開資訊，美股來自 SEC XBRL 申報。"),
         h("p", { class: "small muted" }, "每個欄位的意義與本站的計分方式：", h("a", { href: "#learn?k=pe" }, "基本面與財報解說"), "。合約負債（客戶預付款）季增常領先營收一到兩季，", h("a", { href: "#learn?k=cl" }, "說明在此"), "。"),
+        h("div", { class: "panel stack" }, h("div", { class: "sec-head" }, h("h3", {}, "因子象限圖：短線 × 結構", help("tactical", "短線分與結構分")), quadBtns),
+          svg, h("p", { class: "chart-note" }, "每個點是一檔股票（藍＝台股、灰＝美股，較大的點是本週精選）。點一下看個股，按象限按鈕會同時篩選下方表格；滑過表格的列，對應的點會被圈出來。")),
         h("div", { class: "panel stack" }, h("div", { class: "row" }, seg, q), tbl),
       ];
+    },
+
+    async watch() {
+      const issues = (r) => [r.overall <= -0.15 ? "綜合評分偏空" : null, ok(r.tactical) && r.tactical <= -0.3 ? "短線明顯轉弱" : null,
+        ok(r.rsi) && r.rsi >= 75 ? "RSI 過熱" : null, ok(r.maint_est) && r.maint_est < 1.4 ? "融資維持率偏低" : null,
+        ...(r.tags || []).filter(([, tone]) => tone < 0).map(([t]) => t)].filter(Boolean);
+      const holder = h("div");
+      const draw = () => {
+        const rows = [...WATCH].map((s) => bySymbol.get(s) || { symbol: s, gone: true });
+        const live = rows.filter((r) => !r.gone && r.kind !== "fund"), gone = rows.filter((r) => r.gone), funds = rows.filter((r) => r.kind === "fund");
+        const rm = (r) => h("button", { class: "linkish", type: "button", onclick: (e) => { e.stopPropagation(); toggleWatch(r.symbol); draw(); } }, "移除");
+        holder.replaceChildren(...[
+          !rows.length ? h("div", { class: "panel empty stack", style: "align-items:center" }, h("div", {}, "還沒有自選股"),
+            h("div", { class: "small" }, "在任何個股的詳細頁或精選卡片上按 ☆，就會加入這裡。名單只存在這台裝置的瀏覽器，不會上傳。"),
+            h("a", { href: "#picks" }, "從精選 20 檔開始挑")) : null,
+          live.length ? h("div", { class: "stats" },
+            statBox("自選檔數", String(live.length), ""), statBox("偏多／偏空", `${live.filter((r) => r.overall >= 0.15).length}／${live.filter((r) => r.overall <= -0.15).length}`, "依綜合評分"),
+            statBox("有警訊的檔數", String(live.filter((r) => issues(r).length).length), "見「需要留意」欄"),
+            MK && MK.risk ? statBox("目前市場風險", `${num(MK.risk.score, 0)}・${MK.risk.name}`, `參考持股 ${MK.risk.exposure}`) : null) : null,
+          live.length ? h("div", { class: "panel stack" }, h("h3", {}, "自選股健檢"), table([
+            { key: "n", label: "標的", left: true, cell: (r) => h("span", {}, nameCell(r), " ", mkChip(r.market)) },
+            { key: "c", label: "收盤", val: (r) => r.close, cell: (r) => h("span", { class: "num" }, px(r.close)) },
+            { key: "w", label: "週漲跌", val: (r) => r.chg5d, cell: (r) => numEl(pct(r.chg5d), r.chg5d) },
+            { key: "o", label: "綜合分", val: (r) => r.overall, cell: (r) => h("span", { class: "row", style: "justify-content:flex-end;flex-wrap:nowrap" }, meter(r.overall), numEl(signed(r.overall, 2), r.overall)) },
+            { key: "t", label: "短線分", val: (r) => r.tactical, cell: (r) => numEl(ok(r.tactical) ? signed(r.tactical, 2) : "–", r.tactical) },
+            { key: "s", label: "結構分", val: (r) => r.structural, cell: (r) => numEl(ok(r.structural) ? signed(r.structural, 2) : "–", r.structural) },
+            { key: "1", label: "一週", left: true, cell: (r) => pill(r.horizons["1w"]) },
+            { key: "2", label: "一月", left: true, cell: (r) => pill(r.horizons["1m"]) },
+            { key: "sp", label: "停損價（距離）", val: (r) => r.plan && r.plan.stop_pct, cell: (r) => h("span", { class: "num" }, r.plan ? `${px(r.plan.stop)}（−${num((r.plan.stop_pct || 0) * 100, 1)}%）` : "–") },
+            { key: "ps", label: "部位上限", val: (r) => r.plan && r.plan.size, cell: (r) => h("span", { class: "num" }, r.plan && ok(r.plan.size) ? num(r.plan.size * 100, 0) + "%" : "–") },
+            { key: "i", label: "需要留意", left: true, wrap: true, cell: (r) => { const x = issues(r); return x.length ? x.map((t) => h("span", { class: "chip cut", style: "margin:0 4px 2px 0" }, t)) : h("span", { class: "muted" }, "沒有警訊"); } },
+            { key: "x", label: "", cell: rm }], live, { sort: "o", csv: "watchlist", onRow: (r) => openDrawer(r.symbol) }),
+            h("p", { class: "chart-note" }, "「需要留意」彙整各分頁的負面訊號：評分偏空、短線轉弱、過熱、融資壓力，以及外資賣超、借券大增等標籤。沒有警訊不代表安全，只代表規則沒有觸發。")) : null,
+          funds.length ? h("div", { class: "panel stack" }, h("h3", {}, "自選基金"), table([
+            { key: "n", label: "基金", left: true, wrap: true, cell: (r) => r.name }, { key: "e", label: "績效評等", left: true, cell: (r) => gradePill(r) },
+            { key: "s", label: "評分", val: (r) => r.score, cell: (r) => scoreCell(r) }, { key: "1y", label: "1 年", val: (r) => r.ret["1y"], cell: (r) => numEl(pct(r.ret["1y"]), r.ret["1y"]) },
+            { key: "t", label: "淨值趨勢", left: true, cell: (r) => (r.horizons ? pill(r.horizons["1m"]) : "–") }, { key: "x", label: "", cell: rm }], funds, { onRow: (r) => openDrawer(r.symbol) })) : null,
+          gone.length ? h("div", { class: "panel stack" }, h("h3", {}, "已不在本週觀察名單"),
+            h("p", { class: "small" }, "這些標的本週沒有資料（台股觀察名單取成交金額前 90 檔，會隨成交量進出）。"),
+            h("div", { class: "row" }, gone.map((r) => h("span", { class: "chip" }, r.symbol, " ", rm(r))))) : null].filter(Boolean));
+      };
+      draw();
+      return [head("自選股", "把想追蹤的標的集中在一頁，每週更新後一次看完它們的評分、停損距離與各分頁的警訊。"), holder];
     },
 
     async funds() {
@@ -1027,7 +1241,8 @@
             { key: "r", label: "實際漲跌", cell: (r) => numEl(pct(r.ret), r.ret) },
             { key: "o", label: "方向", cell: (r) => (r.dir_ok == null ? "中性" : r.dir_ok ? "✓" : "✗") },
             { key: "i", label: "落在區間內", cell: (r) => (r.in_range ? "✓" : "✗") }], [...A.index_log].reverse()) : null,
-          h("h4", {}, "二、技術面分數的歷史回測（約三年）"),
+          calibNote() ? h("h4", {}, "二、上漲機率的校準（樣本外）") : null, calibNote(),
+          h("h4", {}, calibNote() ? "三、技術面分數的歷史回測（約三年）" : "二、技術面分數的歷史回測（約三年）"),
           h("div", { class: "grid g3" }, Object.keys(HD).map(calib)),
           h("p", { class: "small" }, "讀法：「模型機率」是當時分數換算出的上漲機率，「實際上漲」是之後真的上漲的比例。兩欄越接近、且由強勢偏空往強勢偏多逐步升高，模型越可信。"),
           h("p", { class: "chart-note" }, "回測只能重建技術面分數（籌碼與基本面沒有歷史快照），樣本是現在的熱門股（倖存者偏差），且期間以多頭為主。若高分組的實際上漲比率沒有明顯高於低分組，就表示分數的區分力有限：請把它當成篩選與排序工具，搭配上方的市場風險與部位控制使用。精選個股的實際表現見「精選 20 檔」頁。")),
@@ -1140,6 +1355,8 @@
         const f = S.tw_flow || {};
         if (kind === "card") { const c = LEAD.cards.find((x) => x.key === key); return c ? `${c.value_text}（${c.change_text}）` : null; }
         if (kind === "fut") return f.futures ? `${signed(f.futures.net_oi, 0)} 口` : null;
+        if (kind === "calib") return S.calibration && Object.keys(S.calibration).length
+          ? "斜率 " + Object.entries(S.calibration).map(([k, v]) => `${HZ[k]} ${num(v.k, 2)}`).join("・") : null;
         if (key === "foreign_5d") return ok(f.foreign_5d) ? `近 5 日 ${signed(f.foreign_5d, 0)} 億元` : null;
         if (key === "margin_bal") return ok(f.margin_bal) ? `${num(f.margin_bal, 0)} 億元（一週 ${pct(f.margin_chg5)}）` : null;
         if (key === "maint") return ok(f.maint) ? `${num(f.maint * 100, 1)}%（${f.maint_status}）` : null;
@@ -1178,7 +1395,7 @@
       const tools = await load("tools").catch(() => []);
       const bt = S.backtest || {};
       const W = S.weights || {};
-      const G = { tech: "技術面（趨勢＋動能）", chips: "籌碼面", fund: "基本面", buzz: "Podcast 聲量" };
+      const G = { tech: "技術面（趨勢＋動能）", chips: "籌碼面", fund: "基本面", buzz: "Podcast 聲量（只顯示，不計分）" };
       return [
         head("方法與資料來源", "所有分數都由公開資料以固定規則計算，沒有人工挑選。以下說明計算方式、回測結果與每個來源本週的取得狀態。"),
         h("div", { class: "grid g2" },
@@ -1190,7 +1407,7 @@
               Object.keys(HZ).map((k) => `${HZ[k]} 技術 ${nf(0).format(S.weights_us[k].tech * 100)}%／籌碼 ${nf(0).format(S.weights_us[k].chips * 100)}%／基本面 ${nf(0).format(S.weights_us[k].fund * 100)}%`).join("；") + "。") : null,
             h("p", { class: "small" }, h("a", { href: "#learn" }, "每個指標與預測的原理，見「指標與模型解說」")),
             h("p", { class: "small" }, "每個因子先壓縮到 −1 至 +1：趨勢看均線排列與季線斜率；動能看波動度調整後的報酬、MACD、RSI；台股籌碼看外資／投信買賣超占成交量比重、連續天數與融資變化；美股籌碼看議員交易與 13F 增減；基本面看營收與 EPS 成長、近 3 月對 12 月的營收動能、本益比、殖利率。缺少的因子會自動剔除並重新分配權重。"),
-            h("p", { class: "small" }, "預測區間＝現價 ×（1 ＋ 分數 × 0.6σ ± σ），σ 為近 60 日波動度乘以天數平方根。綜合分數＝一週 30%＋一月 40%＋一季 30%。")),
+            h("p", { class: "small" }, "預測區間＝現價 ×（1 ＋ 偏移 ± σ），σ 為近 60 日波動度乘以天數平方根，偏移隨機率斜率縮放。綜合分數＝一週 30%＋一月 40%＋一季 30%。Podcast 聲量的權重為 0，只顯示不計分。")),
           h("div", { class: "panel stack" }, h("h3", {}, "技術面分數回測"),
             Object.values(bt).some(Boolean) ? table([
               { key: "h", label: "期間", left: true, cell: (k) => HZ[k] },
@@ -1201,7 +1418,10 @@
               { key: "w", label: "高分組勝過平均", cell: (k) => h("span", { class: "num" }, bt[k] ? nf(0).format(bt[k].top_beats_avg * 100) + "%" : "–") }],
             Object.keys(HZ)) : h("div", { class: "empty" }, "樣本不足，尚無回測結果"),
             h("p", { class: "small" }, "做法：過去約三年每 5 個交易日，用當時能取得的價格資料計算技術面分數，比較分數最高與最低各 20% 個股在之後一週／一月／一季的平均報酬。"),
+            S.backtest_imom && Object.values(S.backtest_imom).some(Boolean) ? h("p", { class: "small" }, "對照：純超額強度（扣掉大盤後的個股動能）的 IC 為 " +
+              Object.keys(HZ).map((k) => `${HZ[k]} ${S.backtest_imom[k] ? signed(S.backtest_imom[k].ic, 3) : "–"}`).join("、") + "。目前只列為參考欄位，未計入分數。", help("imom", "純超額強度")) : null,
             h("p", { class: "small muted" }, "限制：樣本是「現在」的熱門股，存在倖存者偏差；籌碼與基本面因子沒有足夠歷史資料，未納入回測；過去績效不代表未來。"))),
+        calibNote() ? h("div", { class: "panel stack" }, h("h3", {}, "上漲機率的校準"), calibNote()) : null,
         h("div", { class: "panel" }, h("h3", {}, "本週資料來源狀態"), h("div", { class: "src" }, S.sources.map((s) => [
           h("span", { class: "dot " + (s.ok ? "ok" : "bad") }, s.ok ? "✓ 成功" : "✕ 未取得"),
           h("span", {}, s.url ? h("a", { href: s.url, target: "_blank", rel: "noopener noreferrer" }, s.name) : s.name, s.note ? h("span", { class: "muted" }, "　" + s.note) : null)]))),
@@ -1234,21 +1454,35 @@
   // Anchored scrolling (knowledge entries) has to clear the sticky masthead, whose height depends on wrapping.
   const measureMast = () => document.documentElement.style.setProperty("--mast-h", document.querySelector(".mast").offsetHeight + "px");
   window.addEventListener("resize", measureMast);
+  // Unmount: destroy every chart of the view being left, so nothing of it can draw into the next one.
+  function unmount() {
+    hideDrawer();
+    [...liveCharts].forEach((dispose) => dispose());
+    liveCharts.clear();
+    charts.clear();
+  }
+  let routeSeq = 0;
   async function route() {
+    const seq = ++routeSeq;
     const { name, p } = parseHash();
     drawNav(name);
     if (name !== current) {
-      hideDrawer();
-      charts.clear();
+      unmount();
+      current = null;
+      let nodes;
       try {
-        const nodes = await views[name]();
-        app.replaceChildren(...nodes.filter(Boolean));
+        nodes = (await views[name]()).filter(Boolean);
       } catch (e) {
-        app.replaceChildren(h("div", { class: "empty" }, "這個分頁的資料載入失敗：" + e.message));
+        nodes = [h("div", { class: "empty" }, "這個分頁的資料載入失敗：" + e.message)];
       }
+      // A newer navigation started while this view was loading: drop this result, or two views
+      // would end up on the page at once.
+      if (seq !== routeSeq) { nodes.forEach((n) => n.querySelectorAll && n.querySelectorAll(".stack").forEach((x) => x.destroy && x.destroy())); return; }
+      app.replaceChildren(...nodes);
       current = name;
       window.scrollTo(0, 0);
     }
+    if (seq !== routeSeq) return;
     const sym = p.get("s");
     if (!sym) hideDrawer(); else if (sym !== drawerSym) showDrawer(sym);
     const target = p.get("k") && document.getElementById("kb-" + p.get("k"));
@@ -1275,8 +1509,9 @@
       loadFailed(e);
       return;
     }
-    [E, FUNDS, AI, LEAD] = await Promise.all([load("etf").catch(() => []), load("funds").catch(() => []),
-      load("ai").catch(() => null), load("leading").catch(() => ({ cards: [], series: {} }))]);
+    [E, FUNDS, AI, LEAD, MK] = await Promise.all([load("etf").catch(() => []), load("funds").catch(() => []),
+      load("ai").catch(() => null), load("leading").catch(() => ({ cards: [], series: {} })), load("market").catch(() => null)]);
+    paintWatch();
     FUNDS.forEach((r) => bySymbol.set(r.symbol, r));
     U.forEach((r) => bySymbol.set(r.symbol, r));
     E.forEach((r) => bySymbol.set(r.symbol, r));
@@ -1284,7 +1519,12 @@
     document.getElementById("stamp").replaceChildren(
       h("span", {}, "資料日 ", h("b", { class: "num" }, S.data_date)),
       h("span", {}, "更新於 ", h("b", { class: "num" }, S.generated_at.slice(0, 16).replace("T", " "))),
-      h("span", {}, "下次更新 ", h("b", { class: "num" }, S.next_update + "（三）")));
+      h("span", {}, "下次更新 ", h("b", { class: "num" }, S.next_update + "（三）")),
+      (() => {
+        const bad = S.sources.filter((x) => !x.ok);
+        return h("a", { class: "health" + (bad.length ? " warn" : ""), href: "#method", title: bad.length ? "未取得：" + bad.map((x) => x.name).join("、") : "本次更新所有資料來源都成功取得" },
+          bad.length ? `資料來源 ${S.sources.length - bad.length}/${S.sources.length}，${bad.length} 項沿用舊資料` : `資料來源 ${S.sources.length} 項正常`);
+      })());
     if (!booted) window.addEventListener("hashchange", route);
     booted = true;
     current = null;

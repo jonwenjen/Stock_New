@@ -16,19 +16,25 @@ from . import indicators as ind
 HORIZONS = {"1w": 5, "1m": 21, "1q": 63}  # trading days
 
 # Weight of each factor group per horizon (re-normalised when a group is missing).
+# Podcast attention ("buzz") carries no weight: being talked about says nothing reliable about
+# direction, and heavy attention is at least as often a sign of a crowded trade. It is shown, not scored.
 WEIGHTS = {
-    "1w": {"tech": 0.55, "chips": 0.35, "fund": 0.05, "buzz": 0.05},
-    "1m": {"tech": 0.45, "chips": 0.25, "fund": 0.25, "buzz": 0.05},
+    "1w": {"tech": 0.60, "chips": 0.35, "fund": 0.05, "buzz": 0.00},
+    "1m": {"tech": 0.50, "chips": 0.25, "fund": 0.25, "buzz": 0.00},
     "1q": {"tech": 0.40, "chips": 0.15, "fund": 0.45, "buzz": 0.00},
 }
 # US "chips" are congressional filings (up to 45 days late) and quarterly 13F holdings:
 # real information, but too slow to drive a one-week call, so they weigh less up front.
 WEIGHTS_SLOW_CHIPS = {
-    "1w": {"tech": 0.80, "chips": 0.10, "fund": 0.05, "buzz": 0.05},
-    "1m": {"tech": 0.50, "chips": 0.15, "fund": 0.30, "buzz": 0.05},
+    "1w": {"tech": 0.85, "chips": 0.10, "fund": 0.05, "buzz": 0.00},
+    "1m": {"tech": 0.55, "chips": 0.15, "fund": 0.30, "buzz": 0.00},
     "1q": {"tech": 0.40, "chips": 0.15, "fund": 0.45, "buzz": 0.00},
 }
 OVERALL = {"1w": 0.3, "1m": 0.4, "1q": 0.3}
+# Up-probability per unit of score, by horizon length in sessions. 0.22 is the ceiling the site
+# started with; each build replaces it with what the back-test supports (market.fit_slopes).
+MAX_SLOPE = 0.22
+P_SLOPE: dict[int, float] = {}
 
 
 def clamp(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
@@ -287,7 +293,7 @@ def fund_us(m: dict) -> tuple[float | None, list[tuple[str, float]]]:
 
 
 def buzz_score(mentions: int) -> float | None:
-    """Podcast mentions are attention, not direction: a small positive tilt only."""
+    """Podcast mentions as an attention gauge (0..0.3). Shown as a factor, weighted zero in every score."""
     if not mentions:
         return 0.0
     return clamp(0.3 * math.tanh(mentions / 3))
@@ -324,11 +330,13 @@ def forecast(last: float, dvol: float, score: float, days: int) -> dict:
     """
     dvol = dvol if dvol and math.isfinite(dvol) else 0.02
     sigma = dvol * math.sqrt(days)
-    exp_ret = score * 0.6 * sigma
+    slope = P_SLOPE.get(days, MAX_SLOPE)
+    # the centre of the range leans with the score only as far as the probability does
+    exp_ret = score * 0.6 * sigma * slope / MAX_SLOPE
     return {
         "score": round(score, 3),
         "label": label(score),
-        "p_up": round(clamp(0.5 + 0.22 * score, 0.28, 0.72), 3),
+        "p_up": round(clamp(0.5 + slope * score, 0.28, 0.72), 3),
         "exp_ret": round(exp_ret, 4),
         "low": round(last * (1 + exp_ret - sigma), 2),
         "high": round(last * (1 + exp_ret + sigma), 2),
@@ -386,7 +394,7 @@ def score_stock(tf: pd.DataFrame, chips: float | None, fund: float | None,
         "fund": None if fund is None else round(fund, 3),
         "buzz": None if buzz is None else round(buzz, 3),
     }
-    tactical = _mix([(0.60, float(row["t_1w"])), (0.35, None if slow_chips else chips), (0.05, buzz)])
+    tactical = _mix([(0.65, float(row["t_1w"])), (0.35, None if slow_chips else chips)])
     structural = _mix([(0.70, fund), (0.30, chips if slow_chips else None)])
     out["tactical"] = None if tactical is None else round(tactical, 3)
     out["structural"] = None if structural is None else round(structural, 3)
@@ -430,6 +438,46 @@ def trade_plan(row: pd.Series, f1m: dict, overall: float) -> dict:
             "zone_high": round(min(c, support + atr), 2),
             "stop_pct": None if stop_pct is None else round(stop_pct, 4),
             "size": None if size is None else round(size, 3)}
+
+
+# --------------------------------------------------------------------------- #
+# Residual momentum: strength that is the stock's own, not the market's
+# --------------------------------------------------------------------------- #
+def residual_momentum(close: pd.Series, bench: pd.Series, beta_n: int = 120, mom_n: int = 60) -> pd.Series:
+    """Momentum of the part of a stock's return its market does not explain.
+
+    Each day's return is split into beta x market return and a residual (beta from the
+    last beta_n sessions). The series returned is the residual summed over mom_n sessions
+    divided by its own volatility over that window - roughly a z-score, so a stock that
+    only rose because everything rose scores near zero.
+    """
+    df = pd.concat([close.rename("c"), bench.rename("b")], axis=1).sort_index()
+    df["b"] = df["b"].ffill()
+    r = df.dropna().pct_change().dropna()
+    if len(r) < beta_n + mom_n:
+        return pd.Series(dtype=float)
+    beta = (r["c"].rolling(beta_n).cov(r["b"]) / r["b"].rolling(beta_n).var()).shift(1)
+    resid = r["c"] - beta * r["b"]
+    z = resid.rolling(mom_n).sum() / (resid.rolling(mom_n).std() * math.sqrt(mom_n))
+    return z.replace([np.inf, -np.inf], np.nan).dropna()
+
+
+def factor_ic(scores: dict[str, pd.Series], closes: dict[str, pd.Series], lookback_days: int = 750,
+              step: int = 5) -> dict:
+    """Rank correlation between any per-stock score series and forward returns, per horizon."""
+    out = {}
+    s_df, c_df = pd.DataFrame(scores), pd.DataFrame(closes)
+    for h, days in HORIZONS.items():
+        fwd = c_df.shift(-days) / c_df - 1
+        dates = s_df.index[-lookback_days:-days:step] if len(s_df) > days + 50 else []
+        ics = []
+        for d in dates:
+            s, r = s_df.loc[d].dropna(), fwd.loc[d].dropna() if d in fwd.index else pd.Series(dtype=float)
+            idx = s.index.intersection(r.index)
+            if len(idx) >= 20:
+                ics.append(s[idx].rank().corr(r[idx].rank()))
+        out[h] = {"samples": len(ics), "ic": round(float(np.nanmean(ics)), 3)} if len(ics) >= 20 else None
+    return out
 
 
 # --------------------------------------------------------------------------- #

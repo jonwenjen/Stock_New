@@ -92,6 +92,9 @@
   `risk.parts`）與市場週期（`regime.name`、`regime.days`）；「籌碼面」帶出外資台指期（`futures.net_oi`、`futures.chg5`）；
   「操作建議與風險」依 `alerts` 中 level 2 的項目提醒，並可從 `accumulating`、`weakening` 各舉一兩檔。
   `accuracy` 顯示模型區分力有限時（`brier` 不低於 `base_brier`）要照實說，不要把機率寫得比數據更有把握。
+- 上漲機率已依回測校準（digest 的 `calibration`：各期間的斜率 `k`），多半落在 47%–53%。寫展望時以標籤與分數描述
+  相對強弱，機率只需帶一次並說明它接近五五波的原因；不要把 51% 與 49% 的差距寫成有把握的方向判斷。
+  `picks_diff` 是與上一週精選名單的差異（`new` 新進檔數、`dropped` 移出名單），可在操作建議中交代。
 - `podcast.overview`：這兩週節目在談什麼主題（依 `podcast_hot[].episodes` 的標題與摘要），
   以及被談論的標的整體是強是弱。
 - `podcast.stocks`：`podcast_hot` 前 8 檔各寫一則（鍵用 `symbol` 欄位，至少要涵蓋前 5 檔）。

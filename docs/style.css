@@ -321,3 +321,46 @@ section[id^="kbg-"] { scroll-margin-top: calc(var(--mast-h, 140px) + 12px); }
 .alert { display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: start; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface-2); }
 .alert.lv2 { border-color: var(--warn); }
 .spark-wide svg { width: 100%; height: 40px; display: block; }
+
+/* ---------- table tools, chart skeleton, source health ---------- */
+.grid.top { align-items: start; }
+.tbl { min-width: 0; }
+.tbl-tools { display: flex; justify-content: flex-end; padding-top: 6px; }
+.linkish { border: 0; background: none; padding: 0; color: var(--accent); font-size: 12.5px; cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
+.linkish:hover { color: var(--ink); }
+.chart.loading { border-radius: 8px; background: linear-gradient(100deg, var(--surface-2) 40%, var(--line-soft) 50%, var(--surface-2) 60%); background-size: 200% 100%; }
+@media (prefers-reduced-motion: no-preference) {
+  .chart.loading { animation: shimmer 1.2s linear infinite; }
+  @keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+}
+.health { color: var(--ink-2); text-decoration: none; border-bottom: 1px dotted var(--ink-3); }
+.health.warn { color: var(--warn); border-bottom-color: var(--warn); }
+
+/* ---------- watchlist star, cross-page tags ---------- */
+.star { cursor: pointer; color: var(--warn); font-size: 17px; line-height: 1; padding: 0 2px; user-select: none; }
+.star[aria-pressed="false"] { color: var(--ink-3); }
+.star:hover { color: var(--warn); }
+#watch-chip { text-decoration: none; }
+.tags { display: flex; gap: 4px 6px; flex-wrap: wrap; }
+.rk .chip { margin-left: 6px; font-family: var(--font); }
+.key.dash { background: none; border-top: 2px dashed var(--ink-3); height: 0; }
+
+/* ---------- decision funnel ---------- */
+.funnel { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 250px), 1fr)); gap: 12px; }
+.fn { border: 1px solid var(--line); border-radius: var(--r); padding: 12px; background: var(--surface-2); display: grid; gap: 8px; align-content: start; min-width: 0; }
+.fn-h { display: flex; gap: 8px; align-items: center; }
+.fn-n { display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; background: var(--accent); color: var(--surface); font-size: 12.5px; font-weight: 700; font-family: var(--mono); flex: none; }
+.riskbar { position: relative; height: 8px; border-radius: 4px; background: linear-gradient(90deg, var(--line) 0 30%, var(--ink-3) 30% 50%, var(--warn) 50% 70%, #b23a2e 70% 100%); opacity: .9; }
+.riskbar i { position: absolute; top: -4px; width: 3px; height: 16px; margin-left: -1.5px; border-radius: 2px; background: var(--ink); box-shadow: 0 0 0 2px var(--surface-2); }
+
+/* ---------- quadrant scatter ---------- */
+.scatter { width: 100%; height: auto; max-height: 420px; display: block; }
+.sc-frame { fill: var(--surface-2); stroke: var(--line); }
+.sc-axis { stroke: var(--ink-3); stroke-dasharray: 3 3; }
+.sc-q { font-size: 11.5px; fill: var(--ink-3); }
+.sc-l { font-size: 11.5px; fill: var(--ink-2); }
+.sc-dot { cursor: pointer; fill-opacity: .55; stroke: var(--surface); stroke-width: 1; }
+.sc-dot.tw { fill: var(--accent); }
+.sc-dot.us { fill: var(--ink-2); }
+.sc-dot.pick { fill-opacity: .95; }
+.sc-dot:hover, .sc-dot.hl, .sc-dot:focus-visible { fill-opacity: 1; stroke: var(--ink); stroke-width: 2; outline: none; }

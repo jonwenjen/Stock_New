@@ -206,9 +206,12 @@ def linkage(tw: pd.Series, drivers: list[tuple[str, str, pd.Series, bool]], n: i
 
 # ----------------------------- composite risk score ----------------------------- #
 # key, name, weight. The total is a weighted mean over whichever components have data.
+# The OFR stress index is built from credit spreads and volatility (among others), both of which
+# already have a component here, so it is shown for context but no longer counted a third time;
+# its weight went to dollar liquidity, which none of the other components measures.
 RISK_PARTS = [("trend", "趨勢與週期", 20), ("breadth", "市場廣度", 15), ("foreign", "外資現貨", 10),
               ("futures", "外資期貨", 10), ("margin", "融資槓桿", 10), ("vol", "波動率", 10),
-              ("credit", "信用利差", 10), ("intl", "國際連動", 15), ("stress", "全球金融壓力", 10)]
+              ("credit", "信用利差", 10), ("intl", "國際連動", 15), ("liquidity", "美元流動性", 10)]
 RISK_LEVELS = [(30, "低", "s1", "七成以上"), (50, "中等", "s0", "五至七成"),
                (70, "偏高", "s-1", "三至五成"), (101, "高", "s-2", "三成以下")]
 
@@ -235,6 +238,11 @@ def credit_risk(oas, chg10=None):
     return base if chg10 is None else np.minimum(100.0, base + lin(chg10, 0.0, 1.0) * 0.3)
 
 
+def liquidity_risk(chg13w):
+    """Fed net liquidity over 13 weeks: +3% or more is safe, -5% or worse is danger."""
+    return lin(chg13w, 0.03, -0.05)
+
+
 def risk_parts(x: dict) -> list[dict]:
     """Score each component 0 (safe) .. 100 (danger) from today's readings; skip the ones without data."""
     g = x.get
@@ -248,7 +256,7 @@ def risk_parts(x: dict) -> list[dict]:
         "vol": None if g("vix") is None else float(vol_risk(g("vix"), g("vix_term"))),
         "credit": None if g("oas") is None else float(credit_risk(g("oas"), g("oas_chg10"))),
         "intl": None if None in (g("soxx_r20"), g("ndq_r20"), g("fx_r20")) else float(intl_risk(g("soxx_r20"), g("ndq_r20"), g("fx_r20"))),
-        "stress": None if g("fsi") is None else float(lin(g("fsi"), -2.5, 2.0)),
+        "liquidity": None if g("liq_chg13") is None else float(liquidity_risk(g("liq_chg13"))),
     }
     return [{"key": k, "name": name, "weight": w, "risk": round(vals[k], 1)}
             for k, name, w in RISK_PARTS if vals[k] is not None]
@@ -281,11 +289,74 @@ def bucket_stats(score: pd.Series, close: pd.Series) -> list[dict]:
 
 
 # ----------------------------- forecast accuracy ----------------------------- #
-def p_up(score: float) -> float:
-    return float(np.clip(0.5 + 0.22 * score, 0.28, 0.72))
+def p_up(score: float, slope: float = 0.22) -> float:
+    return float(np.clip(0.5 + slope * score, 0.28, 0.72))
 
 
-def calibration(frames: dict[str, pd.DataFrame], horizons: dict[str, int], lookback: int = 750, step: int = 5) -> dict:
+def _pairs(frames: dict[str, pd.DataFrame], h: str, days: int, lookback: int, step: int) -> pd.DataFrame:
+    """(date, score, forward return) for every stock on every step-th day of the look-back window."""
+    scores = pd.DataFrame({s: f[f"t_{h}"] for s, f in frames.items()})
+    closes = pd.DataFrame({s: f["close"] for s, f in frames.items()})
+    fwd = closes.shift(-days) / closes - 1
+    dates = scores.index[-lookback:-days:step] if len(scores) > days + 50 else []
+    df = pd.concat([scores.loc[dates].stack().rename("s"), fwd.loc[dates].stack().rename("r")], axis=1).dropna()
+    df["up"] = (df["r"] > 0).astype(float)
+    return df
+
+
+def _slope(df: pd.DataFrame) -> float:
+    """Least-squares slope of (rose or not) on the score, comparing stocks within the same day.
+
+    Both sides are demeaned per date first. Otherwise a rising market, in which most
+    stocks go up and most scores are positive, would look like skill: the slope must
+    come from higher-scored stocks doing better than lower-scored ones on the same day.
+    """
+    g = df.groupby(level=0)
+    s, u = df["s"] - g["s"].transform("mean"), df["up"] - g["up"].transform("mean")
+    den = float((s ** 2).sum())
+    return float((s * u).sum() / den) if den else 0.0
+
+
+def fit_slopes(frames: dict[str, pd.DataFrame], horizons: dict[str, int], floor: float = 0.03, cap: float = 0.22,
+               lookback: int = 750, step: int = 5) -> dict:
+    """How much up-probability a unit of score has actually been worth, per horizon.
+
+    The site's probability is 50% + slope x score. `fit` is the slope the last ~3 years
+    support; `k` is that value kept within [floor, cap], which is what gets published.
+    Walk-forward check: the window is cut into five consecutive blocks and each of the
+    last four is predicted with a slope fitted on the blocks before it only, giving the
+    out-of-sample Brier score of the calibrated probability (`brier`) next to that of the
+    original fixed slope (`brier_fixed`) and of always saying 50% (`brier_coin`).
+    """
+    out = {}
+    for h, days in horizons.items():
+        df = _pairs(frames, h, days, lookback, step)
+        if len(df) < 500:
+            out[h] = None
+            continue
+        dates = sorted(df.index.get_level_values(0).unique())
+        cuts = [dates[int(len(dates) * i / 5)] for i in range(1, 5)]
+        d0 = df.index.get_level_values(0)
+        cal, fixed, coin, n = 0.0, 0.0, 0.0, 0
+        for i, c in enumerate(cuts):
+            end = cuts[i + 1] if i + 1 < len(cuts) else None
+            train, test = df[d0 < c], df[(d0 >= c) & ((d0 < end) if end is not None else True)]
+            if len(train) < 200 or test.empty:
+                continue
+            k = min(cap, max(0.0, _slope(train)))
+            cal += float(((np.clip(0.5 + k * test["s"], 0.28, 0.72) - test["up"]) ** 2).sum())
+            fixed += float(((np.clip(0.5 + cap * test["s"], 0.28, 0.72) - test["up"]) ** 2).sum())
+            coin += float(((0.5 - test["up"]) ** 2).sum())
+            n += len(test)
+        fit = _slope(df)
+        out[h] = {"k": round(min(cap, max(floor, fit)), 4), "fit": round(fit, 4), "n": int(len(df)),
+                  "brier": round(cal / n, 4) if n else None, "brier_fixed": round(fixed / n, 4) if n else None,
+                  "brier_coin": round(coin / n, 4) if n else None}
+    return out
+
+
+def calibration(frames: dict[str, pd.DataFrame], horizons: dict[str, int], lookback: int = 750, step: int = 5,
+                slopes: dict[str, float] | None = None) -> dict:
     """Does a higher technical score go with a higher chance of rising? Past ~3 years.
 
     For each horizon the (score, forward return) pairs are grouped by the label cuts;
@@ -306,7 +377,7 @@ def calibration(frames: dict[str, pd.DataFrame], horizons: dict[str, int], lookb
             out[h] = None
             continue
         df["up"] = (df["r"] > 0).astype(float)
-        df["p"] = np.clip(0.5 + 0.22 * df["s"], 0.28, 0.72)
+        df["p"] = np.clip(0.5 + (slopes or {}).get(h, 0.22) * df["s"], 0.28, 0.72)
         base = float(df["up"].mean())
         active = df[df["s"].abs() >= 0.15]
         bins = []
@@ -323,7 +394,8 @@ def calibration(frames: dict[str, pd.DataFrame], horizons: dict[str, int], lookb
     return out
 
 
-def evaluate_log(log: dict[str, dict], frames: dict[str, pd.DataFrame], horizons: dict[str, int]) -> dict:
+def evaluate_log(log: dict[str, dict], frames: dict[str, pd.DataFrame], horizons: dict[str, int],
+                 slopes: dict[str, float] | None = None) -> dict:
     """Score the forecasts this site actually published.
 
     log: data date -> {symbol: [close, score_1w, score_1m, score_1q]}. A forecast counts
@@ -351,7 +423,7 @@ def evaluate_log(log: dict[str, dict], frames: dict[str, pd.DataFrame], horizons
             out[h] = {"n": 0, "snapshots": 0}
             continue
         s, r = np.array([x[0] for x in rows]), np.array([x[1] for x in rows])
-        up, p = (r > 0).astype(float), np.clip(0.5 + 0.22 * s, 0.28, 0.72)
+        up, p = (r > 0).astype(float), np.clip(0.5 + (slopes or {}).get(h, 0.22) * s, 0.28, 0.72)
         act, bull, bear = np.abs(s) >= 0.15, s >= 0.15, s <= -0.15
         base = float(up.mean())
         out[h] = {"n": int(len(rows)), "snapshots": int(snaps), "base_up": round(base, 3),
@@ -491,6 +563,8 @@ def alerts(x: dict) -> list[dict]:
         add(1, "那斯達克進入修正", f"近 20 日 {g('ndq_r20'):+.1%}。")
     if g("fx_r20") is not None and g("fx_r20") >= 0.02:
         add(1, "新台幣明顯走貶", f"美元／台幣近 20 日 {g('fx_r20'):+.1%}，外資匯出壓力升高。")
+    if g("liq_chg13") is not None and g("liq_chg13") <= -0.03:
+        add(1, "美元流動性收縮", f"Fed 淨流動性 13 週變化 {g('liq_chg13'):+.1%}，資金環境對風險資產轉為逆風。")
     if g("fsi") is not None and g("fsi") > 0:
         add(2, "全球金融壓力高於長期平均", f"OFR 金融壓力指數 {g('fsi'):+.2f}（0 為長期平均）。")
     elif g("fsi_chg20") is not None and g("fsi_chg20") >= 0.75:

@@ -466,3 +466,59 @@ def advance_decline(now: dict[str, float], before: dict[str, float]) -> tuple[in
             up += c > b
             down += c < b
     return (up, down) if up + down >= 200 else None
+
+
+# ----------------------------- dollar liquidity ----------------------------- #
+def net_liquidity(walcl: pd.Series, tga: pd.Series, rrp: pd.Series) -> pd.Series:
+    """Fed balance sheet minus the Treasury's account minus reverse repos, in trillions of dollars.
+
+    walcl and tga come weekly in millions, rrp daily in billions. What is left is roughly
+    the central-bank money actually sitting in the banking system and markets.
+    """
+    df = pd.concat([walcl.rename("a"), tga.rename("t")], axis=1).dropna()
+    r = rrp.dropna()
+    df["r"] = r.reindex(r.index.union(df.index)).ffill().reindex(df.index).fillna(0.0)
+    return ((df["a"] - df["t"]) / 1e6 - df["r"] / 1e3).rename("net")
+
+
+# ----------------------------- over-the-counter index ----------------------------- #
+def tpex_index() -> dict[str, float]:
+    """TPEx (OTC) index closes for the current month: {'YYYY-MM-DD': close}."""
+    rows = http.get_json("https://www.tpex.org.tw/openapi/v1/tpex_index")
+    return {f"{r['Date'][:4]}-{r['Date'][4:6]}-{r['Date'][6:]}": float(r["Close"]) for r in rows if num(r.get("Close"))}
+
+
+# ----------------------------- what changed in the picks ----------------------------- #
+def pick_changes(now: list[str], earlier: list[dict], today: str) -> dict:
+    """Compare this run's picks (symbols, best first) with earlier cohorts.
+
+    Cohorts are grouped by ISO week (the last one of a week stands for it), and only
+    weeks before today's count, so re-running within a week still compares with last
+    week's list; when there is no earlier week the newest earlier cohort is used.
+    Returns {"ref_date", "by_symbol": {sym: {"new", "prev_rank", "move", "weeks"}},
+    "dropped": [symbols]}. move > 0 means the pick climbed; weeks counts this week plus
+    the unbroken run of earlier weeks in which the symbol was picked.
+    """
+    week = lambda d: tuple(dt.date.fromisoformat(d).isocalendar()[:2])  # noqa: E731
+    older = sorted((c for c in earlier if c["date"] < today), key=lambda c: c["date"])
+    weekly: dict[tuple, dict] = {}
+    for c in older:
+        if week(c["date"]) < week(today):
+            weekly[week(c["date"])] = c
+    weeks_before = [weekly[w] for w in sorted(weekly)]
+    past = weeks_before or older[-1:]
+    if not past:
+        return {"ref_date": None, "by_symbol": {}, "dropped": []}
+    ref = past[-1]
+    prev_rank = {p["symbol"]: i + 1 for i, p in enumerate(ref["picks"])}
+    out = {}
+    for i, sym in enumerate(now):
+        weeks = 1
+        for c in reversed(weeks_before):  # a same-week reference list does not make it a second week
+            if sym not in {p["symbol"] for p in c["picks"]}:
+                break
+            weeks += 1
+        pr = prev_rank.get(sym)
+        out[sym] = {"new": pr is None, "prev_rank": pr, "move": None if pr is None else pr - (i + 1), "weeks": weeks}
+    return {"ref_date": ref["date"], "by_symbol": out,
+            "dropped": [p["symbol"] for p in ref["picks"] if p["symbol"] not in set(now)]}

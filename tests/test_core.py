@@ -1186,3 +1186,38 @@ def test_feeds_calendar_and_atom():
               "picks": [{"symbol": "2465.TW", "name": "麗臺 & <A>"}]}]
     xml = feeds.atom_feed(snaps, dt.datetime(2026, 11, 14, 12, 0, 0))
     assert "<entry>" in xml and "&amp; &lt;A&gt;" in xml and "不構成投資建議" in xml
+
+
+# ---------------- colour contrast (UX review 2026-11-14c, visual-9) ----------------
+def _tokens(css: str, selector: str) -> dict:
+    import re as _re
+    out = {}
+    for block in _re.findall(_re.escape(selector) + r"\s*\{([^}]*)\}", css):
+        out.update(dict(_re.findall(r"--([\w-]+):\s*(#[0-9a-fA-F]{6})", block)))
+    return out
+
+
+def _contrast(a: str, b: str) -> float:
+    def lum(hx):
+        rgb = [int(hx[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+        rgb = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in rgb]
+        return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+    hi, lo = sorted((lum(a), lum(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def test_colour_tokens_meet_wcag_aa_in_light_and_dark():
+    from pathlib import Path
+    css = (Path(__file__).resolve().parent.parent / "docs" / "style.css").read_text(encoding="utf-8")
+    light = _tokens(css, ":root")
+    dark = {**light, **_tokens(css, ':root[data-theme="dark"]')}
+    text = [("ink", "bg"), ("ink-2", "bg"), ("ink-3", "bg"), ("ink-3", "surface-2"), ("ink-3", "surface"),
+            ("rise", "bg"), ("rise", "surface"), ("rise", "surface-2"), ("fall", "bg"), ("fall", "surface"),
+            ("fall", "surface-2"), ("warn", "surface"), ("warn", "warn-soft"), ("accent", "surface"), ("accent", "bg"),
+            ("rk-ink", "rk1"), ("rk-ink", "rk2"), ("rk-on", "rk3")]
+    parts = [("line-strong", "surface"), ("line-strong", "bg"), ("rk-line", "surface")]
+    for name, t in (("light", light), ("dark", dark)):
+        for fg, bg in text:
+            assert _contrast(t[fg], t[bg]) >= 4.5, (name, fg, bg, round(_contrast(t[fg], t[bg]), 2))
+        for fg, bg in parts:
+            assert _contrast(t[fg], t[bg]) >= 3.0, (name, fg, bg, round(_contrast(t[fg], t[bg]), 2))

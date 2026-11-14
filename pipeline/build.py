@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import funds, http, indicators, leading, market, media, prices, scoring, tpex, twse, us_data
+from . import funds, http, indicators, leading, market, media, prices, research, scoring, tpex, twse, us_data
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "docs" / "data"
@@ -1984,6 +1984,7 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
     Each indicator is built on its own, so one failing source costs one card."""
     cards, series, extra = [], {}, {"sbl": None, "options": None, "regime": None, "liq_full": None}
     dv = derivs or {}
+    ev: dict[str, tuple[pd.Series, int]] = {}  # card key -> (daily history of what it shows, +1 if higher reads bullish)
 
     def dseries(key: str) -> pd.Series:
         return pd.Series({pd.Timestamp(d): v[key] for d, v in dv.items() if v.get(key) is not None}).sort_index()
@@ -2002,6 +2003,7 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
         prem = leading.adr_premium(frames["TSM"]["close"], frames["2330.TW"]["close"], frames["USDTWD"]["close"])
         now, ago, pct = float(prem.iloc[-1]), float(prem.iloc[-21]), leading.percentile(prem)
         series["adr"] = dated(prem)
+        ev["adr"] = (prem, 1)
         cards.append(_card("adr", "台積電 ADR 溢價", f"{now:.1%}", f"20 日 {pp(now - ago)}",
                            f"高於過去一年 {pct:.0%} 的日子。溢價擴大代表海外買盤對台積電的出價高於台股，"
                            "常被視為外資回補的前兆；收斂則相反。", 1 if now > ago else -1, prem.tail(60)))
@@ -2009,6 +2011,7 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
     def fx():
         c = frames["USDTWD"]["close"]
         r20, weak = float(c.iloc[-1] / c.iloc[-21] - 1), bool(c.iloc[-1] > c.tail(20).mean())
+        ev["fx"] = (c.pct_change(20), -1)
         cards.append(_card("fx", "美元／台幣", f"{c.iloc[-1]:.2f}", f"20 日 {r20:+.1%}",
                            ("台幣走貶、匯率在月線之上，外資匯出壓力仍在。" if weak else
                             "台幣走升、匯率跌破月線，通常伴隨外資匯入。")
@@ -2016,6 +2019,7 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
 
     def real_yield():
         ry = prices.fred_daily("DFII10")["close"]
+        ev["real"] = (ry.diff(20), -1)
         chg = float(ry.iloc[-1] - ry.iloc[-21])
         cards.append(_card("real", "美國 10 年期實質殖利率", f"{ry.iloc[-1]:.2f}%", f"20 日 {chg:+.2f} 個百分點",
                            "實質利率上升會壓縮成長股評價，下降則有利科技股與新興市場資金流入。",
@@ -2025,6 +2029,7 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
         ts = leading.term_structure(frames["VIX"]["close"], prices.cboe_daily("_VIX3M")["close"])
         now = float(ts.iloc[-1])
         series["vix_term"] = dated(ts)
+        ev["vixts"] = (ts, -1)
         extra["vix_term_full"] = ts
         cards.append(_card("vixts", "VIX 期限結構（VIX ÷ VIX3M）", f"{now:.2f}", f"5 日 {now - float(ts.iloc[-6]):+.2f}",
                            ("高於 1：短期恐慌高過三個月後的預期，屬於恐慌狀態；由高點回落常出現在急跌尾聲。"
@@ -2034,6 +2039,7 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
         fs = {s: tframes[s] for s in stocks if meta[s]["market"] == mk}
         b = leading.breadth(fs)
         a20, a60 = float(b["above20"].iloc[-1]), float(b["above60"].iloc[-1])
+        ev[f"breadth_{mk.lower()}"] = (b["above60"], 1)
         series[f"breadth_{mk.lower()}"] = [[d.strftime("%Y-%m-%d"), round(float(x), 3), round(float(y), 3)]
                                            for d, x, y in b.itertuples()]
         read = ("不到 15% 的個股站上月線，屬於超賣區，常見於急跌尾聲。" if a20 < 0.15 else
@@ -2125,6 +2131,7 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
         now, c4, c13 = float(nl.iloc[-1]), float(nl.iloc[-1] / nl.iloc[-5] - 1), float(nl.iloc[-1] / nl.iloc[-14] - 1)
         extra["liq_full"] = nl
         series["net_liq"] = dated(nl, 260)
+        ev["liq"] = (nl.pct_change(13), 1)
         cards.append(_card("liq", "Fed 淨流動性", f"{now:.2f} 兆美元", f"4 週 {c4:+.1%}・13 週 {c13:+.1%}",
                            ("近一季明顯增加：留在金融體系的資金變多，對股票等風險資產是順風。" if c13 >= 0.01 else
                             "近一季明顯減少：資金被抽走，風險資產的評價較難擴張。" if c13 <= -0.01 else
@@ -2144,6 +2151,7 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
         r5 = float(ratio.iloc[-1] / ratio.iloc[-6] - 1)
         o5 = float(o.iloc[-1] / o.iloc[-6] - 1)
         series["otc_rel"] = dated(ratio)
+        ev["otc"] = (ratio.pct_change(5), 1)
         cards.append(_card("otc", "櫃買相對強弱（櫃買 ÷ 加權）", f"櫃買 {o.iloc[-1]:.1f}", f"5 日 {o5:+.1%}・相對加權 {r5:+.1%}",
                            ("櫃買跑贏加權：中小型股比權值股強，市場願意承擔風險。" if r5 >= 0.01 else
                             "櫃買落後加權：資金躲在權值股，中小型股失血；指數上漲時這種背離代表漲勢不扎實。" if r5 <= -0.01 else
@@ -2152,6 +2160,7 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
 
     def curve():
         yc = prices.fred_daily("T10Y2Y")["close"]
+        ev["curve"] = (yc, 1)
         now, chg = float(yc.iloc[-1]), float(yc.iloc[-1] - yc.iloc[-21])
         cards.append(_card("curve", "美債殖利率曲線（10 年 − 2 年）", f"{now:+.2f} 個百分點", f"20 日 {chg:+.2f}",
                            ("倒掛：短率高於長率，歷史上常領先景氣衰退一年左右。" if now < 0 else
@@ -2167,6 +2176,8 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
         extra["oas_full"] = oas
         series["hy_oas"] = dated(oas)
         series["semis_rel"] = dated(ratio)
+        ev["hy"] = (oas.diff(10), -1)
+        ev["semis"] = (ratio / ratio.rolling(60).mean() - 1, 1)
         cards.append(_card("hy", "美國高收益債利差", f"{rg['oas']:.2f}%", f"10 日 {rg['oas_chg10']:+.2f} 個百分點",
                            ("利差偏高或快速擴大：信用市場開始要求更高的風險補償，股市下跌時不宜輕易當成買點。"
                             if rg["oas"] > 4.0 or rg["oas_chg10"] >= 0.5 else
@@ -2248,6 +2259,8 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
             raise RuntimeError("no advance/decline data yet")
         last, ten = rows[-1], rows[-10:]
         ratio = sum(r["adv"] for r in ten) / max(1, sum(r["dec"] for r in ten))
+        ad_s = pd.Series({pd.Timestamp(r["date"]): r["adv"] / max(1, r["dec"]) for r in rows}).sort_index()
+        ev["ad"] = (ad_s.rolling(10).mean(), 1)
         line, acc = [], 0
         for r in rows[-120:]:
             acc += r["adv"] - r["dec"]
@@ -2283,8 +2296,26 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
         prev = read_json(DATA / "flows.json", {}).get("sbl")
         if prev:
             extra["sbl"] = {**prev, "stale": True}
+    # Evidence grades: does what each card shows have any relation to the TAIEX afterwards?
+    twii_c = frames["TWII"]["close"]
+    if len(dv):
+        ev.setdefault("retail", (dseries("retail_mtx"), -1))
+        ev.setdefault("top10", (dseries("top10"), 1))
+        ev.setdefault("pcr", (dseries("pcr_oi"), 1))
+        ev.setdefault("fo", ((dseries("fo_call") - dseries("fo_put")).dropna(), 1))
+        b_ = dseries("basis")
+        ev.setdefault("basis", ((b_ / twii_c.reindex(b_.index)).dropna(), 1))
     for c in cards:
         c["group"] = CARD_GROUP.get(c["key"], "其他")
+        x_, orient = ev.get(c["key"], (None, 0))
+        try:
+            c["evidence"] = research.evidence(x_, twii_c, orient)
+        except Exception as e:  # noqa: BLE001 - a failed test only means no grade
+            log(f"  evidence {c['key']}: {e}")
+            c["evidence"] = {"grade": "D", "text": research.GRADE_TEXT["D"], "n": 0}
+        # without evidence the card shows where the value sits in its own history, not a direction
+        if not (c["evidence"]["grade"] in ("A", "B") and c["evidence"].get("agree")):
+            c["tone"] = 0
     write_json(DATA / "history" / "tw_flows.json", flows)
     return {"cards": cards, "series": series, **extra}
 

@@ -675,13 +675,19 @@
       h("b", { class: "num " + cls(r[k]) }, ok(r[k]) ? signed(r[k], 2) : "–"))),
     r.setup ? h("span", { class: "chip mk" }, r.setup) : null) : null);
   const TONE = { 1: ["s1", "偏多訊號"], 0: ["s0", "中性"], "-1": ["s-1", "偏空訊號"] };
+  // Evidence grade (tested weekly on this site's data) and where today's value sits in its own year.
+  const EV_TIP = { A: "五年以上資料、兩段期間方向一致", B: "有統計關係，但樣本短或前後不一致", C: "和加權指數之後的漲跌、回檔沒有可測的關係", D: "歷史資料不足一百二十個交易日" };
+  const evidenceRow = (e) => (e ? h("div", { class: "row small", style: "gap:8px" },
+    h("span", { class: "chip " + (e.grade === "A" || e.grade === "B" ? "mk" : "flag"), title: EV_TIP[e.grade] }, `證據 ${e.grade}・${e.text}`),
+    ok(e.pct) ? h("span", { class: "muted num" }, `高於一年 ${num(e.pct * 100, 0)}% 的日子`) : null) : null);
   const leadCards = (keys) => {
     const cards = LEAD.cards.filter((c) => !keys || keys.includes(c.key));
     return cards.length ? h("div", { class: "leads" }, cards.map((c) => h("div", { class: "lead-card" },
       h("div", { class: "row", style: "justify-content:space-between" }, h("span", { class: "nm" }, c.name, help(CARD_KB[c.key] || c.key, c.name)),
-        h("span", { class: "pill " + TONE[c.tone][0] }, TONE[c.tone][1])),
+        c.tone ? h("span", { class: "pill " + TONE[c.tone][0] }, TONE[c.tone][1]) : null),
       h("div", { class: "row" }, h("b", { class: "num lv" }, c.value_text), h("span", { class: "small muted num" }, c.change_text)),
       c.spark && c.spark.length > 2 ? spark(c.spark) : null,
+      evidenceRow(c.evidence),
       h("p", { class: "small" }, c.reading)))) : null;
   };
 
@@ -763,7 +769,7 @@
               h("a", { href: "#learn?k=labels" }, "各種標籤與機率代表什麼？")))),
         aiBlock("AI 觀點", AI && AI.market),
         LEAD.cards.length ? h("div", { class: "panel stack" }, h("h3", {}, "領先指標"), leadGroups(),
-          h("p", { class: "chart-note" }, "這些指標通常比股價先動，用來輔助判讀。標示的偏多／偏空是市場常見的解讀方式，尚未用本站自己的資料驗證，所以不計入任何分數。點指標名稱旁的 ? 看原理。")) : null,
+          h("p", { class: "chart-note" }, "每張卡每週都用本站資料檢驗：它顯示的數值，和加權指數之後 5 日、20 日的報酬及 20 日內的最大回檔有沒有關係（落後一日，避免用到收盤後才知道的資訊）。A 有支持、B 證據弱、C 無證據、D 歷史不足。只有 A、B 級而且方向和解讀一致的卡才標偏多／偏空，其餘只顯示目前數值在自己一年歷史中的位置。這些指標都不計入任何分數。")) : null,
         (LEAD.options || []).length ? h("div", { class: "panel stack" }, h("h3", {}, "台指選擇權未平倉分布", help("optwall", "選擇權未平倉")),
           h("div", { class: "grid g2" }, LEAD.options.map(optionLadder)),
           h("p", { class: "chart-note" }, `${LEAD.options[0].date} 的未平倉量，各列出未平倉最多的履約價。賣方通常在最大未平倉的價位防守，結算前指數常被壓縮在支撐與壓力之間。`)) : null,

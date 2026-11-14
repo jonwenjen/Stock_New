@@ -1101,3 +1101,18 @@ def test_drawdown_odds_counts_falls_within_the_window():
     groups = pd.Series(["a"] * 25 + ["b"] * 35, index=idx)
     d = market.drawdown_odds(groups, close)
     assert d["a"]["dd"] > 0.4 and d["b"]["dd"] < d["a"]["dd"]
+
+
+def test_evidence_grades_cards_against_the_index():
+    from pipeline import research
+    import numpy as np
+    rng = np.random.default_rng(7)
+    idx = pd.bdate_range("2022-01-03", periods=900)
+    close = pd.Series(100 * np.exp(np.cumsum(rng.normal(0, 0.01, len(idx)))), index=idx)
+    fwd = close.shift(-20) / close - 1
+    leak = (fwd + rng.normal(0, 0.01, len(idx))).shift(1)          # known one day early: strong by design
+    good = research.evidence(leak.dropna(), close, 1)
+    noise = research.evidence(pd.Series(rng.normal(size=len(idx)), index=idx), close, 1)
+    short = research.evidence(pd.Series(1.0, index=idx[-50:]), close, 1)
+    assert good["grade"] == "A" and good["agree"] and noise["grade"] in ("C", "B") and short["grade"] == "D"
+    assert research.evidence(leak.dropna(), close, -1)["agree"] is False

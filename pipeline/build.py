@@ -657,11 +657,12 @@ def backfill_tw_actions(today: dt.date) -> None:
 
 def fill_scale(applied: list[str], date: pd.Timestamp) -> float:
     """Factor that puts a raw bar from `date` on the same scale as an adjusted history."""
-    f = 1.0
+    f, seen = 1.0, set()
     for key in applied:
         d, x = key.split(":")
-        if pd.Timestamp(d) > date:
+        if d not in seen and pd.Timestamp(d) > date:
             f *= float(x)
+        seen.add(d)
     return f
 
 

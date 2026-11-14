@@ -1063,3 +1063,18 @@ def test_carry_flags_keeps_only_unexpired_facts():
     out = twse.carry_flags(f, "2026-11-14")
     assert out == {"3189": {"punish": {"from": "2026-11-03", "to": "2026-11-16"}},
                    "0056": {"exdiv": {"date": "2026-11-20", "kind": "息", "cash": 1.0}}}
+
+
+def test_sanitize_applies_one_event_per_date_whatever_the_rounding():
+    from pipeline import prices
+    idx = pd.bdate_range("2026-10-01", periods=30)
+    c = pd.Series(100.0, index=idx); c.iloc[15:] = 97.07
+    df = pd.DataFrame({"open": c, "high": c, "low": c, "close": c, "volume": 1.0})
+    d = idx[15].strftime("%Y-%m-%d")
+    out, applied, _, total = prices.sanitize(df, market="TW", code="0056", calendar=idx, events={d: 0.9707})
+    assert total == pytest.approx(0.9707)
+    again, applied2, _, total2 = prices.sanitize(out, market="TW", code="0056", calendar=idx,
+                                                 events={d: 0.970723}, applied=applied)
+    assert total2 == 1.0 and applied2 == applied and again["close"].iloc[0] == pytest.approx(97.07)
+    from pipeline.build import fill_scale
+    assert fill_scale([f"{d}:0.970723", f"{d}:0.970700"], idx[0]) == pytest.approx(0.970723)

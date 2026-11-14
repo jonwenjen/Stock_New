@@ -320,13 +320,16 @@ def sanitize(df: pd.DataFrame, *, market: str, code: str = "", calendar: pd.Date
         if off.any():
             notes.append(f"刪除美股休市日 K 棒 {int(off.sum())} 根")
             df = df[~off]
+    # One event per stock and date. The same event can arrive with different rounding (the
+    # history file keeps 4 decimals, a fresh download 6), so "already applied" is decided by date.
+    done = {k.split(":")[0] for k in applied}
     for d, f in sorted((events or {}).items()):
-        key = f"{d}:{f:.6f}"
         ts = pd.Timestamp(d)
-        if key in applied or not (0.05 < f < 1.5) or ts <= df.index[0] or ts > df.index[-1]:
+        if d in done or not (0.05 < f < 1.5) or ts <= df.index[0] or ts > df.index[-1]:
             continue
         df = adjust_before(df, ts, f)
-        applied.append(key)
+        applied.append(f"{d}:{f:.6f}")
+        done.add(d)
         total *= f
         notes.append(f"{d} 除權息還原 ×{f:.4f}")
     lim = daily_limit(code) if market == "TW" else None

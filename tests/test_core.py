@@ -1173,3 +1173,16 @@ def test_valuation_band_and_preregistration_list():
     assert research.valuation_band({"2026-01": [10, 1]}, 12, 1) is None          # too short a history
     ids = [t["id"] for t in research.PREREGISTERED]
     assert len(ids) == len(set(ids)) and all(t["rule"] and t["judge"] for t in research.PREREGISTERED)
+
+
+def test_feeds_calendar_and_atom():
+    import datetime as dt
+    from pipeline import feeds
+    ics = feeds.calendar_ics([{"date": "2026-11-18", "kind": "結算", "text": "台指選擇權月選與台指期結算日; 含逗號, 分號"}],
+                             dt.datetime(2026, 11, 14, 12, 0, 0))
+    assert "DTSTART;VALUE=DATE:20261118" in ics and "DTEND;VALUE=DATE:20261119" in ics and "\\," in ics and r"\;" in ics
+    assert all(len(line.encode()) <= 75 for line in ics.split("\r\n"))
+    snaps = [{"week": "2026-W46", "date": "2026-11-13", "risk": {"score": 42, "name": "中等"},
+              "picks": [{"symbol": "2465.TW", "name": "麗臺 & <A>"}]}]
+    xml = feeds.atom_feed(snaps, dt.datetime(2026, 11, 14, 12, 0, 0))
+    assert "<entry>" in xml and "&amp; &lt;A&gt;" in xml and "不構成投資建議" in xml

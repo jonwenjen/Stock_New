@@ -20,7 +20,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import funds, http, indicators, leading, market, media, prices, research, scoring, tpex, twse, us_data
+from . import feeds, funds, http, indicators, leading, market, media, prices, research, scoring, tpex, twse, us_data
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "docs" / "data"
@@ -1825,6 +1825,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         "counts": {"tw": sum(r["market"] == "TW" for r in records),
                    "us": sum(r["market"] == "US" for r in records), "etf": len(etf_records),
                    "fund": len(fund_records)}})
+    safe("訂閱檔（行事曆 iCal、本週變化 Atom）", feeds.write_feeds, None)
     bad = [s["name"] for s in SOURCES if not s["ok"]]
     log(f"done: {len(records)} stocks, {len(etf_records)} ETFs, {len(fund_records)} funds, {len(picks)} picks, "
         f"{len(hot)} podcast-hot, "

@@ -846,11 +846,13 @@
           return h("div", { class: "stack", style: "gap:4px" }, h("b", {}, label),
             h("div", { class: "small" }, `β ${ok(x.beta) ? num(x.beta, 2) : "–"}・年化波動 ${num(x.vol * 100, 0)}%・平均相關 ${ok(x.avg_corr) ? num(x.avg_corr, 2) : "–"}`),
             h("div", { class: "small" }, `一個月虧損超過 ${num(-x.loss95_1m * 100, 1)}%：依過去波動估計，大約每 20 個月會遇到一次。`),
-            ok(x.hi52) ? h("div", { class: "small muted" }, `距 52 週高點中位數 ${pct(x.hi52 - 1)}（全體 ${pct(x.hi52_all - 1)}）・近 60 日漲幅中位數 ${pct(x.r60)}（全體 ${pct(x.r60_all)}）`) : null);
+            ok(x.hi52) ? h("div", { class: "small muted" }, `距 52 週高點中位數 ${pct(x.hi52 - 1)}（全體 ${pct(x.hi52_all - 1)}）・近 60 日漲幅中位數 ${pct(x.r60)}（全體 ${pct(x.r60_all)}）`) : null,
+            (x.stress || []).length ? h("div", { class: "small" }, h("b", {}, "歷史重演"), `（近 5 年 ${mk === "US" ? "SPY" : "0050"} 最差的 20 日）：`,
+              x.stress.map((t) => `${t.to.slice(0, 7)} ${pct(t.bench, 0)}，名單 ${pct(t.picks, 0)}`).join("；")) : null);
         };
         return h("div", { class: "panel stack" }, h("h3", {}, "這 20 檔放在一起的風險"),
           h("div", { class: "grid g3" }, box("TW", `台股 ${P.TW.n} 檔`), box("US", P.US ? `美股 ${P.US.n} 檔（美元計）` : "美股"), box("ALL", "合計（台幣計，台股 60%／美股 40%）")),
-          h("p", { class: "chart-note" }, "依預設權重（停損越近權重越大）與近 60 日波動推估；急跌初期，近期波動會低估之後的風險，所以這不是最壞情況。名單集中在股價接近一年高點、近期大漲的股票，本質上是押動能延續。"));
+          h("p", { class: "chart-note" }, "依預設權重（停損越近權重越大）與近 60 日波動推估；急跌初期，近期波動會低估之後的風險，所以這不是最壞情況。名單集中在股價接近一年高點、近期大漲的股票，本質上是押動能延續。歷史重演是把今天的名單放回過去最差的幾段行情（當時還沒上市的股票用 β 換算），不含最近 60 個交易日，因為名單正是依那段表現選出來的；它是重演，不是預測。"));
       };
       const filter = { m: "ALL" };
       const grid = h("div", { class: "picks" });
@@ -873,19 +875,25 @@
           filter.m = k; seg.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b === e.currentTarget))); draw();
         } }, t)));
       draw();
-      const trackRows = (S.picks_track || []).flatMap((c) => ["TW", "US"].filter((m) => c[m]).map((m) => ({ date: c.date, m, ...c[m] }))).reverse();
-      const track = h("div", { class: "panel stack" }, h("h3", {}, "過去精選的實際表現"),
+      const FW = S.follow || { rows: [], summary: {} };
+      const trackRows = [...FW.rows].reverse();
+      const track = h("div", { class: "panel stack" }, h("h3", {}, "照著精選操作的實際結果", help("track", "實際追蹤")),
+        h("div", { class: "row", style: "gap:16px;flex-wrap:wrap" }, ["TW", "US"].map((m) => {
+          const x = FW.summary[m];
+          return x ? h("div", { class: "small" }, mkChip(m), " ", h("b", {}, x.verdict),
+            x.weeks ? `・已計 ${x.weeks} 週，平均每週超額 ${pct(x.mean_excess, 2)}，累積 ${pct(x.growth, 1)}（同期 ${m === "TW" ? "0050" : "SPY"} ${pct(x.bench_growth, 1)}）` : "") : null;
+        })),
         trackRows.length ? table([
-          { key: "d", label: "選出日", left: true, cell: (r) => h("span", { class: "num" }, r.date) },
-          { key: "m", label: "市場", left: true, cell: (r) => mkChip(r.m) },
+          { key: "d", label: "名單日", left: true, cell: (r) => h("span", { class: "num" }, r.date) },
+          { key: "m", label: "市場", left: true, cell: (r) => mkChip(r.market) },
+          { key: "e", label: "賣出日", cell: (r) => h("span", { class: "num" }, r.open ? `${r.exit}（持有中）` : r.exit) },
           { key: "n", label: "檔數", cell: (r) => h("span", { class: "num" }, r.n) },
-          { key: "t", label: "經過交易日", cell: (r) => h("span", { class: "num" }, r.days) },
-          { key: "r", label: "精選平均報酬", cell: (r) => numEl(pct(r.ret, 2), r.ret) },
-          { key: "b", label: "同期指數", tip: "台股對加權指數，美股對 S&P 500", cell: (r) => numEl(pct(r.bench, 2), r.bench) },
-          { key: "x", label: "超額報酬", cell: (r) => numEl(pct(r.excess, 2), r.excess) },
-          { key: "w", label: "勝過指數的檔數比例", cell: (r) => h("span", { class: "num" }, num(r.win * 100, 0) + "%") }], trackRows)
-          : h("div", { class: "empty" }, "從下一次更新開始累積：每週會記下當時的精選名單，之後持續對照它們與大盤的實際漲跌"),
-        h("p", { class: "chart-note" }, "每週三的精選名單會被記錄下來，這裡列出從選出日收盤到最新收盤的等權平均報酬，對照同期指數。這是檢驗模型最直接的方式，累積的週數越多越有參考價值。"));
+          { key: "r", label: "扣成本報酬", val: (r) => r.net, cell: (r) => numEl(pct(r.net, 2), r.net) },
+          { key: "b", label: "同期 0050／SPY", val: (r) => r.bench, cell: (r) => numEl(pct(r.bench, 2), r.bench) },
+          { key: "x", label: "超額報酬", val: (r) => r.excess, cell: (r) => numEl(pct(r.excess, 2), r.excess) },
+          { key: "w", label: "跑贏同市場中位數的檔數", val: (r) => r.beat_median, cell: (r) => h("span", { class: "num" }, ok(r.beat_median) ? num(r.beat_median * 100, 0) + "%" : "–") }], trackRows, { csv: "follow" })
+          : h("div", { class: "empty" }, "從下週開始累積：每週的名單會在下一個交易日開盤買進、下一份名單公布後的下一個交易日開盤賣出。"),
+        h("p", { class: "chart-note" }, "規則事先寫定、不再更改：名單公布後的下一個交易日開盤等權買進，下一份名單公布後的下一個交易日開盤賣出；台股扣來回成本 0.585%（手續費兩次加證交稅），美股扣 0.1%。對照同市場的 0050／SPY 與同市場個股中位數。累積滿 26 週之前一律標「樣本不足」；之後若平均每週超額的 t 值低於 1，就寫「實際追蹤尚未顯示優勢」。"));
       return [h("div", { class: "sec-head" }, head("精選 20 檔", `從 ${S.counts.tw} 檔台股與 ${S.counts.us} 檔美股中，依同市場排名挑選：處置股不選、上週精選排名仍在前段就續留、同產業最多 3 檔、走勢高度相關的不重複挑。台股在前、美股在後。點卡片看圖表與完整數據。`), seg),
         h("p", { class: "small muted" }, "排名是同一市場內的相對強弱（台股 1 名最強），不是漲跌預測；百分比是過去約三年同排名的股票跑贏同市場中位數的比例。美股沒有測到可驗證的選股優勢，照實標示。部位上限＝願意承擔 1% 資金虧損時，這檔最多買多少。",
           h("a", { href: "#learn?k=picks" }, "選股規則")),

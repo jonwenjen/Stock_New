@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime as dt
 import re
 
+import numpy as np
 import pandas as pd
 
 from . import http
@@ -668,3 +669,78 @@ def derivatives_window(start: str, end: str) -> dict[str, dict]:
         if total.get(d):
             put(d, "retail_mtx", -n / total[d])
     return out
+
+
+# ----------------------------- following the picks: rules fixed in advance ----------------------------- #
+TRACK_COST = {"TW": 0.00585, "US": 0.001}  # round trip: TW fee 0.1425% x 2 + 0.3% tax; US a small spread
+TRACK_MIN_WEEKS = 26
+
+
+def _open_after(f: pd.DataFrame, day: pd.Timestamp) -> tuple[pd.Timestamp, float] | None:
+    nxt = f[f.index > day]
+    if nxt.empty:
+        return None
+    px = nxt["open"].iloc[0] if "open" in nxt and nxt["open"].iloc[0] > 0 else nxt["close"].iloc[0]
+    return nxt.index[0], float(px)
+
+
+def follow_track(cohorts: list[dict], frames: dict[str, pd.DataFrame], bench: dict[str, str],
+                 universe: dict[str, list[str]]) -> dict:
+    """What following each week's list would have earned (review 2026-11-14, quant-7 + risk-5).
+
+    Rules, fixed before any result was seen: buy every pick at the open of the session after the
+    list date, equal weight; sell at the open of the session after the next list's date (the last
+    list is marked to the latest close once five sessions have passed). Returns are net of a round
+    trip (TRACK_COST) and compared with the market's index fund and with the median stock of the
+    market's current universe over the same window. Until TRACK_MIN_WEEKS lists have been scored
+    the verdict is "too few weeks"; after that, a mean weekly excess with t < 1 is reported as no
+    edge shown yet."""
+    rows = []
+    for i, c in enumerate(cohorts):
+        d0 = pd.Timestamp(c["date"])
+        d1 = pd.Timestamp(cohorts[i + 1]["date"]) if i + 1 < len(cohorts) else None
+        for mk in sorted({p["market"] for p in c["picks"]}):
+            b = frames.get(bench.get(mk, ""))
+            if b is None:
+                continue
+            win = []
+
+            def window(f: pd.DataFrame) -> float | None:
+                a = _open_after(f, d0)
+                if a is None:
+                    return None
+                z = _open_after(f, d1) if d1 is not None else None
+                if z is None:
+                    if d1 is not None or (f.index > a[0]).sum() < 5:
+                        return None
+                    z = (f.index[-1], float(f["close"].iloc[-1]))
+                win.append((a[0], z[0]))
+                return z[1] / a[1] - 1
+
+            rets = [r for p in c["picks"] if p["market"] == mk and p["symbol"] in frames
+                    for r in [window(frames[p["symbol"]])] if r is not None]
+            br = window(b)
+            if not rets or br is None:
+                continue
+            uni = [r for s in universe.get(mk, []) if s in frames for r in [window(frames[s])] if r is not None]
+            med = float(np.median(uni)) if uni else None
+            net = float(np.mean(rets)) - TRACK_COST[mk]
+            rows.append({"date": c["date"], "market": mk, "n": len(rets), "net": round(net, 4),
+                         "bench": round(br, 4), "excess": round(net - br, 4),
+                         "beat_median": round(sum(r > med for r in rets) / len(rets), 3) if med is not None else None,
+                         "median": None if med is None else round(med, 4),
+                         "exit": max(w[1] for w in win).strftime("%Y-%m-%d") if win else None,
+                         "open": d1 is None})
+    summary = {}
+    for mk in ("TW", "US"):
+        done = [r for r in rows if r["market"] == mk and not r["open"]]
+        ex = np.array([r["excess"] for r in done])
+        t = float(ex.mean() / (ex.std(ddof=1) / np.sqrt(len(ex)))) if len(ex) >= 3 and ex.std(ddof=1) > 0 else None
+        growth = float(np.prod([1 + r["net"] for r in done]) - 1) if done else None
+        bgrowth = float(np.prod([1 + r["bench"] for r in done]) - 1) if done else None
+        verdict = (f"樣本不足（{len(done)}／{TRACK_MIN_WEEKS} 週）" if len(done) < TRACK_MIN_WEEKS else
+                   "實際追蹤尚未顯示優勢" if t is None or t < 1 else f"實際追蹤顯示正超額（t = {t:.1f}）")
+        summary[mk] = {"weeks": len(done), "mean_excess": round(float(ex.mean()), 4) if len(ex) else None,
+                       "t": None if t is None else round(t, 2), "growth": growth, "bench_growth": bgrowth,
+                       "verdict": verdict}
+    return {"rows": rows, "summary": summary, "rules": {"cost": TRACK_COST, "min_weeks": TRACK_MIN_WEEKS}}

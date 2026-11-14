@@ -1116,3 +1116,29 @@ def test_evidence_grades_cards_against_the_index():
     short = research.evidence(pd.Series(1.0, index=idx[-50:]), close, 1)
     assert good["grade"] == "A" and good["agree"] and noise["grade"] in ("C", "B") and short["grade"] == "D"
     assert research.evidence(leak.dropna(), close, -1)["agree"] is False
+
+
+def test_follow_track_uses_next_open_costs_and_sample_rule():
+    from pipeline import leading
+    idx = pd.bdate_range("2026-01-05", periods=30)
+    up = pd.DataFrame({"open": np.linspace(100, 129, 30), "close": np.linspace(100.5, 129.5, 30)}, index=idx)
+    flat = pd.DataFrame({"open": 100.0, "close": 100.0}, index=idx)
+    frames = {"A.TW": up, "B.TW": flat, "0050.TW": flat}
+    cohorts = [{"date": "2026-01-05", "picks": [{"symbol": "A.TW", "market": "TW"}]},
+               {"date": "2026-01-12", "picks": [{"symbol": "A.TW", "market": "TW"}]}]
+    out = leading.follow_track(cohorts, frames, {"TW": "0050.TW"}, {"TW": ["A.TW", "B.TW"]})
+    first = out["rows"][0]
+    assert first["exit"] == "2026-01-13" and not first["open"]
+    assert first["net"] == pytest.approx(106 / 101 - 1 - 0.00585, abs=1e-4) and first["beat_median"] == 1.0
+    assert out["summary"]["TW"]["verdict"].startswith("樣本不足")
+
+
+def test_stress_replay_picks_separate_worst_windows():
+    from pipeline import research
+    idx = pd.bdate_range("2021-01-04", periods=700)
+    bench = pd.Series(100.0, index=idx)
+    bench.iloc[200:220] = np.linspace(100, 80, 20); bench.iloc[220:] = 80.0
+    pick = bench * 1.0
+    out = research.stress_replay({"X": 1.0}, {"X": pick}, bench, bench, n=2)
+    assert len(out) == 2 and min(o["bench"] for o in out) <= -0.15
+    assert all(abs(o["picks"] - o["bench"]) < 1e-9 for o in out)      # same prices -> same replay

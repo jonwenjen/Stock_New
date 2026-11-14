@@ -1459,6 +1459,10 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     cohorts = cohorts[-60:]
     write_json(DATA / "history" / "picks.json", cohorts)
     track = leading.cohort_results(cohorts[:-1], frames, {"TW": "TWII", "US": "SPX"})
+    # following the lists by rules fixed in advance: next-day open to next-day open, net of costs
+    follow = safe("精選名單的實際追蹤（事先寫定的規則）", lambda: leading.follow_track(
+        cohorts, frames, {"TW": "0050.TW", "US": "SPY"},
+        {mk: [s for s in stocks if meta[s]["market"] == mk and meta[s]["kind"] == "stock"] for mk in ("TW", "US")}), None)
     chg = leading.pick_changes([r["symbol"] for r in picks], cohorts[:-1], trading_days[-1])
     for r in picks:
         r["diff"] = chg["by_symbol"].get(r["symbol"])
@@ -1755,7 +1759,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         "picks": [slim(r) for r in picks],
         "bullish": [slim(r) for r in bullish], "bearish": [slim(r) for r in bearish],
         "backtest": bt, "backtest_imom": bt_imom, "calibration": CALIB, "picks_diff": picks_diff,
-        "selection_bias": sel_bias, "weekly": weekly, "portfolio": portfolio,
+        "selection_bias": sel_bias, "weekly": weekly, "portfolio": portfolio, "follow": follow,
         "weights": scoring.WEIGHTS, "weights_us": scoring.WEIGHTS_SLOW_CHIPS,
         "sources": SOURCES, "picks_track": track,
         "counts": {"tw": sum(r["market"] == "TW" for r in records),
@@ -1784,6 +1788,11 @@ def portfolio_panel(picks: list[dict], records: list[dict], tframes: dict, frame
             continue
         uni = [r for r in records if r["market"] == mk and r.get("kind") != "etf"]
         med = lambda rows, k: float(np.nanmedian([r[k] for r in rows if r.get(k) is not None])) if rows else None  # noqa: E731
+        fund_sym = "0050.TW" if mk == "TW" else "SPY"
+        if fund_sym in frames:
+            res["stress"] = research.stress_replay({r["symbol"]: float(x) for r, x in zip(ps, w)},
+                                                   {r["symbol"]: tframes[r["symbol"]]["close"] for r in ps},
+                                                   frames[fund_sym]["close"], frames[bench]["close"])
         res.update({"weights": {r["symbol"]: round(float(x), 4) for r, x in zip(ps, w)},
                     "hi52": med(ps, "hi52"), "hi52_all": med(uni, "hi52"), "r60": med(ps, "r60"), "r60_all": med(uni, "r60")})
         out[mk] = res

@@ -143,3 +143,48 @@ def portfolio_risk(rets: pd.DataFrame, weights: np.ndarray, bench: pd.Series) ->
     return {"n": n, "vol": round(vol, 4), "beta": None if beta is None else round(beta, 2),
             "loss95_1m": round(float(-1.645 * vol * np.sqrt(21 / 252)), 4),
             "avg_corr": None if avg_corr is None else round(avg_corr, 2)}
+
+
+def worst_windows(close: pd.Series, n: int = 5, days: int = 20, gap: int = 40) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """The n worst `days`-session returns of a series, no two ending within `gap` sessions of each other."""
+    close = close.dropna()
+    r = (close / close.shift(days) - 1).dropna().sort_values()
+    picked: list[int] = []
+    pos = {d: i for i, d in enumerate(close.index)}
+    for d in r.index:
+        i = pos[d]
+        if all(abs(i - j) >= gap for j in picked):
+            picked.append(i)
+        if len(picked) == n:
+            break
+    return [(close.index[i - days], close.index[i]) for i in sorted(picked)]
+
+
+def stress_replay(weights: dict[str, float], closes: dict[str, pd.Series], bench: pd.Series, index: pd.Series,
+                  n: int = 5, days: int = 20) -> list[dict]:
+    """Historical replay (review 2026-11-14, risk-8): today's picks through the market's worst 20-session
+    stretches of the last five years. A pick without prices back then counts as beta x index return.
+    The last 60 sessions are left out: today's picks were chosen partly for how they did then, so
+    replaying that stretch would flatter them."""
+    windows = worst_windows(bench.iloc[:-60].tail(1200), n, days)
+    ir = index.pct_change()
+    out = []
+    for a, z in windows:
+        port = 0.0
+        for sym, w in weights.items():
+            c = closes.get(sym)
+            if c is not None and a in c.index and z in c.index and c[a] > 0:
+                r = float(c[z] / c[a] - 1)
+            else:
+                beta = 1.0
+                if c is not None and len(c) > 120:
+                    sr = c.pct_change()
+                    j = pd.concat([sr, ir], axis=1, sort=True).dropna().tail(250)
+                    if len(j) > 60 and j.iloc[:, 1].var() > 0:
+                        beta = float(j.cov().iloc[0, 1] / j.iloc[:, 1].var())
+                ia, iz = index.asof(a), index.asof(z)
+                r = beta * float(iz / ia - 1) if ia and iz else 0.0
+            port += w * r
+        out.append({"from": a.strftime("%Y-%m-%d"), "to": z.strftime("%Y-%m-%d"),
+                    "bench": round(float(bench[z] / bench[a] - 1), 4), "picks": round(port, 4)})
+    return out

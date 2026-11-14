@@ -205,18 +205,30 @@ def _concept(cik: int, tag: str) -> list[dict]:
     return next(iter(units.values()), [])
 
 
+def fresh_enough(period: str | None, today: dt.date | None = None, months: int = 15) -> bool:
+    """A reported quarter older than this is a discontinued tag, not the company's latest result."""
+    if not period:
+        return False
+    return dt.date.fromisoformat(period) >= (today or dt.date.today()) - dt.timedelta(days=months * 31)
+
+
 def fundamentals(cik: int, price: float | None) -> dict:
     out: dict = {}
-    eps = ttm_and_yoy(_concept(cik, "EarningsPerShareDiluted"))
+    eps = {}
+    for tag in ("EarningsPerShareDiluted", "EarningsPerShareBasic"):
+        eps = ttm_and_yoy(_concept(cik, tag))
+        if eps and fresh_enough(eps.get("period")):
+            break
+        eps = {}
     if eps:
         out.update({"eps_period": eps.get("period"), "eps": eps.get("latest"),
                     "eps_ttm": eps.get("ttm"), "eps_yoy": eps.get("yoy")})
-        if price and eps.get("ttm"):
+        if price and eps.get("ttm") and eps["ttm"] > 0:  # a loss has no meaningful P/E
             out["pe"] = price / eps["ttm"]
     best: dict = {}
     for tag in REVENUE_TAGS:
         rv = ttm_and_yoy(_concept(cik, tag))
-        if rv and rv.get("period", "") > best.get("period", ""):
+        if rv and fresh_enough(rv.get("period")) and rv.get("period", "") > best.get("period", ""):
             best = rv
     if best:
         out.update({"rev_yoy": best.get("yoy"), "revenue_ttm": best.get("ttm")})

@@ -18,23 +18,18 @@ HORIZONS = {"1w": 5, "1m": 21, "1q": 63}  # trading days
 # Weight of each factor group per horizon (re-normalised when a group is missing).
 # Podcast attention ("buzz") carries no weight: being talked about says nothing reliable about
 # direction, and heavy attention is at least as often a sign of a crowded trade. It is shown, not scored.
-WEIGHTS = {
-    "1w": {"tech": 0.60, "chips": 0.35, "fund": 0.05, "buzz": 0.00},
-    "1m": {"tech": 0.50, "chips": 0.25, "fund": 0.25, "buzz": 0.00},
-    "1q": {"tech": 0.40, "chips": 0.15, "fund": 0.45, "buzz": 0.00},
-}
+# One direction score for every horizon. A 2026-11 review measured the cross-sectional IC of
+# each block on this site's own history: the short-term block (5-day return, RSI, MACD) had
+# none, even for one-week returns, and the slow technical score did best at every horizon.
+# The fundamental and chip groups have no history to test, so they carry less weight until
+# they do. The horizons still differ - in how wide the range is.
+_TW = {"tech": 0.60, "chips": 0.25, "fund": 0.15, "buzz": 0.00}
+WEIGHTS = {"1w": _TW, "1m": _TW, "1q": _TW}
 # US "chips" are congressional filings (up to 45 days late) and quarterly 13F holdings:
 # real information, but too slow to drive a one-week call, so they weigh less up front.
-WEIGHTS_SLOW_CHIPS = {
-    "1w": {"tech": 0.85, "chips": 0.10, "fund": 0.05, "buzz": 0.00},
-    "1m": {"tech": 0.55, "chips": 0.15, "fund": 0.30, "buzz": 0.00},
-    "1q": {"tech": 0.40, "chips": 0.15, "fund": 0.45, "buzz": 0.00},
-}
+_US = {"tech": 0.80, "chips": 0.05, "fund": 0.15, "buzz": 0.00}
+WEIGHTS_SLOW_CHIPS = {"1w": _US, "1m": _US, "1q": _US}
 OVERALL = {"1w": 0.3, "1m": 0.4, "1q": 0.3}
-# Up-probability per unit of score, by horizon length in sessions. 0.22 is the ceiling the site
-# started with; each build replaces it with what the back-test supports (market.fit_slopes).
-MAX_SLOPE = 0.22
-P_SLOPE: dict[int, float] = {}
 
 
 def clamp(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
@@ -67,6 +62,9 @@ def tech_frame(df: pd.DataFrame) -> pd.DataFrame:
     out["atr"] = ind.atr(df["high"].astype(float), df["low"].astype(float), c, 14)
     out["vol"] = ind.daily_vol(c, 60)
     out["pos250"] = ind.range_position(c, 250)
+    # distance from the 52-week high (1 = at the high): the one price factor that held up on
+    # Taiwan data after removing market beta (George & Hwang 2004: anchoring on the old high)
+    out["hi52"] = c / df["high"].astype(float).rolling(252, min_periods=200).max()
     for n in (5, 20, 60, 120):
         out[f"r{n}"] = ind.pct_change_n(c, n)
 
@@ -95,9 +93,9 @@ def tech_frame(df: pd.DataFrame) -> pd.DataFrame:
 
     out["trend"] = trend.clip(-1, 1)
     out["mom_s"], out["mom_m"], out["mom_l"] = mom_s, mom_m, mom_l
-    out["t_1w"] = (0.5 * mom_s + 0.3 * out["trend"] + 0.2 * mom_m).clip(-1, 1)
-    out["t_1m"] = (0.4 * out["trend"] + 0.4 * mom_m + 0.2 * mom_s).clip(-1, 1)
-    out["t_1q"] = (0.4 * out["trend"] + 0.35 * mom_l + 0.25 * mom_m).clip(-1, 1)
+    out["t_slow"] = (0.4 * out["trend"] + 0.35 * mom_l + 0.25 * mom_m).clip(-1, 1)
+    # The per-horizon columns are kept for the code that loops over horizons; they are one score.
+    out["t_1w"] = out["t_1m"] = out["t_1q"] = out["t_slow"]
     return out
 
 
@@ -322,21 +320,21 @@ def label(score: float) -> str:
     return "強勢偏空"
 
 
-def forecast(last: float, dvol: float, score: float, days: int) -> dict:
-    """Probabilistic outlook: direction tilt from the score, width from realised vol.
+def forecast(last: float, dvol: float, score: float, days: int, p_up: float | None = None) -> dict:
+    """Outlook for one horizon: the score's label and a one-sigma range from realised volatility.
 
-    The up-probability is deliberately capped at 28%..72% - factor models
-    do not justify more confidence than that.
+    The range is centred on today's price - the score ranks stocks against each other and
+    has shown no ability to say how far one will move. `p_up` is a base rate supplied by the
+    caller (how often comparable cases rose); `p_beat` (chance of beating the market's
+    median stock) is filled in after the whole market has been ranked.
     """
     dvol = dvol if dvol and math.isfinite(dvol) else 0.02
     sigma = dvol * math.sqrt(days)
-    slope = P_SLOPE.get(days, MAX_SLOPE)
-    # the centre of the range leans with the score only as far as the probability does
-    exp_ret = score * 0.6 * sigma * slope / MAX_SLOPE
+    exp_ret = 0.0
     return {
         "score": round(score, 3),
         "label": label(score),
-        "p_up": round(clamp(0.5 + slope * score, 0.28, 0.72), 3),
+        "p_up": None if p_up is None else round(p_up, 3),
         "exp_ret": round(exp_ret, 4),
         "low": round(last * (1 + exp_ret - sigma), 2),
         "high": round(last * (1 + exp_ret + sigma), 2),
@@ -356,19 +354,19 @@ def setup_tag(tactical: float | None, structural: float | None, tactical_prev: f
         return None
     if structural >= 0.2 and tactical >= 0.15:
         if tactical_prev is not None and tactical_prev < 0.15:
-            return "結構佳，短線剛轉強"
-        return "結構與短線同步偏多"
+            return "基本面佳，籌碼剛轉強"
+        return "基本面與籌碼同步偏多"
     if structural >= 0.2 and tactical <= -0.15:
-        return "結構佳但短線偏弱，等轉強"
+        return "基本面佳但籌碼偏弱"
     if structural <= -0.2 and tactical >= 0.15:
-        return "短線強但結構弱，僅宜短打"
+        return "籌碼強但基本面弱"
     if structural <= -0.2 and tactical <= -0.15:
-        return "結構與短線同步偏空"
+        return "基本面與籌碼同步偏空"
     return None
 
 
 def score_stock(tf: pd.DataFrame, chips: float | None, fund: float | None,
-                buzz: float | None, slow_chips: bool = False) -> dict:
+                buzz: float | None, slow_chips: bool = False, tech: float | None = None) -> dict:
     """Combine the latest technical row with the other factor groups.
 
     slow_chips marks positioning data that arrives weeks late (US filings). Besides the
@@ -381,8 +379,9 @@ def score_stock(tf: pd.DataFrame, chips: float | None, fund: float | None,
     out = {"horizons": {}}
     overall = 0.0
     weights = WEIGHTS_SLOW_CHIPS if slow_chips else WEIGHTS
+    t = float(row["t_slow"]) if tech is None else tech
     for h, days in HORIZONS.items():
-        s = blend(h, {"tech": float(row[f"t_{h}"]), "chips": chips, "fund": fund, "buzz": buzz}, weights)
+        s = blend(h, {"tech": t, "chips": chips, "fund": fund, "buzz": buzz}, weights)
         out["horizons"][h] = forecast(last, dvol, s, days)
         overall += OVERALL[h] * s
     out["overall"] = round(overall, 3)
@@ -394,7 +393,9 @@ def score_stock(tf: pd.DataFrame, chips: float | None, fund: float | None,
         "fund": None if fund is None else round(fund, 3),
         "buzz": None if buzz is None else round(buzz, 3),
     }
-    tactical = _mix([(0.65, float(row["t_1w"])), (0.35, None if slow_chips else chips)])
+    # Two auxiliary reads, neither of which feeds the score again: daily-updated positioning
+    # ("chips", Taiwan only) and filed fundamentals (plus US filed holdings).
+    tactical = None if slow_chips else chips
     structural = _mix([(0.70, fund), (0.30, chips if slow_chips else None)])
     out["tactical"] = None if tactical is None else round(tactical, 3)
     out["structural"] = None if structural is None else round(structural, 3)
@@ -438,6 +439,28 @@ def trade_plan(row: pd.Series, f1m: dict, overall: float) -> dict:
             "zone_high": round(min(c, support + atr), 2),
             "stop_pct": None if stop_pct is None else round(stop_pct, 4),
             "size": None if size is None else round(size, 3)}
+
+
+# --------------------------------------------------------------------------- #
+# Cross-sectional ranks: the technical score as published (Taiwan adds the 52-week high)
+# --------------------------------------------------------------------------- #
+def pct_rank(s: pd.Series) -> pd.Series:
+    """Percentile within the cross-section, 0 (worst) .. 1 (best)."""
+    return s.rank(pct=True, method="average")
+
+
+def tech_panel(frames: dict[str, pd.DataFrame], market: str) -> pd.DataFrame:
+    """dates x symbols panel of the technical score in [-1, 1] as a cross-sectional rank.
+
+    Taiwan: the mean of the ranks of the slow score and of the 52-week-high ratio. US: the
+    rank of the slow score (the 52-week high did not hold up there).
+    """
+    slow = pd.DataFrame({s: f["t_slow"] for s, f in frames.items()})
+    r = slow.rank(axis=1, pct=True)
+    if market == "TW":
+        hi = pd.DataFrame({s: f["hi52"] for s, f in frames.items()}).rank(axis=1, pct=True)
+        r = (r + hi.where(hi.notna(), r)) / 2
+    return (2 * r - 1).clip(-1, 1)
 
 
 # --------------------------------------------------------------------------- #

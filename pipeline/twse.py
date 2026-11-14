@@ -149,9 +149,16 @@ def insiders() -> dict[str, dict]:
     agg: dict[str, dict] = defaultdict(lambda: {"held": 0.0, "elected": 0.0, "pledged": 0.0,
                                                 "people": []})
     month = None
+    seen: set[tuple] = set()
     for r in http.get_json(f"{OPENAPI}/opendata/t187ap11_L", timeout=120):
-        code = r["公司代號"].strip()
-        held, elected = num(r.get("目前持股")) or 0, num(r.get("選任時持股 ")) or 0
+        r = {k.strip(): v for k, v in r.items()}  # some keys carry trailing spaces
+        code, title, name = r["公司代號"].strip(), r.get("職稱", "").strip(), r.get("姓名", "").strip()
+        # Directors and supervisors only: the filing also lists managers (whose holding "at
+        # election" is zero) and repeats a chairman who is also president under both titles.
+        if not ("董事" in title or "監察" in title) or (code, name, title.replace("長", "")) in seen:
+            continue
+        seen.add((code, name, title.replace("長", "")))
+        held, elected = num(r.get("目前持股")) or 0, num(r.get("選任時持股")) or 0
         pledged = num(r.get("設質股數")) or 0
         a = agg[code]
         a["name"] = r.get("公司名稱", "").strip()
@@ -168,7 +175,7 @@ def insiders() -> dict[str, dict]:
         out[code] = {
             "name": a["name"], "held": a["held"], "elected": a["elected"],
             "chg_since_elected": (a["held"] / a["elected"] - 1) if a["elected"] else None,
-            "pledge_ratio": (a["pledged"] / a["held"]) if a["held"] else 0.0,
+            "pledge_ratio": (a["pledged"] / a["held"]) if a["held"] else None,
             "top": [{"title": t, "name": n, "held": h} for h, t, n, _ in top],
             "month": month,
         }
@@ -311,3 +318,74 @@ def streak(values: list[float]) -> int:
             break
         n += 1 if v > 0 else -1
     return n
+
+
+def ex_rights(start: str, end: str) -> dict[str, dict[str, float]]:
+    """Ex-rights / ex-dividend events between two ISO dates: {code: {ex-date: reference / previous close}}.
+
+    TWSE's 除權除息計算結果表 answers a date range (about half a year per request is fine).
+    The factor scales prices before the ex-date so the history is continuous.
+    """
+    j = _rwd("exRight/TWT49U", startDate=start.replace("-", ""), endDate=end.replace("-", ""))
+    f = j["fields"]
+    i_d, i_c, i_p, i_r = f.index("資料日期"), f.index("股票代號"), f.index("除權息前收盤價"), f.index("除權息參考價")
+    out: dict[str, dict[str, float]] = {}
+    for r in j["data"]:
+        m = re.match(r"(\d+)年(\d+)月(\d+)日", r[i_d].strip())
+        prev, ref = num(r[i_p]), num(r[i_r])
+        if not m or not prev or not ref:
+            continue
+        d = f"{int(m[1]) + 1911}-{int(m[2]):02d}-{int(m[3]):02d}"
+        out.setdefault(r[i_c].strip(), {})[d] = round(ref / prev, 6)
+    return out
+
+
+def _roc_date(s: str) -> str | None:
+    """'115/11/17', '1151117' or '115年11月17日' -> '2026-11-17'."""
+    m = re.match(r"\s*(\d{2,3})\D?(\d{1,2})\D?(\d{1,2})", str(s or ""))
+    if not m:
+        return None
+    return f"{int(m[1]) + 1911}-{int(m[2]):02d}-{int(m[3]):02d}"
+
+
+def parse_trading_flags(punish: list[dict], notice: list[dict], notetrans: list[dict],
+                        exdiv: list[dict]) -> dict[str, dict]:
+    """Official trading flags per security code.
+
+    punish   -> 處置股: {"from", "to", "measure", "reason"} (trading by periodic call auction,
+                prepayment required: thin liquidity and large slippage)
+    notice   -> 注意股 on the latest day: {"count", "info"}
+    notetrans-> met the attention criteria recently and may be disposed next: text
+    exdiv    -> 除權息預告: {"date", "kind", "cash"} (cash dividend per share, if given)
+    """
+    out: dict[str, dict] = {}
+    for r in punish:
+        code = (r.get("Code") or "").strip()
+        period = (r.get("DispositionPeriod") or "").replace("～", "~").split("~")
+        if code and len(period) == 2:
+            out.setdefault(code, {})["punish"] = {"from": _roc_date(period[0]), "to": _roc_date(period[1]),
+                                                  "measure": (r.get("DispositionMeasures") or "").strip(),
+                                                  "reason": (r.get("ReasonsOfDisposition") or "").strip()}
+    for r in notice:
+        code = (r.get("Code") or "").strip()
+        if code:
+            out.setdefault(code, {})["notice"] = {"count": int(num(r.get("NumberOfAnnouncement")) or 1),
+                                                  "info": (r.get("TradingInfoForAttention") or "").strip()[:80],
+                                                  "date": _roc_date(r.get("Date"))}
+    for r in notetrans:
+        code = (r.get("Code") or "").strip()
+        if code:
+            out.setdefault(code, {})["near_punish"] = (r.get("RecentlyMetAttentionSecuritiesCriteria") or "").strip()
+    for r in exdiv:
+        code, d = (r.get("Code") or "").strip(), _roc_date(r.get("Date"))
+        if code and d:
+            out.setdefault(code, {})["exdiv"] = {"date": d, "kind": (r.get("Exdividend") or "").strip(),
+                                                 "cash": num(r.get("CashDividend"))}
+    return out
+
+
+def trading_flags() -> dict[str, dict]:
+    """Disposition, attention and ex-dividend notices from the TWSE OpenAPI (four small requests)."""
+    get = lambda path: http.get_json(f"{OPENAPI}/{path}")  # noqa: E731
+    return parse_trading_flags(get("announcement/punish"), get("announcement/notice"),
+                               get("announcement/notetrans"), get("exchangeReport/TWT48U_ALL"))

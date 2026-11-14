@@ -293,105 +293,66 @@ def p_up(score: float, slope: float = 0.22) -> float:
     return float(np.clip(0.5 + slope * score, 0.28, 0.72))
 
 
-def _pairs(frames: dict[str, pd.DataFrame], h: str, days: int, lookback: int, step: int) -> pd.DataFrame:
-    """(date, score, forward return) for every stock on every step-th day of the look-back window."""
-    scores = pd.DataFrame({s: f[f"t_{h}"] for s, f in frames.items()})
-    closes = pd.DataFrame({s: f["close"] for s, f in frames.items()})
-    fwd = closes.shift(-days) / closes - 1
-    dates = scores.index[-lookback:-days:step] if len(scores) > days + 50 else []
-    df = pd.concat([scores.loc[dates].stack().rename("s"), fwd.loc[dates].stack().rename("r")], axis=1).dropna()
-    df["up"] = (df["r"] > 0).astype(float)
-    return df
+def fit_relative(panel: pd.DataFrame, closes: pd.DataFrame, horizons: dict[str, int], cap: float = 0.25,
+                 lookback: int = 750, step: int = 5) -> dict:
+    """How well the published score has told stocks that beat their market from those that lagged.
 
+    panel: dates x symbols, the score as a cross-sectional rank in [-1, 1]; closes: same shape.
+    For every step-th date in the look-back, each stock "beat" if its forward return exceeded
+    that date's median. The chance of beating is modelled as 50% + k x score (comparisons
+    within a date, so a rising market cannot pass for skill).
 
-def _slope(df: pd.DataFrame) -> float:
-    """Least-squares slope of (rose or not) on the score, comparing stocks within the same day.
-
-    Both sides are demeaned per date first. Otherwise a rising market, in which most
-    stocks go up and most scores are positive, would look like skill: the slope must
-    come from higher-scored stocks doing better than lower-scored ones on the same day.
-    """
-    g = df.groupby(level=0)
-    s, u = df["s"] - g["s"].transform("mean"), df["up"] - g["up"].transform("mean")
-    den = float((s ** 2).sum())
-    return float((s * u).sum() / den) if den else 0.0
-
-
-def fit_slopes(frames: dict[str, pd.DataFrame], horizons: dict[str, int], floor: float = 0.03, cap: float = 0.22,
-               lookback: int = 750, step: int = 5) -> dict:
-    """How much up-probability a unit of score has actually been worth, per horizon.
-
-    The site's probability is 50% + slope x score. `fit` is the slope the last ~3 years
-    support; `k` is that value kept within [floor, cap], which is what gets published.
-    Walk-forward check: the window is cut into five consecutive blocks and each of the
-    last four is predicted with a slope fitted on the blocks before it only, giving the
-    out-of-sample Brier score of the calibrated probability (`brier`) next to that of the
-    original fixed slope (`brier_fixed`) and of always saying 50% (`brier_coin`).
+    Walk-forward check: the window is cut into five consecutive blocks; each of the last four
+    is predicted with k fitted on the blocks before it only. `edge` is True when that
+    out-of-sample Brier score beats always saying 50%. `k` is the full-sample fit kept within
+    [0, cap] - published as is, no floor. `base_up` is how often a stock rose at all over the
+    horizon in this sample (it depends on the market's direction, so it is context, not a forecast).
     """
     out = {}
     for h, days in horizons.items():
-        df = _pairs(frames, h, days, lookback, step)
+        fwd = closes.shift(-days) / closes - 1
+        dates = panel.index[-lookback:-days:step] if len(panel) > days + 50 else []
+        x, r = panel.loc[dates].stack(), fwd.reindex(dates).stack()
+        df = pd.concat([x.rename("x"), r.rename("r")], axis=1).dropna()
         if len(df) < 500:
             out[h] = None
             continue
-        dates = sorted(df.index.get_level_values(0).unique())
-        cuts = [dates[int(len(dates) * i / 5)] for i in range(1, 5)]
+        med = df.groupby(level=0)["r"].transform("median")
+        df["beat"] = (df["r"] > med).astype(float)
+        df["up"] = (df["r"] > 0).astype(float)
+        fit = lambda d: float((d["x"] * (d["beat"] - 0.5)).sum() / max(1e-12, float((d["x"] ** 2).sum())))  # noqa: E731
+        ds = sorted(df.index.get_level_values(0).unique())
+        cuts = [ds[int(len(ds) * i / 5)] for i in range(1, 5)]
         d0 = df.index.get_level_values(0)
-        cal, fixed, coin, n = 0.0, 0.0, 0.0, 0
+        model = coin = 0.0
+        n = 0
         for i, c in enumerate(cuts):
             end = cuts[i + 1] if i + 1 < len(cuts) else None
             train, test = df[d0 < c], df[(d0 >= c) & ((d0 < end) if end is not None else True)]
             if len(train) < 200 or test.empty:
                 continue
-            k = min(cap, max(0.0, _slope(train)))
-            cal += float(((np.clip(0.5 + k * test["s"], 0.28, 0.72) - test["up"]) ** 2).sum())
-            fixed += float(((np.clip(0.5 + cap * test["s"], 0.28, 0.72) - test["up"]) ** 2).sum())
-            coin += float(((0.5 - test["up"]) ** 2).sum())
+            k = min(cap, max(0.0, fit(train)))
+            model += float(((np.clip(0.5 + k * test["x"], 0.3, 0.7) - test["beat"]) ** 2).sum())
+            coin += float(((0.5 - test["beat"]) ** 2).sum())
             n += len(test)
-        fit = _slope(df)
-        out[h] = {"k": round(min(cap, max(floor, fit)), 4), "fit": round(fit, 4), "n": int(len(df)),
-                  "brier": round(cal / n, 4) if n else None, "brier_fixed": round(fixed / n, 4) if n else None,
-                  "brier_coin": round(coin / n, 4) if n else None}
-    return out
-
-
-def calibration(frames: dict[str, pd.DataFrame], horizons: dict[str, int], lookback: int = 750, step: int = 5,
-                slopes: dict[str, float] | None = None) -> dict:
-    """Does a higher technical score go with a higher chance of rising? Past ~3 years.
-
-    For each horizon the (score, forward return) pairs are grouped by the label cuts;
-    hit is the share of non-neutral scores whose sign matched the outcome; brier is the
-    mean squared error of the stated probability, base_brier that of always quoting the
-    overall up-rate (lower is better; brier >= base_brier means no skill).
-    """
-    out = {}
-    for h, days in horizons.items():
-        scores = pd.DataFrame({s: f[f"t_{h}"] for s, f in frames.items()})
-        closes = pd.DataFrame({s: f["close"] for s, f in frames.items()})
-        fwd = closes.shift(-days) / closes - 1
-        dates = scores.index[-lookback:-days:step] if len(scores) > days + 50 else []
-        s = scores.loc[dates].stack()
-        r = fwd.loc[dates].stack()
-        df = pd.concat([s.rename("s"), r.rename("r")], axis=1).dropna()
-        if len(df) < 200:
-            out[h] = None
-            continue
-        df["up"] = (df["r"] > 0).astype(float)
-        df["p"] = np.clip(0.5 + (slopes or {}).get(h, 0.22) * df["s"], 0.28, 0.72)
-        base = float(df["up"].mean())
-        active = df[df["s"].abs() >= 0.15]
+        k_all = fit(df)
         bins = []
         for i, name in enumerate(SCORE_LABELS):
-            b = df[(df["s"] > SCORE_EDGES[i]) & (df["s"] <= SCORE_EDGES[i + 1])]
+            b = df[(df["x"] > SCORE_EDGES[i]) & (df["x"] <= SCORE_EDGES[i + 1])]
             bins.append({"label": name, "n": int(len(b)),
+                         "beat": round(float(b["beat"].mean()), 3) if len(b) else None,
                          "up": round(float(b["up"].mean()), 3) if len(b) else None,
-                         "p": round(float(b["p"].mean()), 3) if len(b) else None,
+                         "p": round(float(np.clip(0.5 + min(cap, max(0.0, k_all)) * b["x"], 0.3, 0.7).mean()), 3) if len(b) else None,
                          "avg": round(float(b["r"].mean()), 4) if len(b) else None})
-        out[h] = {"n": int(len(df)), "base_up": round(base, 3),
-                  "hit": round(float((np.sign(active["s"]) == np.sign(active["r"])).mean()), 3) if len(active) else None,
-                  "brier": round(float(((df["p"] - df["up"]) ** 2).mean()), 4),
-                  "base_brier": round(float(((base - df["up"]) ** 2).mean()), 4), "bins": bins}
+        out[h] = {"k": round(min(cap, max(0.0, k_all)), 4), "fit": round(k_all, 4), "n": int(len(df)),
+                  "brier": round(model / n, 4) if n else None, "brier_coin": round(coin / n, 4) if n else None,
+                  "edge": bool(n and model < coin), "base_up": round(float(df["up"].mean()), 3), "bins": bins}
     return out
+
+
+def p_beat(x: float, k: float) -> float:
+    """Chance of beating the market's median stock for a score x in [-1, 1]."""
+    return float(np.clip(0.5 + k * x, 0.3, 0.7))
 
 
 def evaluate_log(log: dict[str, dict], frames: dict[str, pd.DataFrame], horizons: dict[str, int],
@@ -483,12 +444,12 @@ def momentum_lists(records: list[dict], tactical_prev: dict[str, float], n: int 
         streak, rsi, r20, c5 = r.get("foreign_streak") or 0, r.get("rsi") or 50, r.get("r20") or 0, r.get("chg5d") or 0
         ups = [("站上月線", r["close"] > r["ma20"]), ("月漲幅未過熱", 0 <= r20 < 0.15), ("RSI 適中", 45 <= rsi <= 68),
                ("法人連買", streak >= 3 or (r.get("trust5") or 0) > 0 and (r.get("foreign5") or 0) > 0),
-               ("短線分數上升", d is not None and d >= 0.1),
+               ("籌碼分數上升", d is not None and d >= 0.1),
                ("結構面佳", (r.get("structural") or 0) >= 0.2 or bool(r.get("rev_rising")))]
         tags = [k for k, ok in ups if ok]
         if t > 0 and len(tags) >= 4:
             acc.append({**_brief(r, d), "tags": tags})
-        downs = [("短線分數下滑", d is not None and d <= -0.15), ("跌破月線", r["close"] < r["ma20"]),
+        downs = [("籌碼分數下滑", d is not None and d <= -0.15), ("跌破月線", r["close"] < r["ma20"]),
                  ("超買後回落", rsi >= 68 and c5 < 0), ("外資連賣", streak <= -3),
                  ("融資增、股價跌", (r.get("margin_chg5") or 0) > 0.05 and c5 < 0),
                  ("動能落後趨勢", (f.get("momentum") if f.get("momentum") is not None else 0)
@@ -505,7 +466,8 @@ def _brief(r: dict, d: float | None) -> dict:
     return {"symbol": r["symbol"], "code": r["code"], "name": r["name"], "market": r["market"],
             "close": r["close"], "chg5d": r.get("chg5d"), "r20": r.get("r20"), "rsi": r.get("rsi"),
             "tactical": r.get("tactical"), "tactical_chg": None if d is None else round(d, 3),
-            "overall": r.get("overall"), "p_up": {h: v["p_up"] for h, v in (r.get("horizons") or {}).items()}}
+            "overall": r.get("overall"), "rank": r.get("rank"),
+            "p_beat": {h: v.get("p_beat") for h, v in (r.get("horizons") or {}).items()}}
 
 
 # ----------------------------- alerts ----------------------------- #

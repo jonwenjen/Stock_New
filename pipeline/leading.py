@@ -49,8 +49,9 @@ def put_call() -> list[dict]:
     """TAIEX options put/call ratios for the last ~20 sessions, oldest first (ratio 1.0 = 100%)."""
     rows = http.get_json(f"{TAIFEX}/PutCallRatio")
     out = [{"date": f"{r['Date'][:4]}-{r['Date'][4:6]}-{r['Date'][6:]}",
-            "pcr_oi": (num(r.get("PutCallOIRatio%")) or 0) / 100,
-            "pcr_vol": (num(r.get("PutCallVolumeRatio%")) or 0) / 100} for r in rows]
+            "pcr_oi": num(r.get("PutCallOIRatio%")) / 100,
+            "pcr_vol": (num(r.get("PutCallVolumeRatio%")) or 0) / 100}
+           for r in rows if num(r.get("PutCallOIRatio%"))]  # a blank is a missing day, not 0%
     return sorted(out, key=lambda r: r["date"])
 
 
@@ -522,3 +523,46 @@ def pick_changes(now: list[str], earlier: list[dict], today: str) -> dict:
         out[sym] = {"new": pr is None, "prev_rank": pr, "move": None if pr is None else pr - (i + 1), "weeks": weeks}
     return {"ref_date": ref["date"], "by_symbol": out,
             "dropped": [p["symbol"] for p in ref["picks"] if p["symbol"] not in set(now)]}
+
+
+def previous_week_picks(cohorts: list[dict], today: str) -> set[str]:
+    """Symbols in the newest pick list from an earlier ISO week than `today`."""
+    week = lambda d: dt.date.fromisoformat(d).isocalendar()[:2]  # noqa: E731
+    older = [c for c in cohorts if week(c["date"]) < week(today)]
+    return {p["symbol"] for p in max(older, key=lambda c: c["date"])["picks"]} if older else set()
+
+
+# ----------------------------- TDCC shareholder distribution ----------------------------- #
+def parse_tdcc(text: str, codes: set[str] | None = None) -> tuple[str | None, dict[str, list]]:
+    """TDCC 集保股權分散表 (CSV) -> (data date, {code: [% held by 1,000+ lot holders,
+    % held by 400+ lot holders, number of holders]}).
+
+    Levels 12-15 are 400-600, 600-800, 800-1,000 and over 1,000 lots; 16 is a reconciliation
+    line and 17 the total.
+    """
+    import csv
+    import io
+    date, out = None, {}
+    for r in csv.reader(io.StringIO(text.lstrip("\\ufeff"))):
+        if len(r) < 6 or not r[2].strip().isdigit():
+            continue
+        code, lvl = r[1].strip(), int(r[2])
+        if codes is not None and code not in codes:
+            continue
+        date = date or r[0].strip()
+        cell = out.setdefault(code, [0.0, 0.0, 0])
+        pct = num(r[5]) or 0.0
+        if lvl == 15:
+            cell[0] = pct
+        if 12 <= lvl <= 15:
+            cell[1] = round(cell[1] + pct, 2)
+        if lvl == 17:
+            cell[2] = int(num(r[3]) or 0)
+    if date and len(date) == 8:
+        date = f"{date[:4]}-{date[4:6]}-{date[6:]}"
+    return date, out
+
+
+def tdcc_distribution(codes: set[str]) -> tuple[str | None, dict[str, list]]:
+    r = http.request("GET", "https://opendata.tdcc.com.tw/getOD.ashx", params={"id": "1-5"}, timeout=90)
+    return parse_tdcc(r.content.decode("utf-8-sig", "replace"), codes)

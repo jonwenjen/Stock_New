@@ -85,15 +85,17 @@
 - `regime` 是風險環境（`state`：risk_on 風險偏好／risk_off 風險趨避／mixed 輪動觀望，由高收益債利差 `oas`
   與半導體相對強弱 `semis_lead` 判定），在展望或 `etf` 段落交代一句。`options` 是台指選擇權下一個結算日的
   `put_wall`（下檔支撐）、`call_wall`（上檔壓力）、`max_pain`，可在一週展望引用。`trust_first` 是投信首買名單。
-- `picks`、`bullish`、`bearish` 每檔有 `tactical`（短線分）、`structural`（結構分）與 `setup`（兩者的組合判讀），
-  操作建議中可以用它區分「結構佳但短線弱，等轉強」與「短線強但結構弱，僅宜短打」。`picks_track` 是過去精選名單的實際表現，有資料時在操作建議中如實交代，
-  落後大盤也要寫。
+- `picks`、`bullish`、`bearish` 每檔有 `rank`（同市場排名 [名次, 總數]）、`p_beat_1m`（一月跑贏同市場中位數的機率）、
+  `tactical`（籌碼分，只有台股）、`structural`（基本面分）、`setup`（兩者的組合判讀）與 `official_flags`
+  （punish 處置、notice 注意、near_punish 可能處置、exdiv 即將除權息）。精選不會有處置股；有其他旗標的要在操作建議中點名。
+  `picks_track` 是過去精選名單的實際表現，有資料時在操作建議中如實交代，  落後大盤也要寫。
 - `market` 也要用到 `market_safety`：「本週盤勢重點」帶出風險分數（`risk.score`、`risk.name`，並說明最高的兩三項
   `risk.parts`）與市場週期（`regime.name`、`regime.days`）；「籌碼面」帶出外資台指期（`futures.net_oi`、`futures.chg5`）；
   「操作建議與風險」依 `alerts` 中 level 2 的項目提醒，並可從 `accumulating`、`weakening` 各舉一兩檔。
   `accuracy` 顯示模型區分力有限時（`brier` 不低於 `base_brier`）要照實說，不要把機率寫得比數據更有把握。
-- 上漲機率已依回測校準（digest 的 `calibration`：各期間的斜率 `k`），多半落在 47%–53%。寫展望時以標籤與分數描述
-  相對強弱，機率只需帶一次並說明它接近五五波的原因；不要把 51% 與 49% 的差距寫成有把握的方向判斷。
+- 個股不再有「上漲機率」。digest 的 `calibration` 是各市場各期間跑贏中位數的斜率 `k` 與 `edge`（樣本外是否有優勢）；
+  美股 `edge` 為 false 時要寫明「美股排名沒有可驗證的選股優勢」。指數的 `horizons[].p_up` 是近 5 年的歷史上漲比率，
+  不是預測，寫的時候要這樣稱呼。`calendar` 是接下來兩週的除權息、處置到期、結算與公布截止日，在操作建議中挑相關的帶一句。
   `picks_diff` 是與上一週精選名單的差異（`new` 新進檔數、`dropped` 移出名單），可在操作建議中交代。
 - `podcast.overview`：這兩週節目在談什麼主題（依 `podcast_hot[].episodes` 的標題與摘要），
   以及被談論的標的整體是強是弱。

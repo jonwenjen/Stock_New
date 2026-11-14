@@ -64,16 +64,7 @@ def test_tech_frame_has_no_lookahead():
 def test_blend_renormalises_missing_groups():
     assert scoring.blend("1m", {"tech": 0.5, "chips": None, "fund": None, "buzz": None}) == pytest.approx(0.5)
     mixed = scoring.blend("1m", {"tech": 1.0, "chips": -1.0, "fund": None, "buzz": None})
-    assert mixed == pytest.approx((0.50 - 0.25) / 0.75)
-
-
-def test_forecast_is_bounded_and_ordered():
-    for s in (-1, -0.3, 0, 0.3, 1):
-        f = scoring.forecast(100, 0.02, s, 21)
-        assert 0.28 <= f["p_up"] <= 0.72
-        assert f["low"] < 100 * (1 + f["exp_ret"]) < f["high"]
-    assert scoring.forecast(100, 0.02, 1, 21)["exp_ret"] > 0 > scoring.forecast(100, 0.02, -1, 21)["exp_ret"]
-    assert scoring.forecast(100, float("nan"), 0.2, 5)["sigma"] > 0  # NaN vol falls back
+    assert mixed == pytest.approx((0.60 - 0.25) / 0.85)
 
 
 def test_labels():
@@ -685,27 +676,6 @@ def test_advance_decline_counts_common_stocks_only():
     assert leading.advance_decline({"1101": 2.0}, {"1101": 1.0}) is None         # too few names to mean anything
 
 
-def test_tactical_structural_and_slow_chip_weights():
-    tf = scoring.tech_frame(make_df(trend(400, 0.003)))
-    fast = scoring.score_stock(tf, 0.8, -0.5, 0.0)
-    slow = scoring.score_stock(tf, 0.8, -0.5, 0.0, slow_chips=True)
-    t1w = float(tf["t_1w"].iloc[-1])
-    assert fast["tactical"] == pytest.approx(0.65 * t1w + 0.35 * 0.8, abs=1e-3)
-    assert fast["structural"] == pytest.approx(-0.5)                              # daily flows are not structural
-    assert slow["tactical"] == pytest.approx(t1w, abs=1e-3)                       # late filings are not tactical
-    assert slow["structural"] == pytest.approx(0.7 * -0.5 + 0.3 * 0.8)
-    # filings weigh 10% of a one-week call instead of 35%
-    assert slow["horizons"]["1w"]["score"] == pytest.approx(0.85 * t1w + 0.10 * 0.8 + 0.05 * -0.5, abs=2e-3)
-    # podcast attention carries no weight in any score
-    assert scoring.score_stock(tf, 0.8, -0.5, 0.3)["overall"] == fast["overall"]
-    assert scoring.score_stock(tf, None, None, None)["structural"] is None
-    assert scoring.setup_tag(0.3, 0.4) == "結構與短線同步偏多"
-    assert scoring.setup_tag(0.3, 0.4, tactical_prev=0.0) == "結構佳，短線剛轉強"
-    assert scoring.setup_tag(-0.3, 0.4) == "結構佳但短線偏弱，等轉強"
-    assert scoring.setup_tag(0.3, -0.4) == "短線強但結構弱，僅宜短打"
-    assert scoring.setup_tag(0.0, 0.4) is None and scoring.setup_tag(None, 0.4) is None
-
-
 def test_trade_plan_sizes_positions_by_volatility():
     calm, wild = make_df(trend(300, 0.001, seed=3)), make_df(trend(300, 0.001, seed=3))
     wild["high"], wild["low"] = wild["close"] * 1.05, wild["close"] * 0.95
@@ -828,14 +798,6 @@ def test_risk_history_and_bucket_stats():
     assert rows[0]["level"] == "中等" and rows[0]["1w"]["up"] == 1.0
 
 
-def test_calibration_flags_a_score_with_no_skill():
-    frames = {f"S{i}": scoring.tech_frame(make_df(trend(500, 0.0005, seed=i))) for i in range(30)}
-    cal = market.calibration(frames, scoring.HORIZONS)
-    c = cal["1m"]
-    assert c["n"] > 200 and sum(b["n"] for b in c["bins"]) == c["n"]
-    assert 0 <= c["hit"] <= 1 and c["brier"] > 0 and c["base_brier"] <= 0.25
-
-
 def test_evaluate_logs_only_count_matured_forecasts():
     f = make_df(np.linspace(100, 160, 60))
     d0, d_late = f.index[10].strftime("%Y-%m-%d"), f.index[58].strftime("%Y-%m-%d")
@@ -854,8 +816,8 @@ def test_momentum_lists_and_alerts():
     fading = {**base, "symbol": "B", "name": "b", "close": 98.0, "tactical": 0.1, "r20": -0.02, "rsi": 50, "foreign_streak": -5,
               "factors": {"trend": 0.6, "momentum": 0.1}, "overall": 0.1}
     acc, weak = market.momentum_lists([strong, fading], {"A": 0.2, "B": 0.4})
-    assert [r["symbol"] for r in acc] == ["A"] and "短線分數上升" in acc[0]["tags"]
-    assert [r["symbol"] for r in weak] == ["B"] and {"短線分數下滑", "跌破月線", "外資連賣"} <= set(weak[0]["tags"])
+    assert [r["symbol"] for r in acc] == ["A"] and "籌碼分數上升" in acc[0]["tags"]
+    assert [r["symbol"] for r in weak] == ["B"] and {"籌碼分數下滑", "跌破月線", "外資連賣"} <= set(weak[0]["tags"])
     al = market.alerts({"risk": 75.0, "risk_prev": 60.0, "regime": "bear", "regime_prev_run": "pullback", "foreign_streak": -10,
                         "maint": 1.38, "vix_term": 1.1, "fut_pct": 0.0, "fut_net": -100000.0, "soxx_r20": -0.2})
     titles = [a["title"] for a in al]
@@ -876,28 +838,6 @@ def _noise_frames(n_stocks=30, n=500, edge=0.0):
         close = pd.Series(100 * np.exp(np.cumsum(rng.normal(0, 0.01, n) + edge * lvl * 0.004)), index=idx)
         frames[f"S{i}"] = pd.DataFrame({"close": close, "t_1w": score, "t_1m": score, "t_1q": score})
     return frames
-
-
-def test_fit_slopes_follows_the_evidence():
-    none = market.fit_slopes(_noise_frames(edge=0.0), {"1w": 5})["1w"]
-    assert abs(none["fit"]) < 0.04 and none["k"] <= 0.04                            # no skill -> about the floor
-    assert none["brier"] <= none["brier_fixed"]                                     # and that beats the fixed slope
-    real = market.fit_slopes(_noise_frames(edge=1.0), {"1w": 5})["1w"]
-    assert real["fit"] > none["fit"] + 0.05 and 0.03 <= real["k"] <= 0.22
-    assert market.fit_slopes({"A": _noise_frames(1, 80)["S0"]}, {"1w": 5})["1w"] is None
-
-
-def test_forecast_uses_the_calibrated_slope():
-    base = scoring.forecast(100, 0.02, 1.0, 21)
-    assert base["p_up"] == 0.72
-    scoring.P_SLOPE[21] = 0.05
-    try:
-        cal = scoring.forecast(100, 0.02, 1.0, 21)
-        assert cal["p_up"] == pytest.approx(0.55) and cal["label"] == base["label"]
-        assert 0 < cal["exp_ret"] < base["exp_ret"]                                 # the range leans less, too
-        assert cal["high"] - cal["low"] == pytest.approx(base["high"] - base["low"], abs=0.02)
-    finally:
-        scoring.P_SLOPE.clear()
 
 
 def test_residual_momentum_ignores_what_the_market_explains():
@@ -939,3 +879,104 @@ def test_pick_changes_compare_with_the_previous_week():
     assert only["ref_date"] == "2026-11-10" and only["by_symbol"]["A"]["prev_rank"] == 2
     assert only["by_symbol"]["A"]["weeks"] == 1                                             # same week: still the first
     assert leading.pick_changes(["A"], [], "2026-11-11")["ref_date"] is None
+
+
+# ---------------- 2026-11 review: one slow score, relative strength, price integrity, flags ----------------
+def test_forecast_is_a_range_around_todays_price():
+    for sc in (-1, 0, 1):
+        f = scoring.forecast(100, 0.02, sc, 21, p_up=0.57)
+        assert f["exp_ret"] == 0 and f["low"] < 100 < f["high"] and f["p_up"] == 0.57
+    assert scoring.forecast(100, 0.02, 1, 21)["p_up"] is None
+    assert scoring.forecast(100, float("nan"), 0.2, 5)["sigma"] > 0  # NaN vol falls back
+
+
+def test_one_slow_score_and_the_auxiliary_reads():
+    tf = scoring.tech_frame(make_df(trend(400, 0.003)))
+    assert tf["t_1w"].equals(tf["t_slow"]) and tf["t_1q"].equals(tf["t_slow"])
+    assert tf["hi52"].dropna().le(1.0 + 1e-9).all()
+    tw = scoring.score_stock(tf, 0.8, -0.5, 0.0, tech=0.4)
+    us = scoring.score_stock(tf, 0.8, -0.5, 0.0, slow_chips=True, tech=0.4)
+    assert {f["score"] for f in tw["horizons"].values()} == {round(0.60 * 0.4 + 0.25 * 0.8 + 0.15 * -0.5, 3)}
+    assert us["horizons"]["1w"]["score"] == pytest.approx(0.80 * 0.4 + 0.05 * 0.8 + 0.15 * -0.5, abs=2e-3)
+    assert tw["tactical"] == 0.8 and tw["structural"] == pytest.approx(-0.5)   # chips, fundamentals
+    assert us["tactical"] is None and us["structural"] == pytest.approx(0.7 * -0.5 + 0.3 * 0.8)
+    assert scoring.score_stock(tf, 0.8, -0.5, 0.3, tech=0.4)["overall"] == tw["overall"]  # buzz weighs nothing
+    assert scoring.setup_tag(0.3, 0.4) == "基本面與籌碼同步偏多"
+    assert scoring.setup_tag(0.3, 0.4, tactical_prev=0.0) == "基本面佳，籌碼剛轉強"
+    assert scoring.setup_tag(-0.3, 0.4) == "基本面佳但籌碼偏弱"
+
+
+def test_tech_panel_ranks_within_the_market():
+    idx = pd.bdate_range("2025-01-01", periods=3)
+    mk = lambda slow, hi: pd.DataFrame({"t_slow": slow, "hi52": hi}, index=idx)  # noqa: E731
+    frames = {"A": mk([0.9] * 3, [0.5] * 3), "B": mk([0.1] * 3, [1.0] * 3), "C": mk([-0.5] * 3, [0.7] * 3)}
+    us = scoring.tech_panel(frames, "US").iloc[-1]
+    assert us["A"] == pytest.approx(1.0) and us["C"] == pytest.approx(2 / 3 * 0.5 * 2 - 1)
+    tw = scoring.tech_panel(frames, "TW").iloc[-1]
+    assert tw["B"] > us["B"] and tw["A"] < us["A"]                              # the 52-week high moves B up
+
+
+def _rel_world(edge, n_stocks=40, n=500):
+    rng = np.random.default_rng(11)
+    idx = pd.bdate_range("2023-01-02", periods=n)
+    lv = pd.Series(np.linspace(-1, 1, n_stocks), index=[f"S{i}" for i in range(n_stocks)])
+    panel = pd.DataFrame({s: [v] * n for s, v in lv.items()}, index=idx)
+    market = np.cumsum(rng.normal(0.001, 0.01, n))                             # a rising market for everyone
+    closes = pd.DataFrame({s: 100 * np.exp(market + np.cumsum(rng.normal(0, 0.01, n) + edge * v * 0.002))
+                           for s, v in lv.items()}, index=idx)
+    return panel, closes
+
+
+def test_fit_relative_finds_skill_only_where_it_exists():
+    none = market.fit_relative(*_rel_world(0.0), {"1m": 21})["1m"]
+    assert none["k"] < 0.05 and not none["edge"] and none["base_up"] > 0.5      # the market rose; no skill
+    real = market.fit_relative(*_rel_world(1.0), {"1m": 21})["1m"]
+    assert real["k"] > 0.1 and real["edge"] and real["brier"] < real["brier_coin"]
+    assert sum(b["n"] for b in real["bins"]) == real["n"]
+    assert market.p_beat(1.0, 0.1) == pytest.approx(0.6) and market.p_beat(-1.0, 0.5) == 0.3
+
+
+def test_sanitize_removes_bad_bars_and_adjusts_actions():
+    from pipeline import prices
+    idx = pd.bdate_range("2026-08-03", periods=40)
+    c = pd.Series(100.0, index=idx)
+    c.iloc[20:] = 34.0                                       # 1-for-3 split on idx[20]
+    c.iloc[10] = 300.0                                       # one bad bar, undone the next day
+    df = pd.DataFrame({"open": c, "high": c, "low": c, "close": c, "volume": 1.0})
+    sunday = pd.DataFrame({"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0], "volume": [1.0]},
+                          index=[pd.Timestamp("2026-08-09")])
+    df = pd.concat([df, sunday]).sort_index()
+    ev = {idx[20].strftime("%Y-%m-%d"): 0.34}
+    out, applied, notes, total = prices.sanitize(df, market="TW", code="6669", calendar=idx, events=ev)
+    r = out["close"].pct_change().dropna()
+    assert r.abs().max() < 0.105 and len(out) == 39 and applied and total == pytest.approx(0.34)
+    again, applied2, _, total2 = prices.sanitize(out, market="TW", code="6669", calendar=idx, events=ev, applied=applied)
+    assert total2 == 1.0 and applied2 == applied                              # never applied twice
+    gap = c.copy(); gap.iloc[25:] = 50.0                                       # an unannounced seam
+    seam = pd.DataFrame({"open": gap, "high": gap, "low": gap, "close": gap, "volume": 1.0})
+    fixed, *_ = prices.sanitize(seam.drop(idx[10]), market="TW", code="2330", calendar=idx)
+    assert fixed["close"].pct_change().abs().max() < 0.105
+    us = pd.DataFrame({"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0},
+                      index=pd.DatetimeIndex(["2025-05-23", "2025-05-26", "2025-05-27"]))
+    assert list(prices.sanitize(us, market="US")[0].index.day) == [23, 27]    # Memorial Day
+    assert pd.Timestamp("2026-04-03").date() in prices.nyse_holidays(2026)      # Good Friday
+
+
+def test_trading_flags_and_insider_parsing():
+    fl = twse.parse_trading_flags(
+        [{"Code": "3189", "DispositionPeriod": "115/11/10～115/11/16", "DispositionMeasures": "第一次處置", "ReasonsOfDisposition": "連續三次"}],
+        [{"Code": "", "NumberOfAnnouncement": "0"}, {"Code": "2455", "NumberOfAnnouncement": "2", "TradingInfoForAttention": "x", "Date": "1151113"}],
+        [{"Code": "6108", "RecentlyMetAttentionSecuritiesCriteria": "連續二次"}],
+        [{"Code": "00878", "Date": "1151117", "Exdividend": "息", "CashDividend": "1.250000"}])
+    assert fl["3189"]["punish"] == {"from": "2026-11-10", "to": "2026-11-16", "measure": "第一次處置", "reason": "連續三次"}
+    assert fl["2455"]["notice"]["count"] == 2 and "" not in fl and fl["6108"]["near_punish"] == "連續二次"
+    assert fl["00878"]["exdiv"] == {"date": "2026-11-17", "kind": "息", "cash": 1.25}
+
+
+def test_previous_week_picks_ignore_the_same_week():
+    from pipeline import leading
+    c = [{"date": "2026-11-04", "picks": [{"symbol": "A"}]}, {"date": "2026-11-11", "picks": [{"symbol": "B"}]},
+         {"date": "2026-11-13", "picks": [{"symbol": "C"}]}]
+    assert leading.previous_week_picks(c, "2026-11-13") == {"A"}
+    assert leading.previous_week_picks(c, "2026-11-18") == {"C"}
+    assert leading.previous_week_picks([], "2026-11-18") == set()

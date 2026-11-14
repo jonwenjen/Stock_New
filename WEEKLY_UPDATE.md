@@ -79,9 +79,9 @@
 - `market`：四段，各以 `### ` 開頭，合計 500–1,300 字。
 - `market` 的籌碼面要帶到融資維持率：`tw_flow.maint` 是比值（1.48 = 148%，為估算值）、`maint_chg5` 是一週變化
   （0.05 = 5 個百分點）、`maint_cushion` 是整體擔保品距 130% 追繳線還能跌多少。說它是估算，不要寫成官方數字。
-- digest 的 `leading` 是領先指標卡片（ADR 溢價、匯率、實質利率、VIX 期限結構、廣度、散戶小台、Put/Call、借券）。
-  可在籌碼面引用 `value_text` 與 `change_text`，但它們的偏多／偏空只是市場常見解讀，未經本站資料驗證，
-  要寫成「一般解讀為」而不是定論。卡片很多，挑 4–6 個與結論最相關的寫，不要逐一列舉。
+- digest 的 `leading` 是領先指標卡片，每張有 `evidence`（`grade` A 有支持／B 證據弱／C 無證據／D 歷史不足，
+  `pct` 是目前數值高於一年中多少比例的日子）。只有 A、B 級的卡可以寫方向；C、D 級只能描述數值與它在一年中的位置，
+  不可寫成偏多或偏空的訊號。卡片很多，挑 4–6 個與結論最相關的寫，不要逐一列舉。
 - `regime` 是風險環境（`state`：risk_on 風險偏好／risk_off 風險趨避／mixed 輪動觀望，由高收益債利差 `oas`
   與半導體相對強弱 `semis_lead` 判定），在展望或 `etf` 段落交代一句。`options` 是台指選擇權下一個結算日的
   `put_wall`（下檔支撐）、`call_wall`（上檔壓力）、`max_pain`，可在一週展望引用。`trust_first` 是投信首買名單。
@@ -91,13 +91,23 @@
   台股名單包含成交金額前 30 檔上櫃股（symbol 以 .TWO 結尾），提到時註明「上櫃」。
   `picks_track` 是過去精選名單的實際表現，有資料時在操作建議中如實交代，  落後大盤也要寫。
 - `market` 也要用到 `market_safety`：「本週盤勢重點」帶出風險分數（`risk.score`、`risk.name`，並說明最高的兩三項
-  `risk.parts`）與市場週期（`regime.name`、`regime.days`）；「籌碼面」帶出外資台指期（`futures.net_oi`、`futures.chg5`）；
+  `risk.parts`）與市場週期（`regime.name`、`regime.days`）。風險分數衡量的是短期回檔風險，`risk.buckets[].dd20`
+  是各等級之後 20 日內跌逾 5% 的歷史比例；它分辨不了之後的報酬，不要寫成漲跌預測。持股水位只能寫成
+  「此等級對應的經驗區間（未經驗證）」，不可寫「建議降低持股」之類的指令句。
+  「籌碼面」帶出台指期法人部位：外資 `futures.net_oi`、投信 `futures.trust_oi`、三大法人合計 `futures.all_oi`。
+  外資淨空單主要是投信槓桿 ETF 多單的對手，不要單獨解讀為外資看空，也不要寫「一年最空」；
   「操作建議與風險」依 `alerts` 中 level 2 的項目提醒，並可從 `accumulating`、`weakening` 各舉一兩檔。
   `accuracy` 顯示模型區分力有限時（`brier` 不低於 `base_brier`）要照實說，不要把機率寫得比數據更有把握。
 - 個股不再有「上漲機率」。digest 的 `calibration` 是各市場各期間跑贏中位數的斜率 `k` 與 `edge`（樣本外是否有優勢）；
   美股 `edge` 為 false 時要寫明「美股排名沒有可驗證的選股優勢」。指數的 `horizons[].p_up` 是近 5 年的歷史上漲比率，
   不是預測，寫的時候要這樣稱呼。`calendar` 是接下來兩週的除權息、處置到期、結算與公布截止日，在操作建議中挑相關的帶一句。
   `picks_diff` 是與上一週精選名單的差異（`new` 新進檔數、`dropped` 移出名單），可在操作建議中交代。
+- `weekly` 是和上一個 ISO 週快照的比較（`risk` 的變化與主要原因、`cards` 位置大幅移動的指標、`picks_in`、
+  `picks_out` 與原因）。`ref` 為 null 時代表還沒有上週的快照，不要自己推算「上週」。
+- 精選有 `watch_first`（先觀察的原因：股東少、平穩急漲、停損過遠）時，在操作建議中點名並說明原因，不要寫成看空。
+- `selection_bias` 是用今日名單回測的高估程度（`today` 對 `pit`）；提到回測或優勢時要說明它是上限。
+- `portfolio` 是精選放在一起的風險（`beta`、`vol`、`loss95_1m` 一個月 95% 虧損界線、`avg_corr`），可在操作建議中帶一句。
+- 下列字詞已停用，`check_ai` 會擋下：上漲機率、一月目標、風險報酬比、建議降低持股、建議持股。
 - `podcast.overview`：這兩週節目在談什麼主題（依 `podcast_hot[].episodes` 的標題與摘要），
   以及被談論的標的整體是強是弱。
 - `podcast.stocks`：`podcast_hot` 前 8 檔各寫一則（鍵用 `symbol` 欄位，至少要涵蓋前 5 檔）。

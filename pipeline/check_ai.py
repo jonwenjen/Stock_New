@@ -43,6 +43,11 @@ def validate(ai: dict, data_date: str, hot_symbols: list[str], need_fund: bool =
     if need_fund and len(ai.get("fund") or "") < 150:
         errs.append("fund commentary is missing or too short (< 150 characters)")
     blob = json.dumps(ai, ensure_ascii=False)
+    # Wording the five-team review (2026-11-14) retired: the site has no stock-level up probability,
+    # no price target, and gives no instructions about holdings.
+    for phrase in ("上漲機率", "一月目標", "風險報酬比", "建議降低持股", "建議持股"):
+        if phrase in blob:
+            errs.append(f"retired wording found: {phrase}")
     for marker in ("TODO", "TBD", "XXX"):
         if marker in blob:
             errs.append(f"placeholder text found: {marker}")

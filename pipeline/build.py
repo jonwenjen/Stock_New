@@ -1543,9 +1543,12 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         frames, tframes, stocks, meta, flows, lead, tw_flow, records, tactical_prev, indices_out,
         trading_days[-1], today), None) or read_json(DATA / "market.json", {})
     narrative = build_narrative(indices_out, tw_flow, picks, bullish, bearish, (mkt or {}).get("risk"))
+    weekly = safe("每週快照與本週變化", lambda: weekly_snapshot(trading_days[-1], mkt, lead, picks, records), None)
+    portfolio = safe("精選組合風險", lambda: portfolio_panel(picks, records, tframes, frames), None)
+
     def brief(r: dict) -> dict:
         out = {k: r.get(k) for k in ("code", "name", "market", "industry", "close", "chg5d", "r20", "overall", "label",
-                                     "tactical", "structural", "setup", "rank", "reasons", "risks")}
+                                     "tactical", "structural", "setup", "rank", "reasons", "risks", "watch_first")}
         fl = r.get("flags") or {}
         out["p_beat_1m"] = r["horizons"]["1m"].get("p_beat")
         out["official_flags"] = [k for k in ("punish", "notice", "near_punish", "exdiv") if fl.get(k)]
@@ -1556,7 +1559,10 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         "indices": [{k: i.get(k) for k in ("name", "close", "chg5d", "r20", "ytd", "rsi", "horizons")}
                     for i in indices_out],
         "tw_flow": tw_flow, "narrative": narrative, "backtest": bt,
-        "leading": [{k: c.get(k) for k in ("name", "value_text", "change_text", "reading")} for c in lead["cards"]],
+        "leading": [{**{k: c.get(k) for k in ("name", "value_text", "change_text", "reading", "tone")},
+                     "evidence": {k: (c.get("evidence") or {}).get(k) for k in ("grade", "text", "pct")}} for c in lead["cards"]],
+        "weekly": weekly, "selection_bias": sel_bias,
+        "portfolio": {mk: {k: v for k, v in x.items() if k != "weights"} for mk, x in (portfolio or {}).items()},
         "regime": lead.get("regime"), "calibration": {mk: {h: {k: v[k] for k in ("k", "edge", "base_up", "brier", "brier_coin")}
                                                          for h, v in c.items()} for mk, c in CALIB.items()},
         "picks_diff": picks_diff, "calendar": build_calendar(trading_days[-1], flags, meta),
@@ -1740,8 +1746,6 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                                            else ("pe", "eps_ttm", "rev_yoy"))} for mk in ("TW", "US")},
                "behind": {mk: [r["symbol"] for r in records if r["market"] == mk and newest[mk] is not None
                                and pd.Timestamp(r["date"]) < newest[mk]] for mk in ("TW", "US")}}
-    weekly = safe("每週快照與本週變化", lambda: weekly_snapshot(trading_days[-1], mkt, lead, picks, records), None)
-    portfolio = safe("精選組合風險", lambda: portfolio_panel(picks, records, tframes, frames), None)
     safe("證交所 除權息歷史回補（供下週使用）", lambda: backfill_tw_actions(today), None, "https://www.twse.com.tw")
     write_json(DATA / "summary.json", {
         "generated_at": now.isoformat(timespec="seconds"), "data_date": trading_days[-1],

@@ -405,6 +405,13 @@ def score_stock(tf: pd.DataFrame, chips: float | None, fund: float | None,
         "fund": None if fund is None else round(fund, 3),
         "buzz": None if buzz is None else round(buzz, 3),
     }
+    # What each group adds to the composite (all horizons share one set of weights): the drawer shows
+    # these so the rank can be read off, rather than the trend/momentum details that do not enter it.
+    w1 = weights["1m"]
+    used = {k: v for k, v in (("tech", t), ("chips", chips), ("fund", fund)) if v is not None and w1.get(k)}
+    tot = sum(w1[k] for k in used)
+    out["contrib"] = {k: round(w1[k] * v / tot, 3) for k, v in used.items()} if tot else {}
+    out["factors"]["tech"] = round(t, 3)
     # Two auxiliary reads, neither of which feeds the score again: daily-updated positioning
     # ("chips", Taiwan only) and filed fundamentals (plus US filed holdings).
     tactical = None if slow_chips else chips

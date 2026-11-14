@@ -1288,6 +1288,17 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         rec["reasons"] = [t for t, w in sorted(allnotes, key=lambda x: -x[1]) if w > 0][:4]
         rec["risks"] = [t for t, w in sorted(allnotes, key=lambda x: x[1]) if w < 0][:3]
         rec["plan"] = scoring.trade_plan(row, sc["horizons"]["1m"], sc["overall"])
+        # 先觀察 (review 2026-11-14: product-5 + quant-6 + chips-3): facts a buyer should weigh before
+        # following the rank. Weight 0; the conditions were fixed before any test and are archived weekly.
+        watch = []
+        holders = (rec.get("tdcc") or {}).get("holders")
+        if holders and holders < 10000:
+            watch.append(f"股東只有 {holders:,} 人")
+        if (rec.get("r60") or 0) >= 0.30 and (rec.get("vol_ann") or 1) <= 0.35:
+            watch.append(f"平穩急漲（60 日 {rec['r60']:+.0%}、年化波動 {rec['vol_ann']:.0%}）")
+        if (rec["plan"].get("stop_pct") or 0) > 0.15:
+            watch.append(f"停損距離 {rec['plan']['stop_pct']:.0%}")
+        rec["watch_first"] = watch or None
         rec["bars"] = len(df)
         records.append(rec)
 
@@ -1428,8 +1439,22 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     # One cohort per ISO week: a re-run within the week replaces that week's list.
     wk = lambda d: dt.date.fromisoformat(d).isocalendar()[:2]  # noqa: E731
     cohorts = [c for c in read_json(DATA / "history" / "picks.json", []) if wk(c["date"]) != wk(trading_days[-1])]
+    # A pick's stop is set when it enters and afterwards only moves up (review 2026-11-14, risk-4):
+    # re-deriving it each week from a rising moving average let it drift lower than where it began.
+    last_cohort = {x["symbol"]: x for x in (cohorts[-1]["picks"] if cohorts else [])}
+    for r in picks:
+        ps, pl = last_cohort.get(r["symbol"], {}).get("stop"), r.get("plan") or {}
+        if ps and pl.get("stop") is not None and ps > pl["stop"]:
+            if ps < r["close"]:
+                pl["stop"], pl["stop_pct"] = ps, round((r["close"] - ps) / r["close"], 4)
+                pl["size"] = min(scoring.MAX_POSITION, scoring.RISK_BUDGET / pl["stop_pct"])
+                pl["stop_note"] = "沿用入選以來最高的停損（只上移、不下移）"
+            else:
+                pl["stop_hit"] = ps
+                r["risks"] = [f"收盤已低於先前的停損 {ps:,.2f}"] + r["risks"][:2]
     cohorts.append({"date": trading_days[-1],
-                    "picks": [{"symbol": r["symbol"], "name": r["name"], "market": r["market"], "close": r["close"]}
+                    "picks": [{"symbol": r["symbol"], "name": r["name"], "market": r["market"], "close": r["close"],
+                               "stop": (r.get("plan") or {}).get("stop"), "watch": r.get("watch_first")}
                               for r in picks]})
     cohorts = cohorts[-60:]
     write_json(DATA / "history" / "picks.json", cohorts)

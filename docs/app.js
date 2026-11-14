@@ -592,23 +592,27 @@
     body.push(h("div", { class: "panel" }, priceChart(symbol, { range: "6m", plan: r && r.plan })));
     if (item.horizons) body.push(h("div", { class: "panel" }, h("h3", {}, "相對強弱與區間", help("labels", "預測標籤")), forecastGrid(item.horizons, r)));
     if (r) {
-      const F = [["trend", "趨勢"], ["momentum", "動能"], ["chips", "籌碼"], ["fund", "基本面"], ["buzz", "聲量"]];
+      const F = [["tech", "技術（慢速分數＋距 52 週高點）"], ["chips", "籌碼"], ["fund", "基本面"]];
+      const W = ((r.market === "US" ? S.weights_us : S.weights) || {})["1m"] || {};
+      const C = r.contrib || {};
       body.push(h("div", { class: "grid g2" },
-        h("div", { class: "panel" }, h("h3", {}, "因子分數（−1 至 +1）", help("score", "分數")), h("div", { class: "factors" },
+        h("div", { class: "panel" }, h("h3", {}, "排名從哪裡來（−1 至 +1）", help("score", "分數")), h("div", { class: "factors" },
           F.map(([k, t]) => [h("span", {}, t), ok(r.factors[k]) ? meter(r.factors[k]) : h("span", { class: "muted small" }, "無資料"),
             h("span", { class: "num " + cls(r.factors[k]) }, ok(r.factors[k]) ? signed(r.factors[k], 2) : "–")]),
-          h("span", {}, h("b", {}, "綜合")), meter(r.overall), h("b", { class: "num " + cls(r.overall) }, signed(r.overall, 2)),
-          ...(ok(r.tactical) || ok(r.structural) ? [["tactical", "籌碼分"], ["structural", "基本面分"]].flatMap(([k, t]) =>
-            [h("span", {}, t), ok(r[k]) ? meter(r[k]) : h("span", { class: "muted small" }, "無資料"),
-              h("span", { class: "num " + cls(r[k]) }, ok(r[k]) ? signed(r[k], 2) : "–")]) : [])),
+          h("span", {}, h("b", {}, "綜合")), meter(r.overall), h("b", { class: "num " + cls(r.overall) }, signed(r.overall, 2))),
+          h("p", { class: "small", style: "margin-top:8px" }, `綜合 ${signed(r.overall, 2)} ＝ ` + F.filter(([k]) => ok(C[k])).map(([k, t]) => `${t.replace(/（.*）/, "")} ${signed(C[k], 2)}`).join(" ＋ ")
+            + `（權重 技術 ${num(W.tech || 0, 2)}・籌碼 ${num(W.chips || 0, 2)}・基本面 ${num(W.fund || 0, 2)}，缺資料的項目不計）`),
+          h("p", { class: "small muted" }, `參考（不直接計分）：趨勢 ${ok(r.factors.trend) ? signed(r.factors.trend, 2) : "–"}・動能 ${ok(r.factors.momentum) ? signed(r.factors.momentum, 2) : "–"}・Podcast 聲量 ${ok(r.factors.buzz) ? signed(r.factors.buzz, 2) : "–"}（權重 0）`),
           r.setup ? h("p", { style: "margin-top:10px" }, h("span", { class: "chip mk" }, r.setup)) : null,
-          h("p", { class: "chart-note", style: "margin-top:8px" }, "籌碼分只看每天更新的外資、投信、融資；基本面分只看財報與申報持股。兩者都還沒有足夠歷史驗證。", help("tactical", "籌碼分與基本面分"))),
+          h("p", { class: "chart-note", style: "margin-top:8px" }, "籌碼與基本面的權重都還沒有用足夠歷史驗證，實際影響也不同：拿掉籌碼，台股前 12 名會換 4 檔；拿掉基本面只換 1 檔。本站從 2026 年 11 月起保存個股法人與收盤資料，累積後再依事先寫好的規則決定權重。", help("tactical", "籌碼分與基本面分"))),
         h("div", { class: "panel" }, h("h3", {}, "多空理由"),
           h("ul", { class: "why" }, r.reasons.map((t) => h("li", { class: "pro" }, t)), r.risks.map((t) => h("li", { class: "con" }, t)),
             !r.reasons.length && !r.risks.length ? h("li", { class: "muted" }, "目前沒有明顯訊號") : null))));
       body.push(h("div", { class: "panel" }, h("h3", {}, "參考價位與操作", help("size", "建議部位上限")),
         h("div", { class: "plan" }, planCells(r)),
         h("p", { class: "stance", style: "margin-top:10px" }, r.plan.stance),
+        r.watch_first ? h("p", { class: "small" }, h("span", { class: "chip warn" }, "先觀察"), " " + r.watch_first.join("；") + "。這些不代表會漲或會跌，是買進前要先想清楚的事實：股東少、漲得平穩又急的股票，反轉時可能連續跳空穿過停損；停損很遠代表同樣的虧損預算只能買很少。") : null,
+        r.plan.stop_note || r.plan.stop_hit ? h("p", { class: "small muted" }, r.plan.stop_hit ? `收盤已低於先前的停損 ${px(r.plan.stop_hit)}。` : r.plan.stop_note) : null,
         h("p", { class: "chart-note" }, "+1σ 上緣只是波動區間的上緣，不是目標價：排名前段的股票一個月內觸及它的比例約 36%。停損用來控制虧損與波動，不是預測：回測中被停損的股票，一個月後有 66% 價格高於出場價。部位大小比停損更重要。" +
           (ok(r.plan.size) ? `部位上限＝1% ÷ 停損距離：就算停損出場，這一檔也只讓整體資金虧 1%。以 100 萬資金為例，這檔最多約 ${num(r.plan.size * 100, 0)} 萬。` : ""))));
       const kv = r.kind === "etf"
@@ -858,7 +862,8 @@
             h("div", { class: "pick-px" }, h("div", { class: "p num" }, px(r.close)), h("div", { class: "num small " + cls(r.chg5d) }, "週 " + pct(r.chg5d)))),
           h("div", { class: "scorebar" }, "綜合", meter(r.overall), h("b", { class: "num " + cls(r.overall) }, signed(r.overall, 2)),
             h("span", { class: "chip mk" }, rankText(r)), r.kept ? h("span", { class: "chip", title: "排名仍在緩衝範圍內，續留名單" }, "續留") : null),
-          tagChips(r, 3),
+          r.watch_first ? h("div", { class: "tags" }, h("span", { class: "chip warn", title: "不代表會漲或會跌：買進前要先想清楚的事實" }, "先觀察：" + r.watch_first.join("・"))) : null,
+          tagChips(r, r.watch_first ? 2 : 3),
           h("div", { class: "hz" }, relText(r) || "", dual(r)),
           h("ul", { class: "why" }, r.reasons.slice(0, 3).map((t) => h("li", { class: "pro" }, t)), r.risks.slice(0, 2).map((t) => h("li", { class: "con" }, t))),
           h("div", { class: "plan" }, planCells(r)),

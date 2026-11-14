@@ -17,6 +17,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from . import funds, http, indicators, leading, market, media, prices, research, scoring, tpex, twse, us_data
@@ -75,6 +76,44 @@ def read_json(path: Path, default):
 def write_json(path: Path, obj) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(_clean(obj), ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+
+
+def shard_put(folder: str, rows: dict[str, dict]) -> None:
+    """Add days to monthly archive shards, history/<folder>/YYYY-MM.json = {"codes": [...], "rows":
+    {date: [value per code]}}. Days already archived are left alone and only shards that gain a day
+    are rewritten, so the weekly commit stays small however long the archive grows."""
+    by_month: dict[str, dict] = {}
+    for d, row in rows.items():
+        by_month.setdefault(d[:7], {})[d] = row
+    for month, days in by_month.items():
+        path = DATA / "history" / folder / f"{month}.json"
+        sh = read_json(path, {"codes": [], "rows": {}})
+        new = sorted(d for d in days if d not in sh["rows"])
+        if not new:
+            continue
+        pos = {c: i for i, c in enumerate(sh["codes"])}
+        for d in new:
+            for c in days[d]:
+                if c not in pos:
+                    pos[c] = len(sh["codes"])
+                    sh["codes"].append(c)
+            sh["rows"][d] = [days[d].get(c) for c in sh["codes"]]
+        write_json(path, sh)
+
+
+def shard_get(folder: str) -> dict[str, dict]:
+    """Read a monthly archive back as {date: {code: value}}."""
+    out: dict[str, dict] = {}
+    for path in sorted((DATA / "history" / folder).glob("*.json")):
+        sh = read_json(path, {})
+        codes = sh.get("codes") or []
+        for d, row in (sh.get("rows") or {}).items():
+            out[d] = {c: v for c, v in zip(codes, row) if v is not None}
+    return out
+
+
+def shard_days(folder: str) -> set[str]:
+    return {d for path in (DATA / "history" / folder).glob("*.json") for d in (read_json(path, {}).get("rows") or {})}
 
 
 def _clean(o):
@@ -261,6 +300,7 @@ def stock_flows(trading_days: list[str]) -> tuple[list[str], dict[str, list[tupl
     for d, table in twse.fetch_days(need, twse.inst_stocks, "T86", log).items():
         store[d] = {c: [round(v[0] / 1000), round(v[1] / 1000)] for c, v in table.items()
                     if twse.tracked(c) and (v[0] or v[1])}
+    shard_put("stock_flows_tw", store)  # kept for good: validating the chips weight needs a long history
     store = {d: store[d] for d in sorted(store)[-(n + 10):]}
     if not store:
         raise RuntimeError("no per-stock institutional data")
@@ -601,6 +641,7 @@ def otc_stock_flows(trading_days: list[str]) -> tuple[list[str], dict[str, list[
     for d, table in tpex_days(need, tpex.inst_stocks, "OTC institutional").items():
         store[d] = {c: [round(v[0] / 1000), round(v[1] / 1000)] for c, v in table.items()
                     if tpex.COMMON_STOCK.match(c) and (v[0] or v[1])}
+    shard_put("stock_flows_otc", store)
     store = {d: store[d] for d in sorted(store)[-(n + 10):]}
     write_json(path, store)
     dates = sorted(store)[-n:]
@@ -730,14 +771,24 @@ def update_tw_prices(trading_days: list[str], universe: list[str], actions: dict
     pit_path = DATA / "history" / "tw_universe_pit.json"
     pit = read_json(pit_path, {})
     # Days fetched in earlier runs sit in the local cache: archive those too, not just today's fetches.
+    # The closes of every listed common stock go to monthly shards (history/pit_closes), so a later
+    # back-test can follow stocks that have since left the universe - no extra requests.
     cached = {f.stem: f for f in DAY_CACHE.glob("*.json")} if DAY_CACHE.exists() else {}
+    have_closes, new_closes = shard_days("pit_closes"), {}
     for d in sorted(set(tables) | set(cached)):
-        table = None if d in pit else (tables.get(d) or read_json(cached[d], {}))
-        if table:
+        if d in pit and d in have_closes:
+            continue
+        table = tables.get(d) or read_json(cached[d], {})
+        if not table:
+            continue
+        if d not in pit:
             vals = sorted(((c, bar[3] * bar[4]) for c, bar in table.items() if twse.COMMON_STOCK.match(c)),
                           key=lambda x: -x[1])
             pit[d] = [c for c, _ in vals[:150]]
+        if d not in have_closes:
+            new_closes[d] = {c: round(bar[3], 2) for c, bar in table.items() if twse.COMMON_STOCK.match(c) and bar[3]}
     write_json(pit_path, {d: pit[d] for d in sorted(pit)[-1300:]})
+    shard_put("pit_closes", new_closes)
     day_rows: dict[str, list] = {}
     for d, table in sorted(tables.items()):
         for code, bar in table.items():
@@ -1296,7 +1347,12 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     bullish = sorted(records, key=lambda r: -r["overall"])[:12]
     bearish = sorted(records, key=lambda r: r["overall"])[:12]
     # Back-tests per market: the US had no measurable edge, which a pooled number would hide.
-    bt = {mk: scoring.backtest({s: tframes[s] for s in syms}) for mk, syms in by_mkt.items() if len(syms) >= 25}
+    bt = {mk: scoring.backtest({s: tframes[s] for s in syms}, panel=panels.get(mk)) for mk, syms in by_mkt.items()
+          if len(syms) >= 25}
+    # ...on today's universe, which flatters it: measure by how much against the point-in-time list
+    sel_bias = safe("選樣偏誤（今日名單對當時名單）", lambda: research.selection_bias(
+        read_json(DATA / "history" / "tw_universe_pit.json", {}), shard_get("pit_closes"),
+        [s.split(".")[0] for s in by_mkt.get("TW", []) if s.endswith(".TW")]), None)
 
     # ---- 8b. ETFs and podcast-hot names -------------------------------------
     etf_records = []
@@ -1659,6 +1715,8 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                                            else ("pe", "eps_ttm", "rev_yoy"))} for mk in ("TW", "US")},
                "behind": {mk: [r["symbol"] for r in records if r["market"] == mk and newest[mk] is not None
                                and pd.Timestamp(r["date"]) < newest[mk]] for mk in ("TW", "US")}}
+    weekly = safe("每週快照與本週變化", lambda: weekly_snapshot(trading_days[-1], mkt, lead, picks, records), None)
+    portfolio = safe("精選組合風險", lambda: portfolio_panel(picks, records, tframes, frames), None)
     safe("證交所 除權息歷史回補（供下週使用）", lambda: backfill_tw_actions(today), None, "https://www.twse.com.tw")
     write_json(DATA / "summary.json", {
         "generated_at": now.isoformat(timespec="seconds"), "data_date": trading_days[-1],
@@ -1668,6 +1726,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         "picks": [slim(r) for r in picks],
         "bullish": [slim(r) for r in bullish], "bearish": [slim(r) for r in bearish],
         "backtest": bt, "backtest_imom": bt_imom, "calibration": CALIB, "picks_diff": picks_diff,
+        "selection_bias": sel_bias, "weekly": weekly, "portfolio": portfolio,
         "weights": scoring.WEIGHTS, "weights_us": scoring.WEIGHTS_SLOW_CHIPS,
         "sources": SOURCES, "picks_track": track,
         "counts": {"tw": sum(r["market"] == "TW" for r in records),
@@ -1678,6 +1737,95 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         f"{len(hot)} podcast-hot, "
         f"failed sources: {bad or 'none'}")
     return 0
+
+
+def portfolio_panel(picks: list[dict], records: list[dict], tframes: dict, frames: dict) -> dict:
+    """The picks held together, per market and combined in TWD at a 60/40 split (review 2026-11-14, risk-1)."""
+    fx = frames["USDTWD"]["close"].pct_change() if "USDTWD" in frames else None
+    out: dict = {}
+    parts = []
+    for mk, bench in (("TW", "TWII"), ("US", "SPX")):
+        ps = [r for r in picks if r["market"] == mk and r["symbol"] in tframes]
+        if len(ps) < 2 or bench not in frames:
+            continue
+        w = research.pick_weights([(r.get("plan") or {}).get("stop_pct") for r in ps])
+        rets = pd.DataFrame({r["symbol"]: tframes[r["symbol"]]["close"].pct_change() for r in ps}).tail(250)
+        res = research.portfolio_risk(rets, w, frames[bench]["close"].pct_change())
+        if not res:
+            continue
+        uni = [r for r in records if r["market"] == mk and r.get("kind") != "etf"]
+        med = lambda rows, k: float(np.nanmedian([r[k] for r in rows if r.get(k) is not None])) if rows else None  # noqa: E731
+        res.update({"weights": {r["symbol"]: round(float(x), 4) for r, x in zip(ps, w)},
+                    "hi52": med(ps, "hi52"), "hi52_all": med(uni, "hi52"), "r60": med(ps, "r60"), "r60_all": med(uni, "r60")})
+        out[mk] = res
+        if mk == "US" and fx is not None:
+            rets = ((1 + rets).mul(1 + fx.reindex(rets.index).fillna(0.0), axis=0) - 1)  # what a TWD investor gets
+        parts.append((0.6 if mk == "TW" else 0.4, rets, w))
+    if len(parts) == 2:
+        rets = pd.concat([p[1] for p in parts], axis=1)
+        w = np.concatenate([p[0] * p[2] for p in parts])
+        both = research.portfolio_risk(rets, w, frames["TWII"]["close"].pct_change())
+        if both:
+            out["ALL"] = both
+    return out
+
+
+def weekly_snapshot(data_date: str, mkt: dict | None, lead: dict, picks: list[dict], records: list[dict]) -> dict:
+    """One snapshot per ISO week, history/weekly/<YYYY-Www>.json (review 2026-11-14, product-1).
+
+    A re-run inside the week replaces that week's file; earlier weeks are never rewritten, so
+    "since last week" always means the last snapshot of an earlier week. Returns what changed."""
+    folder = DATA / "history" / "weekly"
+    y, w, _ = dt.date.fromisoformat(data_date).isocalendar()
+    key = f"{y}-W{w:02d}"
+    mkt = mkt or {}
+    risk, fut = mkt.get("risk") or {}, mkt.get("futures") or {}
+    snap = {"week": key, "date": data_date,
+            "risk": {"score": risk.get("score"), "name": risk.get("name"),
+                     "parts": {p["key"]: [p["weight"], p["risk"], p["name"]] for p in risk.get("parts") or []}},
+            "regime": (mkt.get("regime") or {}).get("state"), "breadth": (mkt.get("breadth") or {}).get("value"),
+            "futures": {k: fut.get(k) for k in ("net_oi", "trust_oi", "all_oi")},
+            "cards": {c["key"]: {"name": c["name"], "value": c["value_text"], "tone": c["tone"],
+                                 "grade": (c.get("evidence") or {}).get("grade"), "pct": (c.get("evidence") or {}).get("pct")}
+                      for c in lead.get("cards") or []},
+            "picks": [{"symbol": r["symbol"], "name": r["name"], "rank": r.get("rank")} for r in picks],
+            "ranks": {r["symbol"]: r["rank"] for r in records if r.get("rank")}}
+    write_json(folder / f"{key}.json", snap)
+    earlier = sorted(p.stem for p in folder.glob("*.json") if p.stem < key)
+    if not earlier:
+        return {"week": key, "ref": None}
+    old = read_json(folder / f"{earlier[-1]}.json", {})
+    out: dict = {"week": key, "ref": old.get("week"), "ref_date": old.get("date")}
+    rn, ro = snap["risk"], old.get("risk") or {}
+    if rn.get("score") is not None and ro.get("score") is not None:
+        tot = sum(v[0] for v in rn["parts"].values()) or 1
+        moves = [(k, v[2], ro["parts"][k][1], v[1], v[0] * (v[1] - ro["parts"][k][1]) / tot)
+                 for k, v in rn["parts"].items() if k in (ro.get("parts") or {})]
+        out["risk"] = {"now": rn["score"], "prev": ro["score"], "name": rn["name"], "prev_name": ro.get("name"),
+                       "drivers": [{"name": nm, "from": a, "to": b, "effect": round(e, 1)}
+                                   for _k, nm, a, b, e in sorted(moves, key=lambda m: -abs(m[4]))[:3] if abs(e) >= 0.5]}
+    oc = old.get("cards") or {}
+    out["cards"] = [{"key": k, "name": c["name"], "from": oc[k]["pct"], "to": c["pct"]}
+                    for k, c in snap["cards"].items()
+                    if k in oc and c.get("pct") is not None and oc[k].get("pct") is not None
+                    and abs(c["pct"] - oc[k]["pct"]) >= 0.30]
+    was = {p["symbol"]: p for p in old.get("picks") or []}
+    now = {p["symbol"] for p in snap["picks"]}
+    by_sym = {r["symbol"]: r for r in records}
+
+    def why_out(sym: str) -> str:
+        r = by_sym.get(sym)
+        if not r:
+            return "已不在觀察名單"
+        if (r.get("flags") or {}).get("punish"):
+            return "處置股"
+        rk = r.get("rank")
+        cap = 30 if r["market"] == "TW" else 20
+        return f"排名降到 {rk[0]}／{rk[1]}" if rk and rk[0] > cap else "產業或相關性上限"
+
+    out["picks_in"] = [p for p in snap["picks"] if p["symbol"] not in was]
+    out["picks_out"] = [{"symbol": s_, "name": p["name"], "why": why_out(s_)} for s_, p in was.items() if s_ not in now]
+    return out
 
 
 # ----------------------------- market safety ----------------------------- #

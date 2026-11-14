@@ -229,13 +229,15 @@ RISK_PARTS = [("trend", "趨勢與週期", 20), ("breadth", "市場廣度", 5), 
               ("credit", "信用利差", 10), ("intl", "國際連動", 15), ("liquidity", "美元流動性", 10)]
 RISK_LEVELS = [(30, "低", "s1", "七成以上"), (50, "中等", "s0", "五至七成"),
                (70, "偏高", "s-1", "三至五成"), (101, "高", "s-2", "三成以下")]
+# The budget panel's default stock share for each level: a number, so it can only fall as risk rises.
+EXPOSURE_PCT = {"低": 80, "中等": 60, "偏高": 40, "高": 20}
 
 
 def risk_level(score: float) -> dict:
     for cut, name, tone, exposure in RISK_LEVELS:
         if score < cut:
-            return {"name": name, "tone": tone, "exposure": exposure}
-    return {"name": "高", "tone": "s-2", "exposure": "三成以下"}
+            return {"name": name, "tone": tone, "exposure": exposure, "exposure_pct": EXPOSURE_PCT[name]}
+    return {"name": "高", "tone": "s-2", "exposure": "三成以下", "exposure_pct": EXPOSURE_PCT["高"]}
 
 
 def intl_risk(soxx_r20, ndq_r20, fx_r20):

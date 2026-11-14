@@ -81,3 +81,65 @@ def evidence(x: pd.Series | None, close: pd.Series, orient: int) -> dict:
     grade = "A" if strong and n >= LONG_DAYS and best["halves"] else "B" if strong else "C"
     return {"grade": grade, "text": GRADE_TEXT[grade], "n": n, "pct": pct, "target": best["target"],
             "rho": best["rho"], "t": best["t"], "agree": bool(np.sign(best["rho"]) == np.sign(orient) != 0)}
+
+
+def selection_bias(pit: dict[str, list[str]], closes: dict[str, dict[str, float]], today_codes: list[str],
+                   top: int = 90, max_gap: int = 7, min_days: int = 60) -> dict | None:
+    """How much a back-test on today's universe flatters itself (review 2026-11-14, risk-3 / quant-2).
+
+    Chains day-to-day equal-weight returns of (a) the stocks that were the `top` most traded on each
+    day (point-in-time) and (b) today's universe, over the same days. Pairs of archived days more than
+    `max_gap` calendar days apart are skipped for both. A daily move beyond the 10% price limit is a
+    corporate action in raw prices, not a return, and is left out of both."""
+    days = sorted(d for d in closes if d in pit)
+    pit_g = now_g = 1.0
+    used, first, last = 0, None, None
+    for d0, d1 in zip(days, days[1:]):
+        if (pd.Timestamp(d1) - pd.Timestamp(d0)).days > max_gap:
+            continue
+        c0, c1 = closes[d0], closes[d1]
+
+        def rets(codes):
+            out = [c1[c] / c0[c] - 1 for c in codes if c0.get(c) and c1.get(c)]
+            return [r for r in out if abs(r) <= 0.105]
+
+        a, b = rets(pit[d0][:top]), rets(today_codes)
+        if len(a) < 0.8 * top or len(b) < 0.8 * len(today_codes):
+            continue
+        pit_g *= 1 + float(np.mean(a))
+        now_g *= 1 + float(np.mean(b))
+        used += 1
+        first, last = first or d0, d1
+    if used < min_days:
+        return None
+    return {"from": first, "to": last, "days": used, "pit": round(pit_g - 1, 4), "today": round(now_g - 1, 4)}
+
+
+def pick_weights(stops: list[float | None]) -> np.ndarray:
+    """Default weights inside one market: proportional to min(25%, 1% / stop distance), summing to 1."""
+    raw = np.array([min(0.25, 0.01 / max(s or 0.05, 0.01)) for s in stops], dtype=float)
+    return raw / raw.sum() if raw.sum() else raw
+
+
+def portfolio_risk(rets: pd.DataFrame, weights: np.ndarray, bench: pd.Series) -> dict | None:
+    """Risk of holding the picks together (review 2026-11-14, risk-1).
+
+    rets: daily returns (dates x picks, in the investor's currency); weights sum to 1; bench: the
+    market's daily returns. Volatility and correlation from the last 60 sessions, beta from 120.
+    The one-month 95% loss line is -1.645 sigma sqrt(21/252): an estimate from past volatility,
+    not a floor - early in a sell-off recent volatility understates what follows."""
+    rets = rets.dropna(how="all").fillna(0.0)
+    if len(rets) < 60 or not len(weights):
+        return None
+    r60 = rets.tail(60)
+    cov = r60.cov().to_numpy() * 252
+    vol = float(np.sqrt(weights @ cov @ weights))
+    port = rets.tail(120) @ weights
+    b = bench.reindex(port.index).fillna(0.0)
+    beta = float(np.cov(port, b)[0, 1] / np.var(b, ddof=1)) if np.var(b) > 0 else None
+    corr = r60.corr().to_numpy()
+    n = len(weights)
+    avg_corr = float((corr.sum() - np.trace(corr)) / (n * (n - 1))) if n > 1 else None
+    return {"n": n, "vol": round(vol, 4), "beta": None if beta is None else round(beta, 2),
+            "loss95_1m": round(float(-1.645 * vol * np.sqrt(21 / 252)), 4),
+            "avg_corr": None if avg_corr is None else round(avg_corr, 2)}

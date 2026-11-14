@@ -518,16 +518,19 @@ def factor_ic(scores: dict[str, pd.Series], closes: dict[str, pd.Series], lookba
 # --------------------------------------------------------------------------- #
 # Walk-forward check of the technical score
 # --------------------------------------------------------------------------- #
-def backtest(frames: dict[str, pd.DataFrame], lookback_days: int = 750, step: int = 5) -> dict:
-    """Cross-sectional check: does today's technical score rank future returns?
+def backtest(frames: dict[str, pd.DataFrame], lookback_days: int = 750, step: int = 5,
+             panel: pd.DataFrame | None = None) -> dict:
+    """Cross-sectional check: does the score rank future returns?
 
-    frames: symbol -> tech_frame output (indexed by date). Uses only information
-    available at each date. Universe = today's constituents (survivorship bias!).
+    frames: symbol -> tech_frame output (indexed by date). `panel` (dates x symbols), when given,
+    is the score the site actually ranks by (Taiwan: the slow score combined with distance to the
+    52-week high); otherwise each horizon's own column. Uses only information available at each
+    date. Universe = today's constituents (survivorship bias: the result is an upper bound).
     """
     res = {}
     for h, days in HORIZONS.items():
         col = f"t_{h}"
-        scores = pd.DataFrame({s: f[col] for s, f in frames.items()})
+        scores = panel if panel is not None else pd.DataFrame({s: f[col] for s, f in frames.items()})
         closes = pd.DataFrame({s: f["close"] for s, f in frames.items()})
         fwd = closes.shift(-days) / closes - 1
         dates = scores.index[-lookback_days:-days:step] if len(scores) > days + 50 else []

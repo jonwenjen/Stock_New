@@ -754,12 +754,27 @@
             })()) : h("p", { class: "muted" }, "沒有已知事件。"), "#method", "完整行事曆在「方法與來源」")),
           h("p", { class: "chart-note" }, "持股水位是依風險等級給的一般性區間，不是個人化建議；風險分數的切點與歷史表現見「市場安全」。"));
       };
+      const weeklyCard = () => {
+        const W = S.weekly;
+        if (!W) return null;
+        if (!W.ref) return h("div", { class: "panel stack" }, h("h3", {}, "本週變化"),
+          h("p", { class: "muted small" }, `本站從 ${W.week} 起每週保存一份快照。下週起這裡會列出和上週相比的變化：短期回檔風險與主要原因、位置大幅移動的指標、精選名單的進出與原因。`));
+        const items = [];
+        if (W.risk) items.push(h("li", {}, `短期回檔風險 ${num(W.risk.prev, 0)} → ${num(W.risk.now, 0)}（${W.risk.prev_name || "–"} → ${W.risk.name}）`
+          + (W.risk.drivers.length ? "，主要來自 " + W.risk.drivers.map((d) => `${d.name} ${num(d.from, 0)}→${num(d.to, 0)}`).join("、") : "")));
+        if ((W.cards || []).length) items.push(h("li", {}, "位置大幅移動的指標：" + W.cards.map((c) => `${c.name}（一年百分位 ${num(c.from * 100, 0)} → ${num(c.to * 100, 0)}）`).join("、")));
+        if ((W.picks_in || []).length) items.push(h("li", {}, "新進精選：" + W.picks_in.map((x) => x.name).join("、")));
+        if ((W.picks_out || []).length) items.push(h("li", {}, "移出精選：" + W.picks_out.map((x) => `${x.name}（${x.why}）`).join("、")));
+        return h("div", { class: "panel stack" }, h("div", { class: "sec-head" }, h("h3", {}, "本週變化"), h("span", { class: "small muted num" }, `較 ${W.ref_date}（${W.ref}）`)),
+          items.length ? h("ul", { class: "why" }, items) : h("p", { class: "muted" }, "和上週相比沒有明顯變化。"));
+      };
       return [
+        weeklyCard(),
+        funnel(),
         h("div", { class: "tiles" }, S.indices.map((i) => h("button", { class: "tile", type: "button", onclick: () => openDrawer(i.symbol) },
           h("span", { class: "nm" }, i.name), h("span", { class: "px num" }, px(i.close)),
           h("span", { class: "chg" }, h("span", { class: "num " + cls(i.chg1d) }, "日 " + chgText(i, i.chg1d, 2)), h("span", { class: "num " + cls(i.chg5d) }, "週 " + chgText(i, i.chg5d))),
           spark(i.spark)))),
-        funnel(),
         h("div", { class: "grid g2" },
           h("div", { class: "panel note" }, h("h3", {}, "本週判讀"), S.narrative.map((n) => h("div", {}, h("h4", {}, n.title), h("p", {}, n.text)))),
           h("div", { class: "panel stack" }, h("h3", {}, "趨勢預測：一週／一月／一季"),
@@ -780,26 +795,58 @@
     async picks() {
       // Portfolio budget: the per-stock caps assume one stock at a time; this scales them to a total.
       const budgetPanel = () => {
-        const def = (() => { const m = MK && MK.risk && /([一二三四五六七八九])至([一二三四五六七八九])成/.exec(MK.risk.exposure || "");
-          const d = "一二三四五六七八九"; return m ? ((d.indexOf(m[1]) + 1) + (d.indexOf(m[2]) + 1)) * 5 : 50; })();
-        let b = def;
-        try { b = +localStorage.getItem("budget") || def; } catch (e) { /* storage unavailable */ }
-        const out = h("div", { class: "small" });
-        const input = h("input", { type: "number", min: 10, max: 100, step: 5, value: b, "aria-label": "打算投入的資金比例", style: "width:5em",
-          oninput: () => { try { localStorage.setItem("budget", input.value); } catch (e) { /* */ } draw(); } });
+        const ex = (MK && MK.risk && MK.risk.exposure_pct) || 50;
+        const load = (k, d) => { try { const v = localStorage.getItem(k); return v === null || v === "" ? d : +v; } catch (e) { return d; } };
+        const save = (k, v) => { try { localStorage.setItem(k, v); } catch (e) { /* storage unavailable */ } };
+        const fxRate = (S.indices.find((x) => x.symbol === "USDTWD") || {}).close || 32;
+        const field = (key, def, attrs, label) => { const el = h("input", { type: "number", value: load(key, def), ...attrs, "aria-label": label, oninput: () => { save(key, el.value); draw(); } }); return el; };
+        const cash = field("budget_cash", 1000000, { min: 0, step: 10000, style: "width:8em" }, "總資金（台幣）");
+        const share = field("budget_share", ex, { min: 0, max: 100, step: 5, style: "width:4.5em" }, "股票比例（%）");
+        const tw = field("budget_tw", 60, { min: 0, max: 100, step: 10, style: "width:4.5em" }, "股票中台股的比例（%）");
+        const out = h("div", { class: "stack", style: "gap:6px" });
+        const lots = (n) => (n >= 1000 ? `${Math.floor(n / 1000)} 張` + (n % 1000 ? ` ${n % 1000} 股` : "") : `${n} 股（零股）`);
         const draw = () => {
-          const total = Math.max(0, Math.min(100, +input.value || 0)) / 100;
-          const caps = S.picks.map((r) => (r.plan && r.plan.size) || 0), sum = caps.reduce((a, x) => a + x, 0);
-          const k = sum ? Math.min(1, total / sum) : 1;
-          const ind = {};
-          S.picks.forEach((r, i) => { ind[r.industry] = (ind[r.industry] || 0) + caps[i] * k; });
-          const top = Object.entries(ind).sort((a, x) => x[1] - a[1]).slice(0, 3);
-          out.replaceChildren(`20 檔的部位上限加總 ${num(sum * 100, 0)}%，要放進 ${num(total * 100, 0)}% 的資金，每檔約用上限的 ${num(k * 100, 0)}%。`,
-            `最集中的產業：${top.map(([n, v]) => `${n} ${num(v * 100, 0)}%`).join("、")}。`);
+          const A = Math.max(0, +cash.value || 0), B = Math.min(100, Math.max(0, +share.value || 0)) / 100, T = Math.min(100, Math.max(0, +tw.value || 0)) / 100;
+          const rows = [];
+          let loss = 0;
+          [["TW", T], ["US", 1 - T]].forEach(([mk, part]) => {
+            const ps = S.picks.filter((r) => r.market === mk);
+            const raw = ps.map((r) => Math.min(0.25, 0.01 / Math.max((r.plan && r.plan.stop_pct) || 0.05, 0.01)));
+            const sum = raw.reduce((a, x) => a + x, 0) || 1;
+            ps.forEach((r, k) => {
+              const amt = A * B * part * raw[k] / sum, price = mk === "US" ? r.close * fxRate : r.close;
+              loss += amt * ((r.plan && r.plan.stop_pct) || 0);
+              rows.push({ r, amt, shares: price ? Math.floor(amt / price) : 0 });
+            });
+          });
+          const small = rows.filter((x) => x.r.market === "TW" && x.amt > 0 && x.amt < 23400).length;
+          out.replaceChildren(
+            h("p", { class: "small" }, `股票部位 ${nf(0).format(A * B)} 元：台股 ${num(T * 100, 0)}%、美股 ${num((1 - T) * 100, 0)}%。每個市場內依停損距離分配：停損越近可以放越多，單檔最多 25%。如果全部同時停損，約虧 ${nf(0).format(loss)} 元（總資金的 ${num(A ? loss / A * 100 : 0, 1)}%）。`),
+            table([{ key: "n", label: "精選", left: true, cell: (x) => h("span", {}, x.r.name, " ", mkChip(x.r.market, x.r.symbol)) },
+              { key: "s", label: "停損距離", val: (x) => x.r.plan && x.r.plan.stop_pct, cell: (x) => h("span", { class: "num" }, x.r.plan && ok(x.r.plan.stop_pct) ? num(x.r.plan.stop_pct * 100, 1) + "%" : "–") },
+              { key: "a", label: "建議金額（台幣）", val: (x) => x.amt, cell: (x) => h("span", { class: "num" }, nf(0).format(x.amt)) },
+              { key: "q", label: "約當股數", val: (x) => x.shares, cell: (x) => h("span", { class: "num" }, x.r.market === "TW" ? lots(x.shares) : `${x.shares} 股`) }],
+              rows, { csv: "budget", sort: "a" }),
+            small ? h("p", { class: "chart-note" }, `有 ${small} 檔台股單筆金額低於約 2.34 萬元：多數券商最低手續費 20 元，實際費率會比牌告高。`) : null);
         };
         draw();
-        return h("div", { class: "panel stack" }, h("div", { class: "row" }, h("b", {}, "部位預算"), "我打算投入", input, "% 資金"), out,
-          h("p", { class: "chart-note" }, `預設值取自市場風險分數對應的持股水位（${MK && MK.risk ? MK.risk.exposure : "–"}），這是控制總部位的經驗法則，未經本站資料驗證，可自行調整；只存在這台裝置。`));
+        return h("div", { class: "panel stack" }, h("div", { class: "row", style: "flex-wrap:wrap;gap:8px" }, h("b", {}, "部位預算"), "總資金", cash, "元・股票比例", share, "%・其中台股", tw, "%"), out,
+          h("p", { class: "chart-note" }, `股票比例預設 ${ex}%，取自短期回檔風險等級（${MK && MK.risk ? MK.risk.name : "–"}）；這是控制總部位的經驗法則，未經驗證，可自行調整。美股精選沒有可驗證的選股優勢，美股比例可以設成 0。台股與美股預設 60／40，只是中性的起點。數字只存在這個瀏覽器。`));
+      };
+      const portfolioPanel = () => {
+        const P = S.portfolio;
+        if (!P || !P.TW) return null;
+        const box = (mk, label) => {
+          const x = P[mk];
+          if (!x) return null;
+          return h("div", { class: "stack", style: "gap:4px" }, h("b", {}, label),
+            h("div", { class: "small" }, `β ${ok(x.beta) ? num(x.beta, 2) : "–"}・年化波動 ${num(x.vol * 100, 0)}%・平均相關 ${ok(x.avg_corr) ? num(x.avg_corr, 2) : "–"}`),
+            h("div", { class: "small" }, `一個月虧損超過 ${num(-x.loss95_1m * 100, 1)}%：依過去波動估計，大約每 20 個月會遇到一次。`),
+            ok(x.hi52) ? h("div", { class: "small muted" }, `距 52 週高點中位數 ${pct(x.hi52 - 1)}（全體 ${pct(x.hi52_all - 1)}）・近 60 日漲幅中位數 ${pct(x.r60)}（全體 ${pct(x.r60_all)}）`) : null);
+        };
+        return h("div", { class: "panel stack" }, h("h3", {}, "這 20 檔放在一起的風險"),
+          h("div", { class: "grid g3" }, box("TW", `台股 ${P.TW.n} 檔`), box("US", P.US ? `美股 ${P.US.n} 檔（美元計）` : "美股"), box("ALL", "合計（台幣計，台股 60%／美股 40%）")),
+          h("p", { class: "chart-note" }, "依預設權重（停損越近權重越大）與近 60 日波動推估；急跌初期，近期波動會低估之後的風險，所以這不是最壞情況。名單集中在股價接近一年高點、近期大漲的股票，本質上是押動能延續。"));
       };
       const filter = { m: "ALL" };
       const grid = h("div", { class: "picks" });
@@ -837,6 +884,7 @@
       return [h("div", { class: "sec-head" }, head("精選 20 檔", `從 ${S.counts.tw} 檔台股與 ${S.counts.us} 檔美股中，依同市場排名挑選：處置股不選、上週精選排名仍在前段就續留、同產業最多 3 檔、走勢高度相關的不重複挑。台股在前、美股在後。點卡片看圖表與完整數據。`), seg),
         h("p", { class: "small muted" }, "排名是同一市場內的相對強弱（台股 1 名最強），不是漲跌預測；百分比是過去約三年同排名的股票跑贏同市場中位數的比例。美股沒有測到可驗證的選股優勢，照實標示。部位上限＝願意承擔 1% 資金虧損時，這檔最多買多少。",
           h("a", { href: "#learn?k=picks" }, "選股規則")),
+        portfolioPanel(),
         budgetPanel(),
         (S.picks_diff || {}).ref_date ? h("p", { class: "small" }, `與 ${S.picks_diff.ref_date} 的名單相比：新進 ${S.picks_diff.new} 檔（標示 NEW）` +
           (S.picks_diff.dropped.length ? `；移出 ${S.picks_diff.dropped.map((x) => x.name).join("、")}。` : "；沒有移出。") + "↑↓ 是名次變化，「連續 n 週」是連續上榜的週數。") : null,
@@ -1384,7 +1432,7 @@
           A.backtest_us && Object.keys(A.backtest_us).length ? h("details", {}, h("summary", { class: "small" }, "美股的同一張表"),
             h("div", { class: "grid g2" }, Object.keys(HD).map((k) => calib(k, A.backtest_us)))) : null,
           h("p", { class: "small" }, "讀法：「模型：跑贏中位數」是網站依排名給的機率，「實際跑贏中位數」是之後真的跑贏同市場中位數股票的比例。兩欄越接近、且由強勢偏空往強勢偏多逐步升高，排名越可信。「實際上漲」主要反映這段期間的大盤行情。"),
-          h("p", { class: "chart-note" }, "回測只能重建技術面分數（籌碼與基本面沒有歷史快照），樣本是現在的熱門股（倖存者偏差），且期間以多頭為主。若高分組的實際上漲比率沒有明顯高於低分組，就表示分數的區分力有限：請把它當成篩選與排序工具，搭配上方的市場風險與部位控制使用。精選個股的實際表現見「精選 20 檔」頁。")),
+          h("p", { class: "chart-note" }, `回測只能重建技術面分數（籌碼與基本面沒有歷史快照），樣本是現在的熱門股（倖存者偏差），且期間以多頭為主${S.selection_bias ? `：${S.selection_bias.from} 到 ${S.selection_bias.to}（${S.selection_bias.days} 個交易日），今日名單等權上漲 ${pct(S.selection_bias.today, 0)}，當時成交值前 90 名只有 ${pct(S.selection_bias.pit, 0)}，所以所有優勢數字都只是上限` : ""}。若高分組的實際上漲比率沒有明顯高於低分組，就表示分數的區分力有限：請把它當成篩選與排序工具，搭配上方的市場風險與部位控制使用。精選個股的實際表現見「精選 20 檔」頁。`)),
       ];
     },
 

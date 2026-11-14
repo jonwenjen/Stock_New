@@ -391,6 +391,21 @@ def trading_flags() -> dict[str, dict]:
                                get("announcement/notetrans"), get("exchangeReport/TWT48U_ALL"))
 
 
+def carry_flags(flags: dict[str, dict], today: str) -> dict[str, dict]:
+    """Last successful flags reused when the feed is throttled: only facts with an end date that is
+    still ahead (disposition periods, announced ex-dividend dates); daily attention notices are dropped."""
+    out: dict[str, dict] = {}
+    for code, f in flags.items():
+        keep = {}
+        if (f.get("punish") or {}).get("to") and f["punish"]["to"] >= today:
+            keep["punish"] = f["punish"]
+        if (f.get("exdiv") or {}).get("date") and f["exdiv"]["date"] >= today:
+            keep["exdiv"] = f["exdiv"]
+        if keep:
+            out[code] = keep
+    return out
+
+
 def foreign_holding(date: str) -> dict[str, dict]:
     """Foreign investors' holding per listed security on a date: {code: {"pct", "room", "limit"}} (percent)."""
     j = _rwd("fund/MI_QFIIS", date=date.replace("-", ""), selectType="ALLBUT0999")

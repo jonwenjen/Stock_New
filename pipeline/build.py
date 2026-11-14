@@ -838,7 +838,13 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
             if c not in fresh and any(v is not None for v in old_vals.values()):
                 fresh[c] = old_vals
     insiders = safe("證交所 董監持股", lambda: retry(twse.insiders), {}, tw_api)
-    flags = safe("證交所 處置／注意股與除權息預告", lambda: retry(twse.trading_flags), {}, tw_api)
+    flags_path = DATA / "history" / "tw_flags.json"
+    flags = safe("證交所 處置／注意股與除權息預告", lambda: retry(twse.trading_flags), None, tw_api)
+    if flags:
+        write_json(flags_path, {"fetched": today.isoformat(), "flags": flags})
+    else:
+        flags = twse.carry_flags(read_json(flags_path, {}).get("flags", {}), today.isoformat())
+        log(f"  trading flags: feed unavailable, reusing {len(flags)} unexpired flags from the last run")
     futures = safe("期交所 外資台指期未平倉", twse.foreign_futures, None, "https://openapi.taifex.com.tw")
 
     # ETFs: a fixed core list plus whatever is trading most actively right now.

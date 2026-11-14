@@ -1054,3 +1054,12 @@ def test_form4_keeps_open_market_trades_only():
                   "value": 50500.0, "planned": False}]
     s = us_data.insider_summary(t + [{"date": "2026-01-01", "type": "sell", "value": 9e9, "owner": "x", "planned": False}], "2026-08-01")
     assert s["buys"] == 1 and s["sells"] == 0 and s["buyers"] == 1 and s["last"] == "2026-11-04"
+
+
+def test_carry_flags_keeps_only_unexpired_facts():
+    f = {"3189": {"punish": {"from": "2026-11-03", "to": "2026-11-16"}, "notice": {"count": 1}},
+         "2455": {"punish": {"from": "2026-10-01", "to": "2026-11-10"}},
+         "0056": {"exdiv": {"date": "2026-11-20", "kind": "息", "cash": 1.0}}}
+    out = twse.carry_flags(f, "2026-11-14")
+    assert out == {"3189": {"punish": {"from": "2026-11-03", "to": "2026-11-16"}},
+                   "0056": {"exdiv": {"date": "2026-11-20", "kind": "息", "cash": 1.0}}}

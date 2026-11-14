@@ -722,8 +722,11 @@ def update_tw_prices(trading_days: list[str], universe: list[str], actions: dict
     # archive lets later tests use the list as it was. About 1 KB a day.
     pit_path = DATA / "history" / "tw_universe_pit.json"
     pit = read_json(pit_path, {})
-    for d, table in tables.items():
-        if d not in pit and table:
+    # Days fetched in earlier runs sit in the local cache: archive those too, not just today's fetches.
+    cached = {f.stem: f for f in DAY_CACHE.glob("*.json")} if DAY_CACHE.exists() else {}
+    for d in sorted(set(tables) | set(cached)):
+        table = None if d in pit else (tables.get(d) or read_json(cached[d], {}))
+        if table:
             vals = sorted(((c, bar[3] * bar[4]) for c, bar in table.items() if twse.COMMON_STOCK.match(c)),
                           key=lambda x: -x[1])
             pit[d] = [c for c, _ in vals[:150]]

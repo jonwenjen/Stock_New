@@ -913,6 +913,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
             if c not in fresh and any(v is not None for v in old_vals.values()):
                 fresh[c] = old_vals
     insiders = safe("證交所 董監持股", lambda: retry(twse.insiders), {}, tw_api)
+    daytrade = safe("證交所 個股當日沖銷", lambda: twse.day_trading(trading_days[-1]), {}, "https://www.twse.com.tw")
     flags_path = DATA / "history" / "tw_flags.json"
     flags = safe("證交所 處置／注意股與除權息預告", lambda: retry(twse.trading_flags), None, tw_api)
     if flags:
@@ -1030,6 +1031,13 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
             otc_flow_dates, otc_flows = otc_stock_flows(trading_days)
             for c, v in otc_flows.items():
                 flow_map.setdefault(c, v)
+            if len(otc_flow_dates) >= 15:  # 投信首買 for OTC names too (review 2026-11-14, chips-4)
+                otc_first = leading.trust_first_buys({c: otc_flows[c] for c in otc_codes if c in otc_flows},
+                                                     {c: bar[3] for c, bar in otc_day.items()})
+                for r in otc_first:
+                    r["name"] = (otc_margin.get(r["code"]) or {}).get("name") or r["code"]
+                trust_first += otc_first
+                first_by_code.update({r["code"]: r for r in otc_first})
         except Exception as e:  # noqa: BLE001 - OTC chips then come from the margin data only
             log(f"  OTC institutional trades: {e}")
     otc_frames = safe("櫃買中心 上櫃個股每日行情", lambda: update_otc_prices(trading_days, otc_codes, actions), {},
@@ -1249,6 +1257,9 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                 rec.update({"margin_cost": cost, "maint_est": me})
                 if me < 1.40:
                     cn.append((f"估算融資維持率 {me:.0%}，接近 130% 追繳線，留意斷頭賣壓", -0.12))
+            vol = (quotes.get(code) or {}).get("volume")
+            if daytrade.get(code) is not None and vol:
+                rec["daytrade"] = round(min(1.0, daytrade[code] / vol), 3)
             fund_in = {**valuation.get(code, {}), **revenue.get(code, {}), **eps.get(code, {})}
             rm = leading.revenue_momentum({ym: t[code] for ym, t in rev_hist.items() if t.get(code)})
             if rm:
@@ -1310,6 +1321,8 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
             watch.append(f"平穩急漲（60 日 {rec['r60']:+.0%}、年化波動 {rec['vol_ann']:.0%}）")
         if (rec["plan"].get("stop_pct") or 0) > 0.15:
             watch.append(f"停損距離 {rec['plan']['stop_pct']:.0%}")
+        if (rec.get("daytrade") or 0) >= 0.70:
+            watch.append(f"當沖比率 {rec['daytrade']:.0%}")
         rec["watch_first"] = watch or None
         rec["bars"] = len(df)
         records.append(rec)

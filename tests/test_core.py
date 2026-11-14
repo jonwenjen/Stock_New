@@ -1142,3 +1142,15 @@ def test_stress_replay_picks_separate_worst_windows():
     out = research.stress_replay({"X": 1.0}, {"X": pick}, bench, bench, n=2)
     assert len(out) == 2 and min(o["bench"] for o in out) <= -0.15
     assert all(abs(o["picks"] - o["bench"]) < 1e-9 for o in out)      # same prices -> same replay
+
+
+def test_otc_warning_note_and_day_trading_parsers():
+    from pipeline import tpex
+    fl = tpex.parse_flags([], [{"SecuritiesCompanyCode": "3441", "TradingInformation": "x", "Date": "1151113"}], [],
+                          [{"SecuritiesCompanyCode": "3441", "AccumulationSituation": "115年11月10日至115年11月13日連續四次"}])
+    assert fl["3441"]["near_punish"].endswith("連續四次") and fl["3441"]["notice"]["count"] == 4
+    j = {"stat": "OK", "tables": [{"fields": ["當日沖銷交易總成交股數"], "data": [["1"]]},
+                                  {"fields": ["證券代號", "證券名稱", "暫停現股賣出後現款買進當沖註記", "當日沖銷交易成交股數",
+                                              "當日沖銷交易買進成交金額", "當日沖銷交易賣出成交金額"],
+                                   "data": [["1802", "台玻", "", "84,000,000", "1", "1"]]}]}
+    assert twse.parse_day_trading(j) == {"1802": 84000000.0}

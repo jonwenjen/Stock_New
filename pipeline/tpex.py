@@ -113,8 +113,22 @@ def foreign_holding() -> dict[str, dict]:
     return out
 
 
-def parse_flags(disposal: list[dict], warning: list[dict], exdiv: list[dict]) -> dict[str, dict]:
-    """Same shape as twse.parse_trading_flags: punish / notice / exdiv."""
+_CN = {"一": 1, "二": 2, "兩": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
+
+def _times(text: str) -> int | None:
+    """'…連續四次' -> 4."""
+    m = re.search(r"連續([一二兩三四五六七八九十\d]+)次", text or "")
+    if not m:
+        return None
+    t = m.group(1)
+    return int(t) if t.isdigit() else _CN.get(t)
+
+
+def parse_flags(disposal: list[dict], warning: list[dict], exdiv: list[dict],
+                note: list[dict] | None = None) -> dict[str, dict]:
+    """Same shape as twse.parse_trading_flags: punish / notice / near_punish / exdiv. `note` is the
+    warning-accumulation list (e.g. "連續四次"), the step before a disposition."""
     out: dict[str, dict] = {}
     for r in disposal:
         code = (r.get("SecuritiesCompanyCode") or "").strip()
@@ -127,6 +141,13 @@ def parse_flags(disposal: list[dict], warning: list[dict], exdiv: list[dict]) ->
         if code:
             out.setdefault(code, {})["notice"] = {"count": 1, "info": (r.get("TradingInformation") or "").strip()[:80],
                                                   "date": _roc_date(r.get("Date"))}
+    for r in note or []:
+        code, text = (r.get("SecuritiesCompanyCode") or "").strip(), (r.get("AccumulationSituation") or "").strip()
+        if code and text:
+            out.setdefault(code, {})["near_punish"] = text
+            n = _times(text)
+            if n and "notice" in out[code]:
+                out[code]["notice"]["count"] = n
     for r in exdiv:
         code, d = (r.get("SecuritiesCompanyCode") or "").strip(), _roc_date(r.get("ExRrightsExDividendDate"))
         if code and d:
@@ -136,8 +157,12 @@ def parse_flags(disposal: list[dict], warning: list[dict], exdiv: list[dict]) ->
 
 
 def trading_flags() -> dict[str, dict]:
+    try:
+        note = _api("tpex_trading_warning_note")
+    except Exception:  # noqa: BLE001 - the precursor list is extra; the core flags stand without it
+        note = []
     return parse_flags(_api("tpex_disposal_information"), _api("tpex_trading_warning_information"),
-                       _api("tpex_exright_prepost"))
+                       _api("tpex_exright_prepost"), note)
 
 
 def ex_rights_recent() -> dict[str, dict[str, float]]:

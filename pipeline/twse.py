@@ -391,6 +391,21 @@ def trading_flags() -> dict[str, dict]:
                                get("announcement/notetrans"), get("exchangeReport/TWT48U_ALL"))
 
 
+def parse_day_trading(j: dict) -> dict[str, float]:
+    """TWTB4U: shares day-traded per security on one date."""
+    tab = next((t for t in j.get("tables") or [] if "證券代號" in (t.get("fields") or [])), None)
+    if not tab:
+        return {}
+    f = tab["fields"]
+    i_c, i_v = f.index("證券代號"), f.index("當日沖銷交易成交股數")
+    return {r[i_c].strip(): num(r[i_v]) or 0.0 for r in tab.get("data") or []}
+
+
+def day_trading(date: str) -> dict[str, float]:
+    """Day-trade volume per listed security (one request)."""
+    return parse_day_trading(_rwd("dayTrading/TWTB4U", date=date.replace("-", ""), selectType="All"))
+
+
 def carry_flags(flags: dict[str, dict], today: str) -> dict[str, dict]:
     """Last successful flags reused when the feed is throttled: only facts with an end date that is
     still ahead (disposition periods, announced ex-dividend dates); daily attention notices are dropped."""

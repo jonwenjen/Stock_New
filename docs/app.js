@@ -632,6 +632,7 @@
           ["距 52 週高點", ok(r.hi52) ? pct(r.hi52 - 1) : "–"],
           ["千張大戶持股", r.tdcc ? num(r.tdcc.big1000, 1) + "%" + (ok(r.tdcc.chg1000) ? `（週 ${signed(r.tdcc.chg1000, 2)}）` : "") : "–"],
           ["股東人數週變化", r.tdcc && ok(r.tdcc.chg_holders) ? pct(r.tdcc.chg_holders) : "–"],
+          ["當沖比率（最新一日）", ok(r.daytrade) ? num(r.daytrade * 100, 0) + "%" : "–"],
           ["外資持股比例", ok(r.qfii) ? num(r.qfii, 1) + "%" : "–"],
           ["外資持股 20 日", ok(r.qfii_chg20) ? signed(r.qfii_chg20, 2) + " pp" : "–"],
           ["外資尚可投資", ok(r.qfii_room) ? num(r.qfii_room, 1) + "%" : "–"]]

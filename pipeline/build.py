@@ -914,6 +914,15 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                 fresh[c] = old_vals
     insiders = safe("證交所 董監持股", lambda: retry(twse.insiders), {}, tw_api)
     daytrade = safe("證交所 個股當日沖銷", lambda: twse.day_trading(trading_days[-1]), {}, "https://www.twse.com.tw")
+    margins = safe("證交所 營益分析（毛利率、營益率）", lambda: retry(twse.margins), {}, tw_api)
+    if margins:  # archived per period: quarter-on-quarter trends become possible from the next filing
+        mpath = DATA / "history" / "tw_margins.json"
+        mh = read_json(mpath, {})
+        for c, v in margins.items():
+            if v.get("period"):
+                mh.setdefault(v["period"], {})[c] = [v["gm"], v["om"], v["nm"], v["rev_m"]]
+        write_json(mpath, {k: mh[k] for k in sorted(mh)[-12:]})
+    etf_nav = safe("證交所 ETF 淨值與折溢價", twse.etf_nav, {}, "https://mis.twse.com.tw")
     flags_path = DATA / "history" / "tw_flags.json"
     flags = safe("證交所 處置／注意股與除權息預告", lambda: retry(twse.trading_flags), None, tw_api)
     if flags:
@@ -1281,6 +1290,11 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                                                     "rev_cum_yoy", "eps", "eps_period", "month")})
             # The quarterly table gives this year's cumulative EPS; price / P/E is the trailing four quarters.
             rec["eps_ttm"] = round(last / fund_in["pe"], 2) if (fund_in.get("pe") or 0) > 0 else None
+            if fund_in.get("yield") and (fund_in.get("pe") or 0) > 0:  # dividends / trailing earnings
+                rec["payout"] = round(fund_in["yield"] * fund_in["pe"] / 100, 3)
+            mg = margins.get(code)
+            if mg:
+                rec.update({"gm": mg["gm"], "om": mg["om"], "nm": mg["nm"], "margin_period": mg["period"]})
             rec["yield_odd"] = scoring.odd_yield(fund_in.get("yield"), fund_in.get("pe")) or None
             ins = insiders.get(code)
             if ins:
@@ -1397,7 +1411,17 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
             continue
         if newest[m["market"]] is not None and frames[s].index[-1] < newest[m["market"]] - pd.Timedelta(days=7):
             continue  # stale prices: leave it out rather than score it
-        etf_records.append(etf_record(s, frames[s], tframes[s], m, flow_map, mentions.get(s, 0)))
+        er = etf_record(s, frames[s], tframes[s], m, flow_map, mentions.get(s, 0))
+        if m["market"] == "TW":
+            nv = etf_nav.get(m.get("code") or s.split(".")[0])
+            if nv:
+                er.update({"prem": nv["prem"], "aum": nv["aum"], "flow_day": nv["flow"], "nav_time": nv["time"]})
+            # cash paid over the last 12 months, from the ex-dividend factors (price basis: 1 / product - 1)
+            ev = {d: f for d, f in (actions.get(m.get("code") or s.split(".")[0]) or {}).items()
+                  if frames[s].index[-1] - pd.Timedelta(days=365) < pd.Timestamp(d) <= frames[s].index[-1]}
+            if ev:
+                er["dist12"] = round(1 / math.prod(ev.values()) - 1, 4)
+        etf_records.append(er)
     etf_records.sort(key=lambda r: -r["overall"])
     by_sym = {r["symbol"]: r for r in records + etf_records}
     tactical_hist[week_key] = {r["symbol"]: r["tactical"] for r in records if r.get("tactical") is not None}

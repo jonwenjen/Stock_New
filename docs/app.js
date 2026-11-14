@@ -617,7 +617,9 @@
         h("p", { class: "chart-note" }, "+1σ 上緣只是波動區間的上緣，不是目標價：排名前段的股票一個月內觸及它的比例約 36%。停損用來控制虧損與波動，不是預測：回測中被停損的股票，一個月後有 66% 價格高於出場價。部位大小比停損更重要。" +
           (ok(r.plan.size) ? `部位上限＝1% ÷ 停損距離：就算停損出場，這一檔也只讓整體資金虧 1%。以 100 萬資金為例，這檔最多約 ${num(r.plan.size * 100, 0)} 萬。` : ""))));
       const kv = r.kind === "etf"
-        ? [["類別", r.industry], ["近一月", pct(r.r20)], ["近一季", pct(r.r60)], ["今年以來", pct(r.ytd)], ["近一年", pct(r.r250)],
+        ? [["類別", r.industry], ["近一月", pct(r.r20)], ["近一季", pct(r.r60)], ["今年以來", pct(r.ytd)], ["近一年" + (r.market === "TW" ? "（含息）" : "（不含息）"), pct(r.r250)],
+          ["近 12 月配息率", ok(r.dist12) ? num(r.dist12 * 100, 1) + "%" : "–"], ["折溢價", ok(r.prem) ? signed(r.prem, 2) + "%" + (r.nav_time ? `（${r.nav_time.slice(0, 5)}）` : "") : "–"],
+          ["規模", ok(r.aum) ? nf(0).format(r.aum / 1e8) + " 億" : "–"], ["單日申購贖回", ok(r.flow_day) ? signed(r.flow_day / 1e8, 1) + " 億" : "–"],
           ["一年最大回檔", pct(r.mdd)], ["年化波動", ok(r.vol_ann) ? num(r.vol_ann * 100, 0) + "%" : "–"], ["RSI(14)", num(r.rsi, 0)],
           ["外資 5 日", ok(r.foreign5) ? signed(r.foreign5, 0) + " 張" : "–"], ["投信 5 日", ok(r.trust5) ? signed(r.trust5, 0) + " 張" : "–"]]
         : r.market === "TW"
@@ -634,6 +636,9 @@
           ["千張大戶持股", r.tdcc ? num(r.tdcc.big1000, 1) + "%" + (ok(r.tdcc.chg1000) ? `（週 ${signed(r.tdcc.chg1000, 2)}）` : "") : "–"],
           ["股東人數週變化", r.tdcc && ok(r.tdcc.chg_holders) ? pct(r.tdcc.chg_holders) : "–"],
           ["當沖比率（最新一日）", ok(r.daytrade) ? num(r.daytrade * 100, 0) + "%" : "–"],
+          ["毛利率／營益率（今年累計）", ok(r.gm) ? `${num(r.gm, 1)}%／${ok(r.om) ? num(r.om, 1) + "%" : "–"}` : "–"],
+          ["稅後純益率（今年累計）", ok(r.nm) ? num(r.nm, 1) + "%" : "–"],
+          ["配發率（殖利率 × 本益比）", ok(r.payout) ? num(r.payout * 100, 0) + "%" + (r.payout > 1 ? "（高於獲利）" : "") : "–"],
           ["外資持股比例", ok(r.qfii) ? num(r.qfii, 1) + "%" : "–"],
           ["外資持股 20 日", ok(r.qfii_chg20) ? signed(r.qfii_chg20, 2) + " pp" : "–"],
           ["外資尚可投資", ok(r.qfii_room) ? num(r.qfii_room, 1) + "%" : "–"]]
@@ -1201,6 +1206,24 @@
         h("div", { class: "panel stack" }, h("div", { class: "sec-head" }, h("h3", {}, "因子象限圖：籌碼 × 基本面", help("tactical", "籌碼分與基本面分")), quadBtns),
           svg, h("p", { class: "chart-note" }, "每個點是一檔股票（藍＝台股、灰＝美股，較大的點是本週精選）。點一下看個股，按象限按鈕會同時篩選下方表格；滑過表格的列，對應的點會被圈出來。")),
         h("div", { class: "panel stack" }, h("div", { class: "row" }, seg, q), tbl),
+        (() => {
+          const tw = U.filter((r) => r.market === "TW" && r.kind !== "etf");
+          const med = (a) => { const v = a.filter(ok).sort((x, y) => x - y); return v.length ? v[Math.floor(v.length / 2)] : null; };
+          const groups = Object.entries(tw.reduce((m, r) => { (m[r.industry] = m[r.industry] || []).push(r); return m; }, {}))
+            .filter(([, rs]) => rs.length >= 3)
+            .map(([name, rs]) => ({ name, n: rs.length, rev: med(rs.map((r) => r.rev_yoy)), r20: med(rs.map((r) => r.r20)), r60: med(rs.map((r) => r.r60)),
+              rank: med(rs.map((r) => (r.rank ? r.rank[0] / r.rank[1] : null))), picks: rs.filter((r) => S.picks.some((p) => p.symbol === r.symbol)).length }));
+          if (groups.length < 3) return null;
+          return h("div", { class: "panel stack" }, h("h3", {}, "台股產業概況（觀察名單，3 檔以上的產業）"), table([
+            { key: "n", label: "產業", left: true, cell: (g) => g.name },
+            { key: "c", label: "檔數", val: (g) => g.n, cell: (g) => h("span", { class: "num" }, g.n) },
+            { key: "v", label: "月營收年增中位數", val: (g) => g.rev, cell: (g) => numEl(pctRaw(g.rev), g.rev) },
+            { key: "m", label: "近一月中位數", val: (g) => g.r20, cell: (g) => numEl(pct(g.r20), g.r20) },
+            { key: "q", label: "近一季中位數", val: (g) => g.r60, cell: (g) => numEl(pct(g.r60), g.r60) },
+            { key: "r", label: "排名中位數", tip: "同市場排名的百分位，越小越前面", val: (g) => (ok(g.rank) ? -g.rank : null), cell: (g) => h("span", { class: "num" }, ok(g.rank) ? "前 " + num(g.rank * 100, 0) + "%" : "–") },
+            { key: "p", label: "精選檔數", val: (g) => g.picks, cell: (g) => h("span", { class: "num" }, g.picks) }], groups, { sort: "r", csv: "industries" }),
+            h("p", { class: "chart-note" }, "用來看資金與營收集中在哪些產業。中位數比平均數不受單一個股影響；檔數少的產業波動大，僅供參考。"));
+        })(),
       ];
     },
 
@@ -1516,7 +1539,10 @@
         { key: "m", label: "月", val: (r) => r.r20, cell: (r) => numEl(pct(r.r20), r.r20) },
         { key: "q", label: "季", val: (r) => r.r60, cell: (r) => numEl(pct(r.r60), r.r60) },
         { key: "y", label: "今年", val: (r) => r.ytd, cell: (r) => numEl(pct(r.ytd), r.ytd) },
-        { key: "1y", label: "一年", val: (r) => r.r250, cell: (r) => numEl(pct(r.r250), r.r250) },
+        { key: "1y", label: "一年", tip: "台股 ETF 含配息還原；美股 ETF 是價格報酬（不含配息），兩者不宜直接比", val: (r) => r.r250, cell: (r) => numEl(pct(r.r250), r.r250) },
+        { key: "dv", label: "近 12 月配息率", tip: "僅台股 ETF：由除息參考價推算", val: (r) => r.dist12, cell: (r) => h("span", { class: "num" }, ok(r.dist12) ? num(r.dist12 * 100, 1) + "%" : "–") },
+        { key: "pm", label: "折溢價", tip: "市價相對預估淨值；溢價 1% 以上等於多付錢", val: (r) => r.prem, cell: (r) => h("span", { class: "num" + (ok(r.prem) && Math.abs(r.prem) >= 1 ? " warn-text" : "") }, ok(r.prem) ? signed(r.prem, 2) + "%" : "–") },
+        { key: "au", label: "規模（億）", val: (r) => r.aum, cell: (r) => h("span", { class: "num" }, ok(r.aum) ? nf(0).format(r.aum / 1e8) : "–") },
         { key: "d", label: "一年最大回檔", val: (r) => r.mdd, cell: (r) => numEl(pct(r.mdd), r.mdd) },
         { key: "v", label: "年化波動", val: (r) => r.vol_ann, cell: (r) => h("span", { class: "num" }, ok(r.vol_ann) ? num(r.vol_ann * 100, 0) + "%" : "–") },
         { key: "f", label: "外資 5 日（張）", tip: "僅台股 ETF", val: (r) => r.foreign5, cell: (r) => numEl(ok(r.foreign5) ? signed(r.foreign5, 0) : "–", r.foreign5) },

@@ -391,6 +391,48 @@ def trading_flags() -> dict[str, dict]:
                                get("announcement/notetrans"), get("exchangeReport/TWT48U_ALL"))
 
 
+def parse_margins(rows: list[dict]) -> dict[str, dict]:
+    """t187ap17_L (營益分析): this year's cumulative gross / operating / net margin, percent."""
+    out = {}
+    for r in rows:
+        code = (r.get("公司代號") or "").strip()
+        if not code:
+            continue
+        g = lambda key: num(next((v for k, v in r.items() if k.startswith(key)), None))  # noqa: E731
+        out[code] = {"gm": g("毛利率"), "om": g("營業利益率"), "nm": g("稅後純益率"), "rev_m": g("營業收入"),
+                     "period": f"{int(r['年度']) + 1911}Q{r['季別']}" if r.get("年度") else None}
+    return out
+
+
+def margins() -> dict[str, dict]:
+    """Margins of every listed company, latest reported period (one request)."""
+    return parse_margins(http.get_json(f"{OPENAPI}/opendata/t187ap17_L"))
+
+
+MIS_ETF = "https://mis.twse.com.tw/stock/data/all_etf.txt"
+
+
+def parse_etf_nav(j: dict) -> dict[str, dict]:
+    """TWSE's ETF NAV snapshot: premium (%), estimated NAV, size and the day's creations (TWD).
+    Fields: a code, c units outstanding, d change in units, e price, f estimated NAV, g premium %, j time."""
+    out = {}
+    for block in j.get("a1") or []:
+        for m in block.get("msgArray") or []:
+            code, nav = (m.get("a") or "").strip(), num(m.get("f"))
+            if not code or not nav:
+                continue
+            price, units, d, prem = num(m.get("e")), num(m.get("c")), num(m.get("d")), num(m.get("g"))
+            if prem is None and price:
+                prem = (price / nav - 1) * 100
+            out[code] = {"prem": prem, "nav": nav, "aum": units * nav if units else None,
+                         "flow": d * nav if d is not None else None, "time": m.get("j")}
+    return out
+
+
+def etf_nav() -> dict[str, dict]:
+    return parse_etf_nav(http.get_json(MIS_ETF))
+
+
 def parse_day_trading(j: dict) -> dict[str, float]:
     """TWTB4U: shares day-traded per security on one date."""
     tab = next((t for t in j.get("tables") or [] if "證券代號" in (t.get("fields") or [])), None)

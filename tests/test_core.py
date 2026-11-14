@@ -713,12 +713,12 @@ def test_lin_maps_safe_to_zero_and_danger_to_hundred_either_direction():
     assert market.lin(1.70, 1.70, 1.40) == 0 and market.lin(1.55, 1.70, 1.40) == pytest.approx(50)
 
 
-def test_parse_futures_csv_keeps_foreign_tx_rows_only():
+def test_parse_futures_csv_keeps_tx_rows_by_institution():
     text = ("日期,商品名稱,身份別,a,b,c,d,多空交易口數淨額,e,f,g,h,i,多空未平倉口數淨額,j\n"
             "2026/10/01,臺股期貨,投信,1,1,1,1,776,1,1,1,1,1,74615,1\n"
             "2026/10/01,臺股期貨,外資及陸資,1,1,1,1,-1389,1,1,1,1,1,-79554,1\n"
             "2026/10/01,小型臺指期貨,外資及陸資,1,1,1,1,5,1,1,1,1,1,9,1\n")
-    assert market.parse_futures_csv(text) == {"2026-10-01": {"net_oi": -79554.0, "net_trade": -1389.0}}
+    assert market.parse_futures_csv(text) == {"2026-10-01": {"net_oi": -79554.0, "net_trade": -1389.0, "trust_oi": 74615.0}}
 
 
 def test_breadth_index_and_breakout_check():
@@ -776,7 +776,7 @@ def test_risk_parts_total_and_levels():
             "fut_pct": 0.9, "maint": 1.75, "vix": 13.0, "vix_term": 0.85, "oas": 2.8, "oas_chg10": 0.0,
             "soxx_r20": 0.1, "ndq_r20": 0.06, "fx_r20": -0.03, "fsi": 3.0, "liq_chg13": 0.04}
     parts = market.risk_parts(calm)
-    assert len(parts) == 9 and market.risk_total(parts) < 10 and market.risk_level(market.risk_total(parts))["name"] == "低"
+    assert len(parts) == 8 and "futures" not in {p["key"] for p in parts} and market.risk_total(parts) < 10 and market.risk_level(market.risk_total(parts))["name"] == "低"
     panic = {"regime": "bear", "drawdown": -0.3, "breadth": 5.0, "foreign20_ratio": -0.08, "foreign_streak": -12,
              "fut_pct": 0.0, "maint": 1.35, "vix": 40.0, "vix_term": 1.2, "oas": 7.0, "oas_chg10": 1.5,
              "soxx_r20": -0.2, "ndq_r20": -0.1, "fx_r20": 0.04, "fsi": -3.0, "liq_chg13": -0.06}
@@ -1093,3 +1093,11 @@ def test_fundamentals_losses_odd_yields_and_financials():
     us_loss, _ = scoring.fund_us({"pe": None, "eps_ttm": -0.04, "rev_yoy": 0})
     assert us_loss < 0
     assert industry_fallback("2885") == "金融保險業" and industry_fallback("6199") == "其他"
+
+
+def test_drawdown_odds_counts_falls_within_the_window():
+    idx = pd.bdate_range("2026-01-01", periods=60)
+    close = pd.Series(100.0, index=idx); close.iloc[30:40] = 90.0
+    groups = pd.Series(["a"] * 25 + ["b"] * 35, index=idx)
+    d = market.drawdown_odds(groups, close)
+    assert d["a"]["dd"] > 0.4 and d["b"]["dd"] < d["a"]["dd"]

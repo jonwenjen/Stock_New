@@ -293,7 +293,8 @@ def trim_ladder(ladder: list[list[float]], n: int = 14) -> list[list[float]]:
 def large_traders(rows: list[dict], contract: str = "TX") -> dict | None:
     """Net position of the ten largest traders across all months of an index future."""
     pool = [r for r in rows if r.get("Contract") == contract and r.get("TypeOfTraders") == "0"]
-    allm = [r for r in pool if r.get("SettlementMonth") == "999999"] or \
+    # all months combined: TAIFEX's OpenAPI labels it 999912 (the CSV download uses 999999)
+    allm = [r for r in pool if r.get("SettlementMonth") in ("999999", "999912")] or \
         sorted((r for r in pool if (r.get("SettlementMonth") or "").isdigit()
                 and r.get("SettlementMonth") != "666666"), key=lambda r: r["SettlementMonth"])[:1]
     if not allm:

@@ -29,13 +29,23 @@ http.HOST_INTERVAL.setdefault("www.taifex.com.tw", 2.0)
 
 
 def parse_futures_csv(text: str) -> dict[str, dict]:
-    """TAIFEX institutional futures download -> date -> foreign investors' TX net position."""
-    out = {}
+    """TAIFEX institutional futures download -> date -> TX net open interest of foreign investors
+    ("net_oi", plus "net_trade"), investment trusts ("trust_oi") and dealers ("dealer_oi").
+
+    The trusts' long position is mostly the hedge of leveraged TAIEX ETFs, and the foreign short
+    largely mirrors it, so the foreign figure alone overstates how bearish institutions are."""
+    out: dict[str, dict] = {}
     for line in text.splitlines()[1:]:
         c = [x.strip() for x in line.split(",")]
-        if len(c) >= 14 and c[1] == "臺股期貨" and c[2].startswith("外資"):
-            out[c[0].replace("/", "-")] = {"net_oi": float(c[13]), "net_trade": float(c[7])}
-    return out
+        if len(c) >= 14 and c[1] == "臺股期貨":
+            d = out.setdefault(c[0].replace("/", "-"), {})
+            if c[2].startswith("外資"):
+                d.update({"net_oi": float(c[13]), "net_trade": float(c[7])})
+            elif c[2].startswith("投信"):
+                d["trust_oi"] = float(c[13])
+            elif c[2].startswith("自營"):
+                d["dealer_oi"] = float(c[13])
+    return {k: v for k, v in out.items() if "net_oi" in v}
 
 
 def futures_history(start: str, end: str) -> dict[str, dict]:
@@ -95,7 +105,9 @@ def breakout_check(close: pd.Series, bidx: pd.Series, n: int = 20) -> dict | Non
 
 # ----------------------------- regime ----------------------------- #
 REGIMES = {"bull": "多頭趨勢", "range": "高檔盤整", "pullback": "多頭回檔", "rebound": "空頭反彈", "bear": "空頭趨勢"}
-REGIME_RISK = {"bull": 10.0, "range": 40.0, "pullback": 55.0, "rebound": 65.0, "bear": 90.0}
+# Only the bear state stood apart in five years of data (20-day drawdowns over 5%: bear 46%, the others
+# 8-16%, in no useful order), so the trend part separates bear from everything else.
+REGIME_RISK = {"bull": 20.0, "range": 20.0, "pullback": 20.0, "rebound": 20.0, "bear": 90.0}
 
 
 def regime_states(close: pd.Series, confirm: int = 3) -> pd.Series:
@@ -209,8 +221,11 @@ def linkage(tw: pd.Series, drivers: list[tuple[str, str, pd.Series, bool]], n: i
 # The OFR stress index is built from credit spreads and volatility (among others), both of which
 # already have a component here, so it is shown for context but no longer counted a third time;
 # its weight went to dollar liquidity, which none of the other components measures.
-RISK_PARTS = [("trend", "趨勢與週期", 20), ("breadth", "市場廣度", 15), ("foreign", "外資現貨", 10),
-              ("futures", "外資期貨", 10), ("margin", "融資槓桿", 10), ("vol", "波動率", 10),
+# Review 2026-11-14: the foreign futures position left the score (it mirrors the trusts' leveraged-ETF
+# hedge and correlates -0.9 with the index level); breadth went from 15 to 5 (no measurable information
+# over five years). The total is renormalised over what remains.
+RISK_PARTS = [("trend", "趨勢與週期", 20), ("breadth", "市場廣度", 5), ("foreign", "外資現貨", 10),
+              ("margin", "融資槓桿", 10), ("vol", "波動率", 10),
               ("credit", "信用利差", 10), ("intl", "國際連動", 15), ("liquidity", "美元流動性", 10)]
 RISK_LEVELS = [(30, "低", "s1", "七成以上"), (50, "中等", "s0", "五至七成"),
                (70, "偏高", "s-1", "三至五成"), (101, "高", "s-2", "三成以下")]
@@ -280,12 +295,27 @@ def risk_history(series: dict[str, pd.Series], index: pd.Index) -> pd.Series:
     return score[df.notna().sum(axis=1) >= 3].round(1)
 
 
+def drawdown_odds(groups: pd.Series, close: pd.Series, days: int = 20, threshold: float = 0.05) -> dict:
+    """For each group: how often the index fell more than `threshold` below the day's close at some
+    point in the next `days` sessions. This is what the risk score can tell apart; returns it cannot."""
+    close = close.dropna()
+    low = close[::-1].rolling(days, min_periods=days).min()[::-1].shift(-1)  # lowest close of the next `days`
+    hit = (low / close - 1 <= -threshold).where(low.notna())
+    out = {}
+    for g in groups.dropna().unique():
+        h = hit.reindex(groups.index[groups == g]).dropna()
+        if len(h) >= 10:
+            out[str(g)] = {"n": int(len(h)), "dd": round(float(h.mean()), 3)}
+    return out
+
+
 def bucket_stats(score: pd.Series, close: pd.Series) -> list[dict]:
-    """Forward index returns after days grouped by risk level - the score's own track record."""
+    """Forward index returns after days grouped by risk level - the score's own track record -
+    plus the chance of a drawdown of more than 5% within 20 sessions."""
     names = [lv[1] for lv in RISK_LEVELS]
     groups = pd.cut(score, [-0.1] + [lv[0] for lv in RISK_LEVELS], labels=names, right=False).astype(object)
-    stats = forward_stats(groups, close)
-    return [{"level": n, **stats[n]} for n in names if n in stats]
+    stats, dd = forward_stats(groups, close), drawdown_odds(groups, close)
+    return [{"level": n, **stats[n], "dd20": dd.get(n)} for n in names if n in stats]
 
 
 # ----------------------------- forecast accuracy ----------------------------- #
@@ -497,7 +527,9 @@ def alerts(x: dict) -> list[dict]:
     elif bo.get("kind") == "confirmed":
         add(0, "指數創高且廣度同步", f"廣度指數 {bo['breadth']:.0f}，突破有多數個股支持。")
     if bo.get("breadth_ago") is not None and bo["breadth_ago"] - bo["breadth"] >= 30:
-        add(1, "廣度一個月內大幅惡化", f"廣度指數由 {bo['n']} 日前的 {bo['breadth_ago']:.0f} 降到 {bo['breadth']:.0f}，多數個股已跌破均線。")
+        bc = g("breadth_chg5")
+        add(1, "廣度一個月內大幅惡化", f"廣度指數由 {bo['n']} 日前的 {bo['breadth_ago']:.0f} 降到 {bo['breadth']:.0f}，多數個股已跌破均線"
+            + (f"；但近 5 日 {bc:+.0f}，已在回升。" if bc is not None and bc >= 10 else "。"))
     b, bchg = g("breadth"), g("breadth_chg5")
     if b is not None and bchg is not None and bchg <= -15:
         add(1, "廣度快速惡化", f"廣度指數一週下降 {abs(bchg):.0f} 點，目前 {b:.0f}。")
@@ -506,11 +538,8 @@ def alerts(x: dict) -> list[dict]:
         add(2 if st <= -10 else 1, "外資連續賣超", f"外資已連續 {abs(st)} 日賣超。")
     elif st >= 5:
         add(0, "外資連續買超", f"外資已連續 {st} 日買超。")
-    if g("fut_pct") is not None and g("fut_pct") <= 0.1:
-        add(1, "外資台指期淨空單在一年高檔", f"淨未平倉 {g('fut_net'):+,.0f} 口，"
-                + ("是過去一年最偏空的水準。" if g("fut_pct") <= 0.01 else f"比過去一年 {1 - g('fut_pct'):.0%} 的日子更偏空。"))
-    if g("fut_chg5") is not None and g("fut_chg5") <= -15000:
-        add(1, "外資期貨空單快速增加", f"淨未平倉一週變化 {g('fut_chg5'):+,.0f} 口。")
+    if g("fut_all_chg5") is not None and g("fut_all_chg5") <= -15000:
+        add(1, "三大法人台指期淨部位快速轉空", f"外資＋投信＋自營商淨未平倉一週變化 {g('fut_all_chg5'):+,.0f} 口。")
     if g("maint") is not None and g("maint") < 1.5:
         add(2 if g("maint") < 1.4 else 1, "融資維持率偏低", f"大盤融資維持率估算約 {g('maint'):.0%}，接近 130% 追繳線時容易出現斷頭賣壓。")
     if g("vix_term") is not None and g("vix_term") >= 1:

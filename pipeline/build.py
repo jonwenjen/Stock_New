@@ -1461,7 +1461,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     mkt = safe("市場安全（風險分數、週期、連動、準確度）", lambda: build_market(
         frames, tframes, stocks, meta, flows, lead, tw_flow, records, tactical_prev, indices_out,
         trading_days[-1], today), None) or read_json(DATA / "market.json", {})
-    narrative = build_narrative(indices_out, tw_flow, picks, bullish, bearish)
+    narrative = build_narrative(indices_out, tw_flow, picks, bullish, bearish, (mkt or {}).get("risk"))
     def brief(r: dict) -> dict:
         out = {k: r.get(k) for k in ("code", "name", "market", "industry", "close", "chg5d", "r20", "overall", "label",
                                      "tactical", "structural", "setup", "rank", "reasons", "risks")}
@@ -1758,7 +1758,15 @@ def build_market(frames: dict, tframes: dict, stocks: list[str], meta: dict, flo
         x.update({"fut_net": float(fs.iloc[-1]), "fut_pct": leading.percentile(fs),
                   "fut_chg5": float(fs.iloc[-1] - fs.iloc[-6]) if len(fs) > 6 else None})
         fut_risk = (1 - fs.rolling(250, min_periods=120).rank(pct=True)) * 100
+        # foreign + trusts + dealers: the trusts' long (leveraged-ETF hedge) offsets most of the foreign short
+        last = fh[max(fh)]
+        both = pd.Series({pd.Timestamp(d): v["net_oi"] + v["trust_oi"] + v.get("dealer_oi", 0.0)
+                          for d, v in fh.items() if "trust_oi" in v}).sort_index()
+        x["fut_all_chg5"] = float(both.iloc[-1] - both.iloc[-6]) if len(both) > 6 else None
         fut_out = {"date": iso(fs.index[-1]), "net_oi": x["fut_net"], "chg5": x["fut_chg5"],
+                   "trust_oi": last.get("trust_oi"), "dealer_oi": last.get("dealer_oi"),
+                   "all_oi": float(both.iloc[-1]) if len(both) and both.index[-1] == fs.index[-1] else None,
+                   "all_chg20": float(both.iloc[-1] - both.iloc[-21]) if len(both) > 21 else None,
                    "chg20": float(fs.iloc[-1] - fs.iloc[-21]) if len(fs) > 21 else None, "pct": x["fut_pct"],
                    "min_250": float(fs.tail(250).min()), "max_250": float(fs.tail(250).max()),
                    "series": [{"date": iso(d), "v": float(v), "twii": float(twii.get(d)) if d in twii.index else None}
@@ -1805,8 +1813,6 @@ def build_market(frames: dict, tframes: dict, stocks: list[str], meta: dict, flo
         hs["intl"] = market.intl_risk(al(soxx).pct_change(20), al(ndq).pct_change(20), al(fxs).pct_change(20)).dropna()
     if nl is not None:
         hs["liquidity"] = market.liquidity_risk(nl.pct_change(13)).dropna()
-    if fut_risk is not None:
-        hs["futures"] = fut_risk.dropna()
     hist = market.risk_history(hs, states.index)
     risk_out = {"score": total, **market.risk_level(total), "parts": parts,
                 "history_parts": [n for k, n, _w in market.RISK_PARTS if k in hs],
@@ -1844,15 +1850,23 @@ def build_market(frames: dict, tframes: dict, stocks: list[str], meta: dict, flo
     # alerts need the previous run to tell what changed
     hist_path = DATA / "history" / "market.json"
     runs = [r for r in read_json(hist_path, []) if r["date"] != data_date]
-    prev = runs[-1] if runs else {}
+    # "previous" means the last run of an earlier ISO week: a re-run in the same week is not last week
+    wk = lambda d: dt.date.fromisoformat(d).isocalendar()[:2]  # noqa: E731
+    prev = next((r for r in reversed(runs) if wk(r["date"]) < wk(data_date)), {})
     x.update({"risk": total, "risk_prev": prev.get("risk"), "regime_prev_run": prev.get("regime")})
     alerts = market.alerts(x)
+    # every input and part score is kept, so a changed formula can later be re-tested on what it saw
+    keep = ("foreign20_ratio", "foreign_streak", "maint", "breadth", "fut_net", "fut_all_chg5", "vix", "vix_term",
+            "oas", "oas_chg10", "soxx_r20", "ndq_r20", "fx_r20", "liq_chg13", "drawdown")
     runs.append({"date": data_date, "risk": total, "breadth": x["breadth"], "regime": reg["state"],
-                 "fut_net": x.get("fut_net"), "alerts": len([a for a in alerts if a["level"] == 2])})
+                 "fut_net": x.get("fut_net"), "alerts": len([a for a in alerts if a["level"] == 2]),
+                 "parts": {p["key"]: p["risk"] for p in parts},
+                 "inputs": {k: (round(x[k], 4) if isinstance(x.get(k), float) else x.get(k)) for k in keep}})
     write_json(hist_path, runs[-260:])
 
     tw = next((i for i in indices_out if i["symbol"] == "TWII"), None)
-    return {"date": data_date, "risk": risk_out, "risk_prev": prev.get("risk"), "regime": reg, "breadth": breadth_out,
+    return {"date": data_date, "risk": risk_out, "risk_prev": prev.get("risk"), "risk_prev_date": prev.get("date"),
+            "regime": reg, "breadth": breadth_out,
             "futures": fut_out, "stress": stress_out, "linkage": link, "accuracy": accuracy,
             "accumulating": acc, "weakening": weak, "alerts": alerts, "runs": runs[-26:],
             "index_outlook": {h: {**tw["horizons"][h], "days": d,
@@ -2240,8 +2254,8 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
             line.append(acc)
         twii = frames["TWII"]["close"]
         idx_up = len(twii) > len(ten) and float(twii.iloc[-1]) > float(twii.iloc[-len(ten) - 1])
-        cards.append(_card("ad", "全市場漲跌家數（上市普通股）", f"漲 {last['adv']}・跌 {last['dec']}",
-                           f"近 {len(ten)} 日漲跌比 {ratio:.2f}・{last['date'][5:]}",
+        cards.append(_card("ad", "全市場漲跌家數（上市普通股）", f"近 {len(ten)} 日漲跌比 {ratio:.2f}",
+                           f"{last['date'][5:]} 單日 漲 {last['adv']}・跌 {last['dec']}",
                            ("指數上漲但下跌家數較多：漲勢集中在少數權值股，廣度沒有跟上。" if idx_up and ratio < 0.95 else
                             "指數下跌但上漲家數較多：賣壓集中在權值股，中小型股相對有撐。" if not idx_up and ratio > 1.05 else
                             "上漲家數明顯多於下跌，漲勢普遍。" if ratio >= 1.2 else
@@ -2350,7 +2364,7 @@ def next_wednesday(d: dt.date) -> dt.date:
 
 
 def build_narrative(indices: list[dict], fl: dict, picks: list[dict], bull: list[dict],
-                    bear: list[dict]) -> list[dict]:
+                    bear: list[dict], mkt_risk: dict | None = None) -> list[dict]:
     """Rule-based weekly reading - always available, no LLM involved."""
     by = {i["symbol"]: i for i in indices}
     out = []
@@ -2401,25 +2415,20 @@ def build_narrative(indices: list[dict], fl: dict, picks: list[dict], bull: list
     for i in (tw, sp):
         if not i or "horizons" not in i:
             continue
-        f0 = next(iter(i["horizons"].values()))
         parts = [f"{hz[h]}一個標準差區間 {f['low']:,.0f}–{f['high']:,.0f}（近 5 年同期間上漲比率 {f['p_up']:.0%}）"
                  for h, f in i["horizons"].items() if f.get("p_up") is not None]
         if parts:
-            out.append({"title": f"{i['name']}展望", "text": f"技術與籌碼評分為「{f0['label']}」。" + "；".join(parts)
+            out.append({"title": f"{i['name']}展望", "text": "；".join(parts)
                         + "。上漲比率是歷史統計，不是預測。"})
 
-    tw_s = tw["horizons"]["1m"]["score"] if tw and "horizons" in tw else 0
-    if tw_s >= 0.15:
-        adv = "大盤中期偏多，可維持六至八成持股，以精選名單中趨勢與籌碼同步的個股為主，沿月線操作。"
-    elif tw_s > -0.15:
-        adv = "大盤方向不明，建議持股五成上下，汰弱留強，新倉以拉回支撐不破者為限。"
-    else:
-        adv = "大盤中期偏空，建議降低持股至三至五成，反彈減碼弱勢股，保留現金等待籌碼回穩。"
+    rk = (mkt_risk or {})
+    adv = (f"短期回檔風險為「{rk['name']}」（{rk['score']:.0f} 分），此等級對應的經驗持股區間為{rk['exposure']}（未經驗證，只是預設值，請依自己的承受度調整）。"
+           if rk.get("name") and rk.get("score") is not None else "")
     if bull and bear:
         top = [r["name"] for r in bull if r["market"] == "TW"][:4]
         low = [r["name"] for r in bear if r["market"] == "TW"][:4]
         adv += f"台股同市場排名最前：{'、'.join(top)}；排名最後：{'、'.join(low)}。"
-    adv += "持股比例是控制總部位的經驗法則，未經驗證；所有價位皆為參考，請務必設定停損。"
+    adv += "排名只比較股票之間的相對強弱，不是方向預測；所有價位皆為參考。"
     out.append({"title": "操作建議", "text": adv})
     return out
 

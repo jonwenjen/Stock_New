@@ -88,6 +88,7 @@
 - `picks`、`bullish`、`bearish` 每檔有 `rank`（同市場排名 [名次, 總數]）、`p_beat_1m`（一月跑贏同市場中位數的機率）、
   `tactical`（籌碼分，只有台股）、`structural`（基本面分）、`setup`（兩者的組合判讀）與 `official_flags`
   （punish 處置、notice 注意、near_punish 可能處置、exdiv 即將除權息）。精選不會有處置股；有其他旗標的要在操作建議中點名。
+  台股名單包含成交金額前 30 檔上櫃股（symbol 以 .TWO 結尾），提到時註明「上櫃」。
   `picks_track` 是過去精選名單的實際表現，有資料時在操作建議中如實交代，  落後大盤也要寫。
 - `market` 也要用到 `market_safety`：「本週盤勢重點」帶出風險分數（`risk.score`、`risk.name`，並說明最高的兩三項
   `risk.parts`）與市場週期（`regime.name`、`regime.days`）；「籌碼面」帶出外資台指期（`futures.net_oi`、`futures.chg5`）；

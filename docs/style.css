@@ -21,7 +21,7 @@
   --ma2: #eb6834;
   --ma3: #6250d6;
   --shadow: 0 1px 2px rgba(19, 26, 39, .06), 0 8px 24px rgba(19, 26, 39, .06);
-  --font: "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", system-ui, sans-serif;
+  --font: "PingFang TC", "Microsoft JhengHei", "Noto Sans TC", "Noto Sans CJK TC", "Heiti TC", system-ui, sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   --r: 10px;
 }
@@ -376,3 +376,22 @@ section[id^="kbg-"] { scroll-margin-top: calc(var(--mast-h, 140px) + 12px); }
 .chip.flag { background: var(--rk2-soft); color: var(--rk2); border-color: transparent; font-weight: 500; }
 .cal { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; font-size: 13px; }
 details > summary { cursor: pointer; }
+
+/* ---------- watchlist search ---------- */
+#watch-q { width: 100%; }
+.sugg { display: grid; gap: 4px; }
+.sugg:empty { display: none; }
+.sugg-item { text-align: left; border: 1px solid var(--line); background: var(--surface-2); border-radius: 8px; padding: 6px 10px; cursor: pointer; }
+.sugg-item:hover { border-color: var(--accent); }
+
+/* ---------- phone: the masthead folds away once the reader scrolls ---------- */
+@media (max-width: 560px) {
+  .mast-row { transition: none; }
+  body.scrolled .mast-row { display: none; }
+  body.scrolled .subtabs { padding-block: 6px; }
+  .stamp span:nth-child(2), .stamp span:nth-child(3) { display: none; }
+}
+/* ---------- contrast: small grey text reaches WCAG AA on both themes ---------- */
+:root { --ink-3: #6b7482; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --ink-3: #8d97a6; } }
+:root[data-theme="dark"] { --ink-3: #8d97a6; }

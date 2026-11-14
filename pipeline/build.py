@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import funds, http, indicators, leading, market, media, prices, scoring, twse, us_data
+from . import funds, http, indicators, leading, market, media, prices, scoring, tpex, twse, us_data
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "docs" / "data"
@@ -368,6 +368,96 @@ def cached_day(date: str) -> dict:
     return data
 
 
+def update_derivs(today: dt.date, twii: pd.Series) -> dict[str, dict]:
+    """Daily derivatives positioning kept in history/tw_derivs.json, from TAIFEX's dated CSVs.
+
+    The OpenAPI only serves the latest day, so the first run back-fills twelve months (one
+    window of six requests per month, newest first); later runs refresh the last ~40 days.
+    """
+    path = DATA / "history" / "tw_derivs.json"
+    store = read_json(path, {})
+    n_windows = 2 if len(store) >= 200 or QUICK else 13
+    # Two of the downloads return nothing when the end date is past the latest published day.
+    end = min(today, twii.index[-1].date()) if len(twii) else today
+    for i in range(n_windows):
+        start = end - dt.timedelta(days=30 if i else 20)
+        try:
+            for d, v in leading.derivatives_window(start.isoformat(), end.isoformat()).items():
+                store.setdefault(d, {}).update(v)
+        except Exception as e:  # noqa: BLE001 - a missing month only shortens the history
+            log(f"  derivatives {start}..{end}: {str(e)[:100]}")
+        end = start - dt.timedelta(days=1)
+    for d, v in store.items():
+        c = twii.get(pd.Timestamp(d))
+        if v.get("settle") and c is not None and not pd.isna(c):
+            v["basis"] = round(v["settle"] - float(c), 1)
+    store = {d: store[d] for d in sorted(store)[-520:]}
+    write_json(path, store)
+    if not store:
+        raise RuntimeError("no derivatives history")
+    return store
+
+
+def update_qfii(trading_days: list[str], codes: set[str]) -> dict[str, dict]:
+    """Foreign holding ratio per listed stock today and 20 sessions ago (two requests; cached
+    locally), archived weekly in history/tw_qfii.json. {code: {"pct", "room", "chg20"}}."""
+    days = [trading_days[-1], trading_days[-21]] if len(trading_days) > 21 else trading_days[-1:]
+
+    def get(d: str) -> dict:
+        path = ROOT / ".cache" / "twse_qfii" / f"{d}.json"
+        if path.exists():
+            return read_json(path, {})
+        data = twse.foreign_holding(d)
+        write_json(path, data)
+        return data
+
+    got = twse.fetch_days(days, get, "foreign holding", log)
+    now = got.get(days[0])
+    if not now:
+        raise RuntimeError("no foreign holding table")
+    ago = got.get(days[-1], {}) if len(days) > 1 else {}
+    hist = read_json(DATA / "history" / "tw_qfii.json", {})
+    hist[days[0]] = {c: v["pct"] for c, v in now.items() if c in codes and v.get("pct") is not None}
+    write_json(DATA / "history" / "tw_qfii.json", {d: hist[d] for d in sorted(hist)[-60:]})
+    out = {}
+    for c, v in now.items():
+        if v.get("pct") is None:
+            continue
+        a = (ago.get(c) or {}).get("pct")
+        out[c] = {"pct": v["pct"], "room": v.get("room"), "chg20": round(v["pct"] - a, 2) if a is not None else None}
+    return out
+
+
+def update_form4(tickers: list[str], ciks: dict, today: dt.date) -> dict:
+    """US insiders' open-market trades from SEC Form 4, kept in history/us_form4.json for 180 days.
+    Each filing is downloaded once; later runs only fetch filings they have not seen."""
+    path = DATA / "history" / "us_form4.json"
+    store = read_json(path, {"seen": {}, "trades": []})
+    since = (today - dt.timedelta(days=120 if not store["seen"] else 21)).isoformat()
+    seen, ok = set(store["seen"]), 0
+    for tkr in (tickers[:5] if QUICK else tickers):
+        cik = ciks.get(tkr.replace("-", "")) or ciks.get(tkr)
+        if not cik:
+            continue
+        try:
+            got = us_data.recent_form4(int(cik), since, seen)
+        except Exception as e:  # noqa: BLE001
+            log(f"  form4 {tkr}: {str(e)[:80]}")
+            continue
+        ok += 1
+        for acc, trades in got.items():
+            store["seen"][acc] = today.isoformat()
+            store["trades"] += [{**t, "ticker": tkr} for t in trades]
+    cut = (today - dt.timedelta(days=180)).isoformat()
+    store["trades"] = sorted((t for t in store["trades"] if t["date"] >= cut), key=lambda t: t["date"], reverse=True)
+    store["seen"] = {a: d for a, d in store["seen"].items() if d >= cut}
+    write_json(path, store)
+    log(f"form 4: {ok} companies checked, {len(store['trades'])} trades on file")
+    if tickers and not ok:
+        raise RuntimeError("no company could be checked")
+    return store
+
+
 def update_tdcc(codes: set[str]) -> dict[str, dict]:
     """Weekly TDCC shareholder distribution, archived in history/tdcc.json (the source only
     ever offers the latest week, so history exists only from the first week it was saved).
@@ -423,6 +513,101 @@ def build_calendar(data_date: str, flags: dict, meta: dict) -> list[dict]:
             out.append({"date": day.isoformat(), "kind": "財報", "text": "上市櫃公司季報（或年報）公布截止日"})
         day += dt.timedelta(days=1)
     return sorted(out, key=lambda x: (x["date"], x["kind"]))
+
+
+# ----------------------------- over-the-counter (TPEx) ----------------------------- #
+OTC_CACHE = ROOT / ".cache" / "tpex_days"
+
+
+def tpex_days(dates: list[str], fn, label: str) -> dict:
+    """twse.fetch_days for TPEx requests: same back-off, but a TPEx refusal must not stop TWSE requests."""
+    saved = twse.THROTTLED
+    twse.THROTTLED = False
+    try:
+        return twse.fetch_days(dates, fn, label, log, cooldown=45.0)
+    finally:
+        twse.THROTTLED = saved
+
+
+def cached_otc_day(d: str) -> dict:
+    path = OTC_CACHE / f"{d}.json"
+    if path.exists():
+        return read_json(path, {})
+    data = tpex.day_quotes(d)
+    write_json(path, data)
+    return data
+
+
+def otc_latest_day(trading_days: list[str]) -> dict:
+    """The newest OTC quote table available (today's may not be published yet)."""
+    got = tpex_days(trading_days[-1:], cached_otc_day, "OTC quotes")
+    if not got:
+        got = tpex_days(trading_days[-2:-1], cached_otc_day, "OTC quotes")
+    if not got:
+        raise RuntimeError("no OTC quote table")
+    return next(iter(got.values()))
+
+
+def update_otc_prices(trading_days: list[str], codes: list[str], actions: dict) -> dict[str, pd.DataFrame]:
+    """OTC price store in charts/<code>_TWO.json, built from TPEx's daily all-securities tables.
+
+    One request covers every OTC stock for a day; days are fetched newest first, at most 60
+    per run after the first (a new store needs about 260 sessions for the 52-week high).
+    """
+    cal = pd.DatetimeIndex(pd.to_datetime(trading_days))
+    stored = {c: load_store(f"{c}.TWO") for c in codes}
+    have = {d for c, (f, _) in stored.items() for d in f.index.strftime("%Y-%m-%d")}
+    window = trading_days[-(30 if QUICK else 260):]
+    cover = {d: sum(d in set(f.index.strftime("%Y-%m-%d")) for f, _ in stored.values()) for d in window} if have else {}
+    need = [d for d in window if cover.get(d, 0) < 0.8 * len(codes)]
+    cached = [d for d in need if (OTC_CACHE / f"{d}.json").exists()]
+    todo = [d for d in reversed(need) if d not in cached][:260 if not have else 60]
+    tables = {d: read_json(OTC_CACHE / f"{d}.json", {}) for d in cached}
+    tables.update(tpex_days(todo, cached_otc_day, "OTC quotes"))
+    out = {}
+    for code in codes:
+        old, prev = stored[code]
+        rows = [(d, *t[code]) for d, t in sorted(tables.items()) if code in t]
+        new = pd.DataFrame([r[1:] for r in rows], columns=prices.COLS, index=pd.to_datetime([r[0] for r in rows])) if rows else None
+        applied = prev.get("applied") or []
+        if new is not None and len(old):
+            new = new[~new.index.isin(old.index)]
+            if applied and len(new):
+                k = pd.Series([fill_scale(applied, t) for t in new.index], index=new.index)
+                new[["open", "high", "low", "close"]] = new[["open", "high", "low", "close"]].mul(k, axis=0)
+        df = prices.merge(new, old if len(old) else None)
+        if df.empty:
+            continue
+        df = clean(f"{code}.TWO", df, "TW", code=code, calendar=cal, events=actions.get(code), applied=applied)
+        applied, total = clean.last
+        payload = prices.compact(df, 5, prices.scale_rows(prev.get("w") or [], total))
+        payload.update({"symbol": f"{code}.TWO", "name": prev.get("name") or code, "i": [], "applied": applied})
+        write_json(CHARTS / f"{code}_TWO.json", payload)
+        if len(df) >= 60:
+            out[code] = df
+    log(f"OTC prices: {len(out)}/{len(codes)} stocks with 60+ sessions ({len(todo)} days requested)")
+    if codes and not out:
+        raise RuntimeError("no OTC price history yet")
+    return out
+
+
+def otc_stock_flows(trading_days: list[str]) -> tuple[list[str], dict[str, list[tuple]]]:
+    """Per-stock OTC net shares (foreign, trust) for the latest N sessions, kept in
+    history/tpex_stock_flows.json (in lots) like the listed-stock version."""
+    path = DATA / "history" / "tpex_stock_flows.json"
+    store: dict[str, dict] = read_json(path, {})
+    n = 5 if QUICK else CFG["stock_flow_days"]
+    need = [d for d in trading_days[-n:] if d not in store]
+    for d, table in tpex_days(need, tpex.inst_stocks, "OTC institutional").items():
+        store[d] = {c: [round(v[0] / 1000), round(v[1] / 1000)] for c, v in table.items()
+                    if tpex.COMMON_STOCK.match(c) and (v[0] or v[1])}
+    store = {d: store[d] for d in sorted(store)[-(n + 10):]}
+    write_json(path, store)
+    dates = sorted(store)[-n:]
+    if not dates:
+        raise RuntimeError("no OTC institutional data")
+    codes = set().union(*(set(store[d]) for d in dates))
+    return dates, {c: [tuple(x * 1000 for x in store[d].get(c, (0, 0))) for d in dates] for c in codes}
 
 
 def update_tw_actions(today: dt.date, backfill: int = 0, current: bool = True) -> dict[str, dict[str, float]]:
@@ -684,8 +869,6 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         r["name"] = quotes[r["code"]]["name"]
     first_by_code = {r["code"]: r for r in trust_first}
 
-    rev_hist = safe("公開資訊觀測站 月營收歷史", lambda: update_revenue_history(revenue), {},
-                    "https://mopsov.twse.com.tw")
 
     # ---- 3. universes -------------------------------------------------------
     forced = [k for k in CFG["aliases"] if k.isdigit()]
@@ -696,7 +879,30 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     if not tw_codes:  # TWSE snapshot down -> fall back to the well-known names
         tw_codes = forced
     us_list = CFG["us_universe"][:10] if QUICK else CFG["us_universe"]
-    tdcc = safe("集保 股權分散表（千張大戶）", lambda: update_tdcc(set(tw_codes)), {}, "https://www.tdcc.com.tw")
+    # Over-the-counter (TPEx) stocks: the most actively traded ones join the Taiwan universe.
+    otc_day = safe("櫃買中心 上櫃每日行情", lambda: otc_latest_day(trading_days), {}, "https://www.tpex.org.tw")
+    otc_codes = sorted((c for c in otc_day if tpex.COMMON_STOCK.match(c) and c not in quotes),
+                       key=lambda c: -(otc_day[c][3] * otc_day[c][4]))[:6 if QUICK else CFG.get("otc_universe_size", 30)]
+    otc_margin, otc_qfii = {}, {}
+    if otc_codes:
+        otc_val = safe("櫃買中心 本益比／殖利率", tpex.valuation, {}, "https://www.tpex.org.tw")
+        otc_rev = safe("櫃買中心 月營收", tpex.monthly_revenue, {}, "https://www.tpex.org.tw")
+        otc_eps = safe("櫃買中心 每股盈餘", tpex.quarterly_eps, {}, "https://www.tpex.org.tw")
+        otc_margin = safe("櫃買中心 融資融券", tpex.margin_latest, {}, "https://www.tpex.org.tw")
+        otc_flags = safe("櫃買中心 處置／注意股與除權息預告", tpex.trading_flags, {}, "https://www.tpex.org.tw")
+        otc_qfii = safe("櫃買中心 外資持股比率", tpex.foreign_holding, {}, "https://www.tpex.org.tw")
+        for dst, src in ((valuation, otc_val), (revenue, otc_rev), (eps, otc_eps), (margin_now, otc_margin), (flags, otc_flags)):
+            dst.update({c: v for c, v in src.items() if c not in dst})
+    tdcc = safe("集保 股權分散表（千張大戶）", lambda: update_tdcc(set(tw_codes) | set(otc_codes)), {}, "https://www.tdcc.com.tw")
+    qfii = safe("證交所 外資持股比率", lambda: update_qfii(trading_days, set(tw_codes)), {}, "https://www.twse.com.tw")
+    for c in otc_codes:  # OTC holding comes as a snapshot only; its 20-day change builds up from the weekly archive
+        if c in otc_qfii:
+            qfii[c] = {**otc_qfii[c], "chg20": None}
+    derivs = safe("期交所 期貨選擇權歷史（散戶、十大交易人、基差、Put/Call、外資選擇權）",
+                  lambda: update_derivs(today, twii["close"]), None, "https://www.taifex.com.tw") \
+        or read_json(DATA / "history" / "tw_derivs.json", {})
+    rev_hist = safe("公開資訊觀測站 月營收歷史", lambda: update_revenue_history(revenue, set(otc_codes)), {},
+                    "https://mopsov.twse.com.tw")
     liab = safe("FinMind 合約負債（資產負債表）", lambda: update_contract_liabilities(tw_codes[:5] if QUICK else tw_codes, today),
                 {}, "https://finmindtrade.com")
 
@@ -716,6 +922,31 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         else:
             meta[sym] = {"name": name, "market": "TW", "kind": "stock", "code": code, "scored": code in tw_codes,
                          "industry": revenue.get(code, {}).get("industry") or "其他"}
+    if otc_codes:
+        try:
+            ev = tpex.ex_rights_recent()
+            store = read_json(DATA / "history" / "tw_actions.json", {"done": [], "events": {}})
+            for c, d in ev.items():
+                store["events"].setdefault(c, {}).update(d)
+                actions.setdefault(c, {}).update(d)
+            write_json(DATA / "history" / "tw_actions.json", store)
+        except Exception as e:  # noqa: BLE001 - recent OTC actions only; older ones are bridged by sanitising
+            log(f"  OTC ex-rights: {e}")
+        try:
+            otc_flow_dates, otc_flows = otc_stock_flows(trading_days)
+            for c, v in otc_flows.items():
+                flow_map.setdefault(c, v)
+        except Exception as e:  # noqa: BLE001 - OTC chips then come from the margin data only
+            log(f"  OTC institutional trades: {e}")
+    otc_frames = safe("櫃買中心 上櫃個股每日行情", lambda: update_otc_prices(trading_days, otc_codes, actions), {},
+                      "https://www.tpex.org.tw") if otc_codes else {}
+    otc_codes = [c for c in otc_codes if c in otc_frames]
+    for code in otc_codes:
+        sym = f"{code}.TWO"
+        frames[sym] = otc_frames[code]
+        meta[sym] = {"name": (otc_margin.get(code) or {}).get("name") or load_store(sym)[1].get("name") or code,
+                     "market": "TW", "exchange": "OTC", "kind": "stock", "code": code, "scored": True,
+                     "industry": revenue.get(code, {}).get("industry") or "其他"}
     def us_prices(tkr: str) -> pd.DataFrame:
         raw = []
         try:
@@ -817,6 +1048,12 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
             log(f"  fundamentals {tkr}: {e}")
     SOURCES.append({"name": "SEC XBRL 美股財報 (EPS/營收)", "ok": okf > 0 or not ciks, "url": "https://data.sec.gov",
                     "note": f"{okf} 檔取得"})
+    form4 = safe("SEC Form 4 內部人交易", lambda: update_form4([s for s in stocks if meta[s]["market"] == "US"], ciks, today),
+                 None, "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4") \
+        or read_json(DATA / "history" / "us_form4.json", {"trades": []})
+    since90 = (today - dt.timedelta(days=90)).isoformat()
+    insider_us = {t: us_data.insider_summary([x for x in form4["trades"] if x["ticker"] == t], since90)
+                  for t in {x["ticker"] for x in form4["trades"]}}
 
     # ---- 6. podcasts + GitHub tools ----------------------------------------
     names: dict[str, list[str]] = {}
@@ -885,6 +1122,8 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         rec["hi52"] = None if pd.isna(row.get("hi52")) else float(row["hi52"])
         if m["market"] == "TW" and code in tdcc:
             rec["tdcc"] = tdcc[code]
+        if m["market"] == "TW" and code in qfii:
+            rec.update({"qfii": qfii[code]["pct"], "qfii_room": qfii[code]["room"], "qfii_chg20": qfii[code]["chg20"]})
         notes = scoring.tech_reasons(row)
         if m["market"] == "TW":
             fl = flow_map.get(code)
@@ -948,6 +1187,8 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
             chips, cn = scoring.chips_us(chips_in)
             rec.update({"congress_buys": c["buys"] if c else 0, "congress_sells": c["sells"] if c else 0,
                         "guru_net": guru_net.get(code, 0)})
+            if code in insider_us:
+                rec["insider_us"] = insider_us[code]
             fund_in = us_fund.get(code, {})
             fund, fn = scoring.fund_us(fund_in)
             rec.update({k: fund_in.get(k) for k in ("pe", "eps", "eps_ttm", "eps_yoy", "rev_yoy", "eps_period")})
@@ -1093,7 +1334,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     fund_records.sort(key=lambda r: -(r["score"] if r.get("score") is not None else -1))
 
     # ---- 8d. leading indicators and the record of past picks ------------------
-    lead = build_leading(frames, tframes, stocks, meta, flows, quotes, today)
+    lead = build_leading(frames, tframes, stocks, meta, flows, quotes, today, derivs)
     # One cohort per ISO week: a re-run within the week replaces that week's list.
     wk = lambda d: dt.date.fromisoformat(d).isocalendar()[:2]  # noqa: E731
     cohorts = [c for c in read_json(DATA / "history" / "picks.json", []) if wk(c["date"]) != wk(trading_days[-1])]
@@ -1324,6 +1565,14 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
             put(r["symbol"], "名人基金減碼", -1)
         if (r.get("congress_buys") or 0) - (r.get("congress_sells") or 0) >= 2:
             put(r["symbol"], "議員淨買進", 0)
+        iu = r.get("insider_us") or {}
+        if iu.get("buys"):
+            put(r["symbol"], "內部人買進", 1)
+        if (iu.get("sell_unplanned") or 0) >= 1e7:
+            put(r["symbol"], "內部人大額賣出", -1)
+        if r.get("qfii_chg20") is not None and abs(r["qfii_chg20"]) >= 2:
+            put(r["symbol"], f"外資持股 20 日{'增' if r['qfii_chg20'] > 0 else '減'} {abs(r['qfii_chg20']):.1f} 個百分點",
+                1 if r["qfii_chg20"] > 0 else -1)
         if r.get("mentions", 0) >= 2:
             hot_too = r["mentions"] >= 3 and ((r.get("rsi") or 0) >= 70 or (r.get("margin_chg5") or 0) >= 0.05)
             put(r["symbol"], "Podcast 過熱" if hot_too else "Podcast 熱議", -1 if hot_too else 0)
@@ -1353,7 +1602,10 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         "congress": {"trades": trades[:400], "live": congress_ok,
                      "by_ticker": sorted(({"ticker": k, **v} for k, v in csum.items()),
                                          key=lambda r: -(r["buys"] + r["sells"]))[:40]},
-        "gurus": gurus, "tw_insiders": sorted(tw_ins, key=lambda r: -(r["pledge"] or 0))})
+        "gurus": gurus, "tw_insiders": sorted(tw_ins, key=lambda r: -(r["pledge"] or 0)),
+        "us_insiders": {"trades": [t for t in form4["trades"] if t["date"] >= since90][:200],
+                        "by_ticker": sorted(({"ticker": k, "name": meta.get(k, {}).get("name", k), **v} for k, v in insider_us.items()),
+                                            key=lambda r: -(r["buy_value"] + r["sell_value"]))}})
     write_json(DATA / "podcasts.json", {"shows": shows, "mentions": mentions, "hot": hot,
                                         "names": {s: meta[s]["name"] for s in mentions if s in meta}})
     write_json(DATA / "etf.json", etf_records)
@@ -1589,7 +1841,7 @@ def market_digest(m: dict) -> dict | None:
             "weakening": [{k: r[k] for k in ("code", "name", "market", "chg5d", "tactical", "tags")} for r in m["weakening"][:8]]}
 
 
-def update_revenue_history(revenue: dict) -> dict[str, dict]:
+def update_revenue_history(revenue: dict, otc: set[str] | None = None) -> dict[str, dict]:
     """Monthly revenue per company for the last 15 months: {'YYYY-MM': {code: thousand TWD}}.
 
     The exchange's open data only has the latest month, so older months come once from
@@ -1608,12 +1860,15 @@ def update_revenue_history(revenue: dict) -> dict[str, dict]:
         wanted.append(f"{y}-{m:02d}")
         y, m = (y - 1, 12) if m == 1 else (y, m - 1)
     for ym in wanted:
-        if len(hist.get(ym, {})) >= 500:
-            continue
-        try:
-            hist.setdefault(ym, {}).update(leading.mops_revenue(ym))
-        except Exception as e:  # noqa: BLE001 - archive page missing or refused: try again next run
-            log(f"  revenue {ym}: {e}")
+        have = hist.get(ym, {})
+        for board, need in (("sii", sum(not c in (otc or ()) for c in have) < 500),
+                            ("otc", bool(otc) and sum(c in otc for c in have) < len(otc) * 0.5)):
+            if not need:
+                continue
+            try:
+                hist.setdefault(ym, {}).update(leading.mops_revenue(ym, board))
+            except Exception as e:  # noqa: BLE001 - archive page missing or refused: try again next run
+                log(f"  revenue {ym} {board}: {e}")
     hist = {k: hist[k] for k in sorted(hist)[-15:]}
     write_json(path, hist)
     return hist
@@ -1663,7 +1918,8 @@ CARD_GROUP = {"liq": "資金與跨市場", "otc": "市場廣度", "adr": "資金
               "hy": "資金與跨市場", "semis": "資金與跨市場", "vixts": "資金與跨市場",
               "breadth_tw": "市場廣度", "breadth_us": "市場廣度", "ad": "市場廣度",
               "retail": "期貨、選擇權與放空", "top10": "期貨、選擇權與放空", "basis": "期貨、選擇權與放空",
-              "pcr": "期貨、選擇權與放空", "optwall": "期貨、選擇權與放空", "sbl": "期貨、選擇權與放空"}
+              "pcr": "期貨、選擇權與放空", "optwall": "期貨、選擇權與放空", "sbl": "期貨、選擇權與放空",
+              "fo": "期貨、選擇權與放空"}
 
 
 def _card(key: str, name: str, value_text: str, change_text: str, reading: str, tone: int = 0,
@@ -1674,11 +1930,22 @@ def _card(key: str, name: str, value_text: str, change_text: str, reading: str, 
 
 
 def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, flows: list[dict],  # noqa: C901, PLR0915
-                  quotes: dict, today: dt.date) -> dict:
+                  quotes: dict, today: dt.date, derivs: dict | None = None) -> dict:
     """Indicators that tend to move before prices do. Shown for context only: none of
     them feeds the scores, because this site has no history yet to test them on.
     Each indicator is built on its own, so one failing source costs one card."""
     cards, series, extra = [], {}, {"sbl": None, "options": None, "regime": None, "liq_full": None}
+    dv = derivs or {}
+
+    def dseries(key: str) -> pd.Series:
+        return pd.Series({pd.Timestamp(d): v[key] for d, v in dv.items() if v.get(key) is not None}).sort_index()
+
+    def pct_note(key: str, value: float) -> str:
+        s_ = dseries(key)
+        if len(s_) < 120:
+            return ""
+        s_ = s_.tail(250)
+        return f"・高於一年 {float((s_ <= value).mean()):.0%} 的日子"
     pp = lambda x: f"{x * 100:+.1f} 個百分點"  # noqa: E731
     dated = lambda sr, n=250: [[d.strftime("%Y-%m-%d"), round(float(v), 4)] for d, v in sr.tail(n).items()]  # noqa: E731
     by_date = {r["date"]: r for r in flows}
@@ -1743,7 +2010,9 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
                             "散戶多空部位不極端，反向訊號不明顯。")
                            + "算法：小型臺指未平倉扣掉三大法人後的淨部位 ÷ 全市場未平倉。",
                            -1 if r >= 0.2 else 1 if r <= -0.2 else 0,
+                           dseries("retail_mtx").tail(120) if len(dseries("retail_mtx")) else
                            [x["retail_mtx"] for x in flows if x.get("retail_mtx") is not None][-60:]))
+        cards[-1]["change_text"] += pct_note("retail_mtx", r)
 
     def pcr():
         rows = leading.put_call()
@@ -1754,7 +2023,25 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
         cards.append(_card("pcr", "台指選擇權 Put/Call 未平倉比", f"{now:.0%}", f"5 日 {pp(now - rows[-6]['pcr_oi'])}",
                            ("高於 100%：賣權未平倉多於買權，一般解讀為下檔有支撐、偏多。" if now >= 1 else
                             "低於 100%：買權未平倉多於賣權，一般解讀為上檔有壓、偏空。"),
-                           1 if now >= 1.1 else -1 if now < 0.9 else 0, [x["pcr_oi"] for x in rows]))
+                           1 if now >= 1.1 else -1 if now < 0.9 else 0,
+                           dseries("pcr_oi").tail(120) if len(dseries("pcr_oi")) > 20 else [x["pcr_oi"] for x in rows]))
+        cards[-1]["change_text"] += pct_note("pcr_oi", now)
+
+    def foreign_options():
+        c, p_ = dseries("fo_call"), dseries("fo_put")
+        if not len(c) or not len(p_):
+            raise RuntimeError("no foreign options history")
+        d = c.index[-1]
+        cn, pn = float(c.iloc[-1]), float(p_.get(d, float("nan")))
+        tone = leading.options_stance(cn, pn)
+        c5 = float(c.iloc[-1] - c.iloc[-6]) if len(c) > 6 else 0.0
+        cards.append(_card("fo", "外資台指選擇權淨未平倉", f"買權 {cn:+,.0f}・賣權 {pn:+,.0f} 口",
+                           f"買權 5 日 {c5:+,.0f}・{d:%m-%d}",
+                           ("外資淨買進買權、淨賣出賣權：兩者都在指數上漲時獲利，部位偏多。" if tone > 0 else
+                            "外資淨賣出買權、淨買進賣權：兩者都在指數下跌時獲利，部位偏空。" if tone < 0 else
+                            "買權與賣權方向不一致，可能是價差或避險組合，看不出明確方向。")
+                           + "外資常用選擇權搭配期貨與現貨避險，單看選擇權容易誤判，要和期貨未平倉一起看。",
+                           tone, (c - p_.reindex(c.index).fillna(0)).tail(120)))
 
     def sbl():
         mdates = [r["date"] for r in flows if r.get("margin_bal")]
@@ -1878,7 +2165,9 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
                            + ("部位明顯偏多。" if r >= 0.1 else "部位明顯偏空，大戶在避險或看空。" if r <= -0.1 else "幅度不大。")
                            + "大戶部位通常比散戶有參考性，方向與散戶相反時尤其值得留意。",
                            1 if r >= 0.1 else -1 if r <= -0.1 else 0,
+                           dseries("top10").tail(120) if len(dseries("top10")) else
                            [x["top10"] for x in flows if x.get("top10") is not None][-60:]))
+        cards[-1]["change_text"] += pct_note("top10", r)
 
     def basis():
         fb = leading.futures_basis(http.get_json(f"{leading.TAIFEX}/DailyMarketReportFut"))
@@ -1894,6 +2183,7 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
                             "逆價差：期貨比現貨便宜，" + ("幅度大，期貨市場偏悲觀或避險需求高。" if pct <= -0.005 else "幅度不大。"))
                            + "6–9 月除權息旺季的逆價差屬正常，接近結算日基差會收斂到零。",
                            1 if pct >= 0.003 else -1 if pct <= -0.005 else 0,
+                           dseries("basis").tail(120) if len(dseries("basis")) else
                            [x["basis"] for x in flows if x.get("basis") is not None][-60:]))
 
     def ad():
@@ -1937,6 +2227,7 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
                           ("期交所 十大交易人部位", top10, "https://openapi.taifex.com.tw"),
                           ("期交所 台指期基差", basis, "https://openapi.taifex.com.tw"),
                           ("期交所 選擇權 Put/Call 比", pcr, "https://openapi.taifex.com.tw"),
+                          ("期交所 外資選擇權部位", foreign_options, "https://www.taifex.com.tw"),
                           ("期交所 選擇權未平倉分布", options, "https://openapi.taifex.com.tw"),
                           ("證交所 借券賣出餘額", sbl, "https://www.twse.com.tw")):
         safe(f"領先指標：{name}", fn, None, url)

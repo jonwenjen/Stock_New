@@ -134,10 +134,10 @@ def parse_mops_revenue(html: str) -> dict[str, float]:
     return out
 
 
-def mops_revenue(ym: str) -> dict[str, float]:
-    """Listed companies' revenue for month 'YYYY-MM' from the MOPS static archive."""
+def mops_revenue(ym: str, board: str = "sii") -> dict[str, float]:
+    """Revenue for month 'YYYY-MM' from the MOPS static archive; board "sii" (listed) or "otc"."""
     y, m = int(ym[:4]) - 1911, int(ym[5:])
-    r = http.request("GET", f"https://mopsov.twse.com.tw/nas/t21/sii/t21sc03_{y}_{m}.html", retries=1, timeout=60)
+    r = http.request("GET", f"https://mopsov.twse.com.tw/nas/t21/{board}/t21sc03_{y}_{m}.html", retries=1, timeout=60)
     table = parse_mops_revenue(r.content.decode("big5", "ignore"))
     if len(table) < 200:
         raise RuntimeError(f"revenue table for {ym} looks incomplete ({len(table)} rows)")
@@ -566,3 +566,104 @@ def parse_tdcc(text: str, codes: set[str] | None = None) -> tuple[str | None, di
 def tdcc_distribution(codes: set[str]) -> tuple[str | None, dict[str, list]]:
     r = http.request("GET", "https://opendata.tdcc.com.tw/getOD.ashx", params={"id": "1-5"}, timeout=90)
     return parse_tdcc(r.content.decode("utf-8-sig", "replace"), codes)
+
+
+# ----------------------------- TAIFEX history downloads (CSV, Big5) ----------------------------- #
+TAIFEX_WWW = "https://www.taifex.com.tw/cht/3"
+
+
+def taifex_csv(path: str, start: str, end: str, **extra) -> list[list[str]]:
+    """One of TAIFEX's dated CSV downloads between two ISO dates (about a month per request)."""
+    r = http.request("POST", f"{TAIFEX_WWW}/{path}", timeout=90,
+                     data={"queryStartDate": start.replace("-", "/"), "queryEndDate": end.replace("-", "/"), **extra})
+    rows = [[c.strip() for c in line.split(",")] for line in r.content.decode("big5", "replace").splitlines()[1:]]
+    return [x for x in rows if len(x) > 3 and re.fullmatch(r"\d{4}/\d{2}/\d{2}", x[0])]
+
+
+def _iso(d: str) -> str:
+    return d.replace("/", "-")
+
+
+def parse_front_settle(rows: list[list[str]]) -> dict[str, float]:
+    """futDataDown (TX): front-month settlement price, regular session, per day."""
+    out: dict[str, tuple[str, float]] = {}
+    for r in rows:
+        if len(r) > 17 and re.fullmatch(r"\d{6}", r[2]) and r[17] == "一般" and num(r[10]):
+            d = _iso(r[0])
+            if d not in out or r[2] < out[d][0]:
+                out[d] = (r[2], num(r[10]))
+    return {d: v for d, (_, v) in out.items()}
+
+
+def parse_total_oi(rows: list[list[str]]) -> dict[str, float]:
+    """futDataDown (any contract): open interest summed over all months, regular session."""
+    out: dict[str, float] = {}
+    for r in rows:
+        if len(r) > 17 and re.fullmatch(r"\d{6}", r[2]) and r[17] == "一般" and num(r[11]) is not None:
+            out[_iso(r[0])] = out.get(_iso(r[0]), 0.0) + num(r[11])
+    return out
+
+
+def parse_inst_net_oi(rows: list[list[str]], product: str) -> dict[str, float]:
+    """futContractsDateDown: the three institutional groups' net open interest in one product."""
+    out: dict[str, float] = {}
+    for r in rows:
+        if len(r) >= 14 and r[1] == product and num(r[13]) is not None:
+            out[_iso(r[0])] = out.get(_iso(r[0]), 0.0) + num(r[13])
+    return out
+
+
+def parse_pcr_hist(rows: list[list[str]]) -> dict[str, float]:
+    """pcRatioDown: put/call open-interest ratio (1.0 = 100%)."""
+    return {_iso(r[0]): num(r[6]) / 100 for r in rows if len(r) > 6 and num(r[6])}
+
+
+def parse_top10_hist(rows: list[list[str]], contract: str = "TX") -> dict[str, float]:
+    """largeTraderFutDown: ten largest traders' net position across all months, share of open interest."""
+    out = {}
+    for r in rows:
+        if len(r) > 9 and r[1] == contract and r[3] == "999999" and r[4] == "0":
+            buy, sell, oi = num(r[7]), num(r[8]), num(r[9])
+            if oi:
+                out[_iso(r[0])] = (buy - sell) / oi
+    return out
+
+
+def parse_foreign_options(rows: list[list[str]]) -> dict[str, dict]:
+    """callsAndPutsDateDown (TXO): foreign investors' net open interest in calls and in puts."""
+    out: dict[str, dict] = {}
+    for r in rows:
+        if len(r) > 14 and r[1] == "臺指選擇權" and r[3].startswith("外資") and num(r[14]) is not None:
+            out.setdefault(_iso(r[0]), {})["call" if r[2].upper() == "CALL" else "put"] = num(r[14])
+    return {d: v for d, v in out.items() if len(v) == 2}
+
+
+def options_stance(call_net: float, put_net: float) -> int:
+    """Long calls and short puts both profit from a rise: +1 bullish, -1 bearish, 0 mixed."""
+    if call_net > 0 and put_net < 0:
+        return 1
+    if call_net < 0 and put_net > 0:
+        return -1
+    return 0
+
+
+def derivatives_window(start: str, end: str) -> dict[str, dict]:
+    """Every derivatives series the site charts, for one window (six CSV requests).
+    Returns {date: {"settle", "pcr_oi", "top10", "retail_mtx", "fo_call", "fo_put"}}."""
+    out: dict[str, dict] = {}
+    put = lambda d, k, v: out.setdefault(d, {}).__setitem__(k, round(v, 4))  # noqa: E731
+    for d, v in parse_front_settle(taifex_csv("futDataDown", start, end, down_type="1", commodity_id="TX")).items():
+        put(d, "settle", v)
+    for d, v in parse_pcr_hist(taifex_csv("pcRatioDown", start, end)).items():
+        put(d, "pcr_oi", v)
+    for d, v in parse_top10_hist(taifex_csv("largeTraderFutDown", start, end)).items():
+        put(d, "top10", v)
+    for d, v in parse_foreign_options(taifex_csv("callsAndPutsDateDown", start, end, commodityId="TXO")).items():
+        put(d, "fo_call", v["call"])
+        put(d, "fo_put", v["put"])
+    inst = parse_inst_net_oi(taifex_csv("futContractsDateDown", start, end, commodityId="MXF"), "小型臺指期貨")
+    total = parse_total_oi(taifex_csv("futDataDown", start, end, down_type="1", commodity_id="MTX"))
+    for d, n in inst.items():
+        if total.get(d):
+            put(d, "retail_mtx", -n / total[d])
+    return out

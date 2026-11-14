@@ -39,7 +39,7 @@
     bar.style.cssText = `width:${w}%;${score >= 0 ? "left:50%" : `left:${50 - w}%`};background:var(${score >= 0 ? "--up" : "--down"})`;
     return h("span", { class: "meter", role: "img", "aria-label": `分數 ${signed(score, 2)}` }, bar);
   };
-  const mkChip = (m) => h("span", { class: "chip mk" }, m === "TW" ? "台股" : "美股");
+  const mkChip = (m, sym) => h("span", { class: "chip mk" }, m === "TW" ? (sym && sym.endsWith(".TWO") ? "上櫃" : "台股") : "美股");
   const nameCell = (r) => h("span", { class: "nm-cell" }, h("b", {}, r.name), h("span", { class: "code" }, r.code));
 
   function spark(values) {
@@ -99,7 +99,7 @@
   // Two-level navigation: five groups, each holding the views that are read together.
   const NAV = [
     ["市場總覽", [["overview", "總覽與預測"], ["safety", "市場安全"], ["alerts", "漲跌預警"]]],
-    ["核心選股", [["picks", "精選 20 檔"], ["fund", "財報指標"], ["watch", "自選股"]]],
+    ["核心選股", [["picks", "精選 20 檔"], ["fund", "財報指標"], ["watch", "自選"]]],
     ["籌碼與聰明錢", [["flows", "外資法人"], ["margin", "融資融券"], ["smart", "名人・議員・董監"]]],
     ["資產配置", [["etf", "ETF"], ["funds", "基金"]]],
     ["輿情與知識", [["podcast", "Podcast"], ["learn", "指標與模型解說"], ["method", "方法與來源"]]]];
@@ -133,6 +133,7 @@
   };
   // Rank within the stock's own market, and the chance of beating that market's median stock.
   const rankText = (r) => (r.rank ? `排名 ${r.rank[0]}／${r.rank[1]}` : "");
+  const musd = (v) => (ok(v) ? "US" + "\u0024" + num(v / 1e6, 1) + "M" : "–");
   const relText = (r, h1 = "1m") => {
     const f = (r.horizons || {})[h1];
     if (!f || f.p_beat == null) return null;
@@ -309,6 +310,9 @@
     const nextDays = (iso, n) => { const out = []; let t = Date.parse(iso + "T00:00:00Z");
       while (out.length < n) { t += 864e5; const d = new Date(t).getUTCDay(); if (d !== 0 && d !== 6) out.push(new Date(t).toISOString().slice(0, 10)); } return out; };
     let rowsByTime = new Map();
+    // Support, stop and the one-month reference target as labelled lines (stocks and ETFs).
+    const planLines = opts.plan ? [["support", "支撐", "--ma1"], ["stop", "停損", "--down"], ["target", "一月目標", "--up"]]
+      .filter(([k]) => ok(opts.plan[k])).map(([k, t, c]) => [candle.createPriceLine({ price: opts.plan[k], title: t, lineWidth: 1, lineStyle: 2, axisLabelVisible: true }), c]) : [];
 
     const applyTheme = () => {
       chart.applyOptions(themeOpts());
@@ -316,6 +320,7 @@
       candle.applyOptions({ upColor: up, downColor: down, borderUpColor: up, borderDownColor: down, wickUpColor: up, wickDownColor: down });
       ["--ma1", "--ma2", "--ma3"].forEach((c, i) => mas[i].applyOptions({ color: css(c) }));
       cone.forEach((c) => c.applyOptions({ color: css("--ink-3") }));
+      planLines.forEach(([l, c]) => l.applyOptions({ color: css(c) }));
       navLine.applyOptions({ color: css("--ink") });
       if (state.data) draw();
     };
@@ -527,7 +532,7 @@
       ["經理人", r.manager], ["對比指數", r.bench_name]].filter(([, v]) => v);
     return [
       h("div", { class: "drawer-head" },
-        h("div", {}, h("div", { class: "t" }, r.name, h("span", { class: "chip mk" }, r.group), gradePill(r)),
+        h("div", {}, h("div", { class: "t" }, r.name, h("span", { class: "chip mk" }, r.group), gradePill(r), star(r.symbol)),
           h("div", { class: "row" }, h("span", { class: "p num" }, num(r.close, r.close < 100 ? 4 : 2)), numEl(pct(r.chg1d, 2), r.chg1d),
             h("span", { class: "muted small" }, `淨值日 ${r.date}・${r.currency}`))),
         h("button", { class: "close", type: "button", onclick: closeDrawer }, "關閉")),
@@ -576,13 +581,13 @@
     }
     const body = [];
     body.push(h("div", { class: "drawer-head" },
-      h("div", {}, h("div", { class: "t" }, item.name, r ? h("span", { class: "num muted small" }, r.code) : null, r ? mkChip(r.market) : null,
+      h("div", {}, h("div", { class: "t" }, item.name, r ? h("span", { class: "num muted small" }, r.code) : null, r ? mkChip(r.market, r.symbol) : null,
         r ? h("span", { class: "chip" }, r.industry) : null, r ? star(symbol) : null),
       h("div", { class: "row" }, h("span", { class: "p num" }, px(item.close)), numEl(pct(item.chg1d, 2), item.chg1d),
         h("span", { class: "muted small" }, "資料日 " + item.date)),
       r ? tagChips(r) : null),
       h("button", { class: "close", type: "button", onclick: closeDrawer }, "關閉")));
-    body.push(h("div", { class: "panel" }, priceChart(symbol, { range: "6m" })));
+    body.push(h("div", { class: "panel" }, priceChart(symbol, { range: "6m", plan: r && r.plan })));
     if (item.horizons) body.push(h("div", { class: "panel" }, h("h3", {}, "相對強弱與區間", help("labels", "預測標籤")), forecastGrid(item.horizons, r)));
     if (r) {
       const F = [["trend", "趨勢"], ["momentum", "動能"], ["chips", "籌碼"], ["fund", "基本面"], ["buzz", "聲量"]];
@@ -620,10 +625,15 @@
           ["純超額強度", ok(r.imom) ? signed(r.imom, 1) : "–"],
           ["距 52 週高點", ok(r.hi52) ? pct(r.hi52 - 1) : "–"],
           ["千張大戶持股", r.tdcc ? num(r.tdcc.big1000, 1) + "%" + (ok(r.tdcc.chg1000) ? `（週 ${signed(r.tdcc.chg1000, 2)}）` : "") : "–"],
-          ["股東人數週變化", r.tdcc && ok(r.tdcc.chg_holders) ? pct(r.tdcc.chg_holders) : "–"]]
+          ["股東人數週變化", r.tdcc && ok(r.tdcc.chg_holders) ? pct(r.tdcc.chg_holders) : "–"],
+          ["外資持股比例", ok(r.qfii) ? num(r.qfii, 1) + "%" : "–"],
+          ["外資持股 20 日", ok(r.qfii_chg20) ? signed(r.qfii_chg20, 2) + " pp" : "–"],
+          ["外資尚可投資", ok(r.qfii_room) ? num(r.qfii_room, 1) + "%" : "–"]]
         : [["本益比 (TTM)", num(r.pe, 1)], ["EPS (TTM)", num(r.eps_ttm, 2)], ["EPS 年增", pctRaw(r.eps_yoy, 0)],
           ["營收年增", pctRaw(r.rev_yoy, 0)], ["議員買 / 賣", `${r.congress_buys ?? 0} / ${r.congress_sells ?? 0}`],
           ["名人基金淨加碼", signed(r.guru_net, 0)], ["RSI(14)", num(r.rsi, 0)], ["年化波動", ok(r.vol_ann) ? num(r.vol_ann * 100, 0) + "%" : "–"],
+          ["內部人 90 日買進", r.insider_us ? r.insider_us.buys + " 筆・" + musd(r.insider_us.buy_value) : "–"],
+          ["內部人 90 日賣出", r.insider_us ? r.insider_us.sells + " 筆・" + musd(r.insider_us.sell_value) : "–"],
           ["純超額強度", ok(r.imom) ? signed(r.imom, 1) : "–"]];
       body.push(h("div", { class: "panel" }, h("h3", {}, "關鍵數據"), h("div", { class: "kv" },
         kv.map(([k, v]) => h("div", {}, h("div", { class: "k" }, k), h("div", { class: "v num " + (/^[+-][\d.,]+%$/.test(v) ? cls(parseFloat(v)) : "") }, v))))));
@@ -790,7 +800,7 @@
         h("button", { class: "pick", type: "button", "data-sym": r.symbol, onclick: () => openDrawer(r.symbol) },
           h("div", { class: "pick-top" },
             h("div", { class: "pick-id" }, h("div", { class: "rk" }, `#${i + 1}・${r.industry}`, diffBadges(r)),
-              h("div", { class: "t" }, r.name, h("span", { class: "num muted small" }, r.code), mkChip(r.market), star(r.symbol))),
+              h("div", { class: "t" }, r.name, h("span", { class: "num muted small" }, r.code), mkChip(r.market, r.symbol), star(r.symbol))),
             h("div", { class: "pick-px" }, h("div", { class: "p num" }, px(r.close)), h("div", { class: "num small " + cls(r.chg5d) }, "週 " + pct(r.chg5d)))),
           h("div", { class: "scorebar" }, "綜合", meter(r.overall), h("b", { class: "num " + cls(r.overall) }, signed(r.overall, 2)),
             h("span", { class: "chip mk" }, rankText(r)), r.kept ? h("span", { class: "chip", title: "排名仍在緩衝範圍內，續留名單" }, "續留") : null),
@@ -860,6 +870,21 @@
           h("div", { class: "panel" }, h("h3", {}, "外資近 5 日賣超前 15"), table(cols("張數"), F.foreign_sell, { onRow: open })),
           h("div", { class: "panel" }, h("h3", {}, "投信近 5 日買超前 15"), table(cols("張數"), F.trust_buy, { onRow: open })),
           h("div", { class: "panel" }, h("h3", {}, "投信近 5 日賣超前 15"), table(cols("張數"), F.trust_sell, { onRow: open }))),
+        (() => {
+          const rows = U.filter((r) => r.market === "TW" && ok(r.qfii_chg20));
+          if (rows.length < 10) return null;
+          const qcols = [
+            { key: "n", label: "個股", left: true, cell: (r) => h("span", {}, nameCell(r), " ", mkChip(r.market, r.symbol)) },
+            { key: "p", label: "外資持股", val: (r) => r.qfii, cell: (r) => h("span", { class: "num" }, num(r.qfii, 1) + "%") },
+            { key: "c", label: "20 日變化", val: (r) => r.qfii_chg20, cell: (r) => numEl(signed(r.qfii_chg20, 2) + " pp", r.qfii_chg20) },
+            { key: "r", label: "尚可投資", tip: "距法令上限還能買的比例", val: (r) => r.qfii_room, cell: (r) => h("span", { class: "num" }, ok(r.qfii_room) ? num(r.qfii_room, 1) + "%" : "–") },
+            { key: "w", label: "週漲跌", val: (r) => r.chg5d, cell: (r) => numEl(pct(r.chg5d), r.chg5d) }];
+          const sorted = [...rows].sort((a, b) => b.qfii_chg20 - a.qfii_chg20);
+          return h("div", { class: "grid g2" },
+            h("div", { class: "panel stack" }, h("h3", {}, "外資持股比例增加最多（20 日）", help("qfii", "外資持股比例")), table(qcols, sorted.slice(0, 15), { csv: false, onRow: (r) => openDrawer(r.symbol) })),
+            h("div", { class: "panel stack" }, h("h3", {}, "外資持股比例減少最多（20 日）"), table(qcols, sorted.slice(-15).reverse(), { csv: false, onRow: (r) => openDrawer(r.symbol) }),
+              h("p", { class: "chart-note" }, "買賣超是流量，持股比例是存量：比例已在高檔的股票，再賣的空間比再買大。上櫃股的 20 日變化要累積幾週存檔後才會出現。")));
+        })(),
         h("div", { class: "panel stack" }, h("h3", {}, "投信首買：安靜一段時間後開始連買", help("trust", "投信首買")),
           (F.trust_first || []).length ? table([
             { key: "n", label: "個股", left: true, cell: (r) => nameCell(r) },
@@ -1007,6 +1032,21 @@
             { key: "a", label: "上季動作", left: true, cell: (r) => h("span", { class: "chip " + r.action }, ACT[r.action] + (ok(r.chg) && r.action !== "hold" ? " " + pct(r.chg, 0) : "")) }],
           g.top.slice(0, 8), { onRow: (r) => bySymbol.has(r.ticker) && openDrawer(r.ticker) }),
           g.exits && g.exits.length ? h("p", { class: "small", style: "margin-top:8px" }, "上季出清：", g.exits.map((e) => h("span", { class: "chip exit", style: "margin-right:4px" }, e.ticker || e.name))) : null))),
+        (M.us_insiders && M.us_insiders.trades.length) ? h("div", { class: "grid g2 top" },
+          h("div", { class: "panel stack" }, h("h3", {}, "美股內部人 90 日買賣（SEC Form 4）", help("form4", "內部人交易")), table([
+            { key: "t", label: "代號", left: true, cell: (r) => h("span", {}, h("b", { class: "num" }, r.ticker), " ", h("span", { class: "small muted" }, r.name)) },
+            { key: "b", label: "買進", val: (r) => r.buy_value, cell: (r) => numEl(r.buys ? r.buys + " 筆 " + musd(r.buy_value) : "–", r.buys ? 1 : 0) },
+            { key: "s", label: "賣出", val: (r) => r.sell_value, cell: (r) => numEl(r.sells ? r.sells + " 筆 " + musd(r.sell_value) : "–", r.sells ? -1 : 0) },
+            { key: "u", label: "非預定賣出", tip: "不在 10b5-1 預定計畫內的賣出金額", val: (r) => r.sell_unplanned, cell: (r) => h("span", { class: "num" }, r.sell_unplanned ? musd(r.sell_unplanned) : "–") },
+            { key: "l", label: "最近一筆", cell: (r) => h("span", { class: "num small" }, r.last || "–") }], M.us_insiders.by_ticker, { sort: "b", onRow: (r) => bySymbol.has(r.ticker) && openDrawer(r.ticker) })),
+          h("div", { class: "panel stack" }, h("h3", {}, "最新內部人交易"), table([
+            { key: "d", label: "交易日", left: true, cell: (r) => h("span", { class: "num" }, r.date) },
+            { key: "t", label: "代號", left: true, cell: (r) => h("b", { class: "num" }, r.ticker) },
+            { key: "o", label: "內部人", left: true, wrap: true, cell: (r) => r.owner + "（" + r.role + "）" },
+            { key: "k", label: "買賣", left: true, cell: (r) => h("span", { class: "chip " + (r.type === "buy" ? "add" : "cut") }, (r.type === "buy" ? "買進" : "賣出") + (r.planned ? "・預定" : "")) },
+            { key: "v", label: "金額", cell: (r) => h("span", { class: "num" }, musd(r.value)) }],
+            [...M.us_insiders.trades].sort((a, b) => (b.type === "buy") - (a.type === "buy") || (b.date > a.date ? 1 : -1)).slice(0, 30), { csv: "us-insiders" }),
+            h("p", { class: "chart-note" }, "只列公開市場的買進與賣出，不含股票獎酬、贈與、行使選擇權與扣稅。「預定」是 10b5-1 預先排定的交易，參考性較低。內部人賣股的理由很多，買進通常只有一個：認為股價被低估。"))) : null,
         h("div", { class: "panel" }, h("h3", {}, "台股董監持股與質押（觀察名單）"), table([
           { key: "n", label: "個股", left: true, cell: (r) => nameCell(r) },
           { key: "p", label: "質押比", val: (r) => r.pledge, cell: (r) => h("span", { class: "num" }, num(r.pledge * 100, 1) + "%") },
@@ -1021,7 +1061,7 @@
     async fund() {
       const state = { m: "ALL", q: "" };
       const cols = [
-        { key: "n", label: "個股", left: true, cell: (r) => h("span", {}, nameCell(r), " ", mkChip(r.market)) },
+        { key: "n", label: "個股", left: true, cell: (r) => h("span", {}, nameCell(r), " ", mkChip(r.market, r.symbol)) },
         { key: "i", label: "產業", left: true, cell: (r) => r.industry },
         { key: "c", label: "收盤", val: (r) => r.close, cell: (r) => h("span", { class: "num" }, px(r.close)) },
         { key: "w", label: "週漲跌", val: (r) => r.chg5d, cell: (r) => numEl(pct(r.chg5d), r.chg5d) },
@@ -1099,50 +1139,80 @@
       const issues = (r) => [r.overall <= -0.15 ? "綜合評分偏空" : null, ok(r.tactical) && r.tactical <= -0.3 ? "籌碼明顯轉弱" : null,
         ok(r.rsi) && r.rsi >= 75 ? "RSI 過熱" : null, ok(r.maint_est) && r.maint_est < 1.4 ? "融資維持率偏低" : null,
         ...(r.tags || []).filter(([, tone]) => tone < 0).map(([t]) => t)].filter(Boolean);
-      const holder = h("div");
+      // A fund's warning signs are about whether it still earns its place, not about next week.
+      const fundIssues = (r) => [["偏弱", "落後"].includes(r.grade) ? `績效評等${r.grade}` : null,
+        ok(r.beat && r.beat["3y"]) && r.beat["3y"] < 40 ? `3 年同類排名只贏 ${num(r.beat["3y"], 0)}%` : null,
+        ok(r.excess_ann) && r.excess_ann <= -0.03 ? `年化落後指數 ${num(-r.excess_ann * 100, 1)} 個百分點` : null,
+        ok(r.mdd_3y) && r.mdd_3y <= -0.35 ? `3 年最大回檔 ${pct(r.mdd_3y, 0)}` : null,
+        r.horizons && r.horizons["1m"].score <= -0.45 ? "淨值趨勢強勢偏空" : null].filter(Boolean);
+      const holder = h("div", { class: "stack", style: "gap:20px" });
+      // Add anything the site covers - stocks, ETFs and funds - by name or code.
+      const pool = [...bySymbol.values()].filter((r) => r && r.symbol && r.name);
+      const sugg = h("div", { class: "sugg" });
+      const q = h("input", { type: "search", id: "watch-q", placeholder: "輸入名稱或代號加入自選，例如 台積電、0050、安聯台灣科技", "aria-label": "搜尋要加入自選的股票、ETF 或基金",
+        oninput: () => {
+          const v = q.value.trim().toLowerCase();
+          const hits = v ? pool.filter((r) => (r.name + " " + (r.code || "") + " " + r.symbol).toLowerCase().includes(v)).slice(0, 8) : [];
+          sugg.replaceChildren(...hits.map((r) => h("button", { type: "button", class: "sugg-item", onclick: () => {
+            if (!WATCH.has(r.symbol)) toggleWatch(r.symbol);
+            q.value = ""; sugg.replaceChildren(); draw();
+          } }, WATCH.has(r.symbol) ? "★ " : "☆ ", h("b", {}, r.name), " ", h("span", { class: "muted small num" }, r.code || r.symbol), " ",
+            h("span", { class: "chip" }, r.kind === "fund" ? "基金" : r.kind === "etf" ? "ETF" : r.market === "US" ? "美股" : "台股"))));
+        } });
       const draw = () => {
         const rows = [...WATCH].map((s) => bySymbol.get(s) || { symbol: s, gone: true });
         const live = rows.filter((r) => !r.gone && r.kind !== "fund"), gone = rows.filter((r) => r.gone), funds = rows.filter((r) => r.kind === "fund");
         const rm = (r) => h("button", { class: "linkish", type: "button", onclick: (e) => { e.stopPropagation(); toggleWatch(r.symbol); draw(); } }, "移除");
         holder.replaceChildren(...[
-          !rows.length ? h("div", { class: "panel empty stack", style: "align-items:center" }, h("div", {}, "還沒有自選股"),
-            h("div", { class: "small" }, "在任何個股的詳細頁或精選卡片上按 ☆，就會加入這裡。名單只存在這台裝置的瀏覽器，不會上傳。"),
-            h("a", { href: "#picks" }, "從精選 20 檔開始挑")) : null,
-          live.length ? h("div", { class: "stats" },
-            statBox("自選檔數", String(live.length), ""), statBox("偏多／偏空", `${live.filter((r) => r.overall >= 0.15).length}／${live.filter((r) => r.overall <= -0.15).length}`, "依綜合評分"),
-            statBox("有警訊的檔數", String(live.filter((r) => issues(r).length).length), "見「需要留意」欄"),
+          !rows.length ? h("div", { class: "panel empty stack", style: "align-items:center" }, h("div", {}, "還沒有自選標的"),
+            h("div", { class: "small" }, "用上方搜尋框加入，或在任何個股、ETF、基金的詳細頁與表格上按 ☆。名單只存在這台裝置的瀏覽器，不會上傳。"),
+            h("div", { class: "row" }, h("a", { href: "#picks" }, "從精選 20 檔挑"), h("a", { href: "#funds" }, "從基金評比挑"))) : null,
+          rows.length ? h("div", { class: "stats" },
+            statBox("自選股票／ETF", String(live.length), live.length ? `偏多 ${live.filter((r) => r.overall >= 0.15).length}・偏空 ${live.filter((r) => r.overall <= -0.15).length}` : ""),
+            statBox("自選基金", String(funds.length), funds.length ? `優異或良好 ${funds.filter((r) => ["優異", "良好"].includes(r.grade)).length} 檔` : ""),
+            statBox("有警訊", String(live.filter((r) => issues(r).length).length + funds.filter((r) => fundIssues(r).length).length), "見「需要留意」欄"),
             MK && MK.risk ? statBox("目前市場風險", `${num(MK.risk.score, 0)}・${MK.risk.name}`, `參考持股 ${MK.risk.exposure}`) : null) : null,
-          live.length ? h("div", { class: "panel stack" }, h("h3", {}, "自選股健檢"), table([
-            { key: "n", label: "標的", left: true, cell: (r) => h("span", {}, nameCell(r), " ", mkChip(r.market)) },
+          live.length ? h("div", { class: "panel stack" }, h("h3", {}, "股票與 ETF 健檢"), table([
+            { key: "n", label: "標的", left: true, cell: (r) => h("span", {}, nameCell(r), " ", mkChip(r.market, r.symbol)) },
             { key: "c", label: "收盤", val: (r) => r.close, cell: (r) => h("span", { class: "num" }, px(r.close)) },
             { key: "w", label: "週漲跌", val: (r) => r.chg5d, cell: (r) => numEl(pct(r.chg5d), r.chg5d) },
             { key: "o", label: "綜合分", val: (r) => r.overall, cell: (r) => h("span", { class: "row", style: "justify-content:flex-end;flex-wrap:nowrap" }, meter(r.overall), numEl(signed(r.overall, 2), r.overall)) },
+            { key: "2", label: "同市場排名", val: (r) => r.rank && -r.rank[0], cell: (r) => h("span", { class: "num" }, r.rank ? `${r.rank[0]}／${r.rank[1]}` : "–") },
             { key: "t", label: "籌碼分", val: (r) => r.tactical, cell: (r) => numEl(ok(r.tactical) ? signed(r.tactical, 2) : "–", r.tactical) },
             { key: "s", label: "基本面分", val: (r) => r.structural, cell: (r) => numEl(ok(r.structural) ? signed(r.structural, 2) : "–", r.structural) },
-            { key: "1", label: "評分", left: true, cell: (r) => pill(r.horizons["1m"]) },
-            { key: "2", label: "同市場排名", val: (r) => r.rank && -r.rank[0], cell: (r) => h("span", { class: "num" }, r.rank ? `${r.rank[0]}／${r.rank[1]}` : "–") },
             { key: "sp", label: "停損價（距離）", val: (r) => r.plan && r.plan.stop_pct, cell: (r) => h("span", { class: "num" }, r.plan ? `${px(r.plan.stop)}（−${num((r.plan.stop_pct || 0) * 100, 1)}%）` : "–") },
             { key: "ps", label: "部位上限", val: (r) => r.plan && r.plan.size, cell: (r) => h("span", { class: "num" }, r.plan && ok(r.plan.size) ? num(r.plan.size * 100, 0) + "%" : "–") },
             { key: "i", label: "需要留意", left: true, wrap: true, cell: (r) => { const x = issues(r); return x.length ? x.map((t) => h("span", { class: "chip cut", style: "margin:0 4px 2px 0" }, t)) : h("span", { class: "muted" }, "沒有警訊"); } },
             { key: "x", label: "", cell: rm }], live, { sort: "o", csv: "watchlist", onRow: (r) => openDrawer(r.symbol) }),
-            h("p", { class: "chart-note" }, "「需要留意」彙整各分頁的負面訊號：評分偏空、籌碼轉弱、過熱、融資壓力，以及外資賣超、借券大增等標籤。沒有警訊不代表安全，只代表規則沒有觸發。")) : null,
-          funds.length ? h("div", { class: "panel stack" }, h("h3", {}, "自選基金"), table([
-            { key: "n", label: "基金", left: true, wrap: true, cell: (r) => r.name }, { key: "e", label: "績效評等", left: true, cell: (r) => gradePill(r) },
-            { key: "s", label: "評分", val: (r) => r.score, cell: (r) => scoreCell(r) }, { key: "1y", label: "1 年", val: (r) => r.ret["1y"], cell: (r) => numEl(pct(r.ret["1y"]), r.ret["1y"]) },
-            { key: "t", label: "淨值趨勢", left: true, cell: (r) => (r.horizons ? pill(r.horizons["1m"]) : "–") }, { key: "x", label: "", cell: rm }], funds, { onRow: (r) => openDrawer(r.symbol) })) : null,
-          gone.length ? h("div", { class: "panel stack" }, h("h3", {}, "已不在本週觀察名單"),
-            h("p", { class: "small" }, "這些標的本週沒有資料（台股觀察名單取成交金額前 90 檔，會隨成交量進出）。"),
+            h("p", { class: "chart-note" }, "「需要留意」彙整各分頁的負面訊號：評分偏空、籌碼轉弱、過熱、融資壓力，以及處置、注意股、外資賣超、借券大增等標籤。沒有警訊不代表安全，只代表規則沒有觸發。")) : null,
+          funds.length ? h("div", { class: "panel stack" }, h("h3", {}, "基金健檢"), table([
+            { key: "n", label: "基金", left: true, wrap: true, cell: (r) => h("span", {}, h("b", { style: "font-weight:500" }, r.name), " ", h("span", { class: "chip" }, r.currency)) },
+            { key: "e", label: "績效評等", left: true, val: (r) => r.score, cell: (r) => gradePill(r) },
+            { key: "s", label: "評分", val: (r) => r.score, cell: (r) => scoreCell(r) },
+            { key: "1m", label: "1 月", val: (r) => r.ret["1m"], cell: (r) => numEl(pct(r.ret["1m"]), r.ret["1m"]) },
+            { key: "1y", label: "1 年", val: (r) => r.ret["1y"], cell: (r) => numEl(pct(r.ret["1y"]), r.ret["1y"]) },
+            { key: "3y", label: "3 年累積", val: (r) => r.ret["3y"], cell: (r) => numEl(pct(r.ret["3y"], 0), r.ret["3y"]) },
+            { key: "x", label: "年化勝過指數", val: (r) => r.excess_ann, cell: (r) => numEl(ok(r.excess_ann) ? signed(r.excess_ann * 100, 1) + " pp" : "–", r.excess_ann) },
+            { key: "b3", label: "同類 3 年", val: (r) => r.beat["3y"], cell: (r) => h("span", { class: "num" }, beatText(r.beat["3y"])) },
+            { key: "d", label: "3 年最大回檔", val: (r) => r.mdd_3y, cell: (r) => numEl(pct(r.mdd_3y, 0), r.mdd_3y) },
+            { key: "t", label: "淨值趨勢", left: true, cell: (r) => (r.horizons ? pill(r.horizons["1m"]) : "–") },
+            { key: "i", label: "需要留意", left: true, wrap: true, cell: (r) => { const x = fundIssues(r); return x.length ? x.map((t) => h("span", { class: "chip cut", style: "margin:0 4px 2px 0" }, t)) : h("span", { class: "muted" }, "沒有警訊"); } },
+            { key: "xx", label: "", cell: rm }], funds, { sort: "s", csv: "watchlist-funds", onRow: (r) => openDrawer(r.symbol) }),
+            h("p", { class: "chart-note" }, "基金看的是「還值不值得持有」：評等偏弱或落後、3 年同類排名在後段、長期落後對比指數、回檔過深都會列出。淨值趨勢只看最近的方向，與績效評等是兩回事。")) : null,
+          gone.length ? h("div", { class: "panel stack" }, h("h3", {}, "已不在本週資料中"),
+            h("p", { class: "small" }, "這些標的本週沒有資料（台股觀察名單取成交金額前段，會隨成交量進出；基金若來源暫時取不到也會出現在這裡）。"),
             h("div", { class: "row" }, gone.map((r) => h("span", { class: "chip" }, r.symbol, " ", rm(r))))) : null].filter(Boolean));
       };
       draw();
-      return [head("自選股", "把想追蹤的標的集中在一頁，每週更新後一次看完它們的評分、停損距離與各分頁的警訊。"), holder];
+      return [head("自選股與基金", "把想追蹤的股票、ETF 與基金集中在一頁，每週更新後一次看完評分、停損距離、基金績效與各分頁的警訊。"),
+        h("div", { class: "panel stack" }, q, sugg), holder];
     },
 
     async funds() {
       const state = { g: "ALL" };
       const groups = [...new Set(FUNDS.map((r) => r.group))];
       const cols = [
-        { key: "n", label: "基金", left: true, wrap: true, cell: (r) => h("span", {}, h("b", { style: "font-weight:500" }, r.name), " ", h("span", { class: "chip" }, r.currency)) },
+        { key: "n", label: "基金", left: true, wrap: true, cell: (r) => h("span", {}, star(r.symbol), " ", h("b", { style: "font-weight:500" }, r.name), " ", h("span", { class: "chip" }, r.currency)) },
         { key: "g", label: "類型", left: true, cell: (r) => h("span", { class: "chip mk" }, r.group) },
         { key: "e", label: "績效評等", left: true, val: (r) => r.score, cell: (r) => gradePill(r) },
         { key: "s", label: "評分", val: (r) => r.score, cell: (r) => scoreCell(r) },
@@ -1197,7 +1267,7 @@
       const BO = { confirmed: ["真突破：指數創高、廣度同步", "s1"], false_risk: ["假突破風險：指數創高、廣度沒跟上", "s-2"],
         washout: ["超賣：指數破底、廣度極低", "s-1"], divergence_up: ["底部背離：指數破底、廣度回升", "s1"], none: ["指數不在近 20 日高低點，沒有突破要驗證", "s0"] };
       const momTable = (rows) => table([
-        { key: "n", label: "個股", left: true, cell: (r) => h("span", {}, nameCell(r), " ", mkChip(r.market)) },
+        { key: "n", label: "個股", left: true, cell: (r) => h("span", {}, nameCell(r), " ", mkChip(r.market, r.symbol)) },
         { key: "c", label: "收盤", cell: (r) => h("span", { class: "num" }, px(r.close)) },
         { key: "w", label: "週漲跌", val: (r) => r.chg5d, cell: (r) => numEl(pct(r.chg5d), r.chg5d) },
         { key: "t", label: "籌碼分", val: (r) => r.tactical, cell: (r) => numEl(signed(r.tactical, 2), r.tactical) },
@@ -1314,7 +1384,7 @@
 
     async alerts() {
       const list = (rows, kind) => table([
-        { key: "n", label: "個股", left: true, cell: (r) => h("span", {}, nameCell(r), " ", mkChip(r.market)) },
+        { key: "n", label: "個股", left: true, cell: (r) => h("span", {}, nameCell(r), " ", mkChip(r.market, r.symbol)) },
         { key: "c", label: "收盤", cell: (r) => h("span", { class: "num" }, px(r.close)) },
         { key: "w", label: "週漲跌", cell: (r) => numEl(pct(r.chg5d), r.chg5d) },
         { key: "1", label: "評分", left: true, cell: (r) => pill(r.horizons["1m"]) },
@@ -1342,7 +1412,7 @@
         head("Podcast 熱議", "近兩週知名財經 Podcast 的節目標題與簡介中提到的個股與 ETF，並對照它們目前的數據。被討論不等於看多：聲量高而數據轉弱，往往是該小心的時候。"),
         aiBlock("本週 Podcast 話題解讀", AI && AI.podcast && AI.podcast.overview),
         h("div", { class: "panel stack" }, h("h3", {}, "熱議個股分析"), hot.length ? table([
-          { key: "n", label: "標的", left: true, cell: (r) => h("span", {}, nameCell(r), " ", mkChip(r.market)) },
+          { key: "n", label: "標的", left: true, cell: (r) => h("span", {}, nameCell(r), " ", mkChip(r.market, r.symbol)) },
           { key: "m", label: "提及集數", val: (r) => r.mentions, cell: (r) => h("b", { class: "num" }, r.mentions) },
           { key: "c", label: "收盤", val: (r) => r.close, cell: (r) => h("span", { class: "num" }, px(r.close)) },
           { key: "w", label: "週漲跌", val: (r) => r.chg5d, cell: (r) => numEl(pct(r.chg5d), r.chg5d) },
@@ -1370,7 +1440,7 @@
       const state = { m: "ALL", c: "ALL" };
       const cats = [...new Set(E.map((r) => r.industry))];
       const cols = [
-        { key: "n", label: "ETF", left: true, cell: (r) => h("span", {}, nameCell(r), " ", mkChip(r.market)) },
+        { key: "n", label: "ETF", left: true, cell: (r) => h("span", {}, star(r.symbol), " ", nameCell(r), " ", mkChip(r.market, r.symbol)) },
         { key: "i", label: "類別", left: true, cell: (r) => h("span", { class: "chip" + (/槓桿|反向/.test(r.industry) ? " warn" : "") }, r.industry) },
         { key: "c", label: "收盤", val: (r) => r.close, cell: (r) => h("span", { class: "num" }, px(r.close)) },
         { key: "w", label: "週", val: (r) => r.chg5d, cell: (r) => numEl(pct(r.chg5d), r.chg5d) },
@@ -1531,6 +1601,12 @@
   }
   // Anchored scrolling (knowledge entries) has to clear the sticky masthead, whose height depends on wrapping.
   const measureMast = () => document.documentElement.style.setProperty("--mast-h", document.querySelector(".mast").offsetHeight + "px");
+  // On a phone the masthead takes a quarter of the screen: fold the title row away while reading.
+  let folded = false;
+  window.addEventListener("scroll", () => {
+    const f = window.scrollY > 120;
+    if (f !== folded) { folded = f; document.body.classList.toggle("scrolled", f); measureMast(); }
+  }, { passive: true });
   window.addEventListener("resize", measureMast);
   // Unmount: destroy every chart of the view being left, so nothing of it can draw into the next one.
   function unmount() {

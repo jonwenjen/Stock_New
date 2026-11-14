@@ -233,3 +233,75 @@ def fundamentals(cik: int, price: float | None) -> dict:
     if best:
         out.update({"rev_yoy": best.get("yoy"), "revenue_ttm": best.get("ttm")})
     return out
+
+
+# ----------------------------- SEC Form 4: company insiders' own trades ----------------------------- #
+def _txt(node, path: str) -> str:
+    el = node.find(path)
+    return (el.text or "").strip() if el is not None and el.text else ""
+
+
+def parse_form4(xml: str) -> list[dict]:
+    """Open-market purchases (P) and sales (S) of common stock in one Form 4.
+
+    Grants, gifts, option exercises and tax withholding are left out: they are not decisions
+    to buy or sell at the market price. `planned` marks trades under a 10b5-1 plan, which
+    are scheduled in advance and say little about the insider's current view.
+    """
+    root = ET.fromstring(xml)
+    owner = _txt(root, "reportingOwner/reportingOwnerId/rptOwnerName")
+    rel = root.find("reportingOwner/reportingOwnerRelationship")
+    role = []
+    if rel is not None:
+        if _txt(rel, "isDirector") in ("1", "true"):
+            role.append("董事")
+        if _txt(rel, "isOfficer") in ("1", "true"):
+            role.append(_txt(rel, "officerTitle") or "高階主管")
+        if _txt(rel, "isTenPercentOwner") in ("1", "true"):
+            role.append("10% 大股東")
+    planned = _txt(root, "aff10b5One") in ("1", "true")
+    out = []
+    for t in root.findall("nonDerivativeTable/nonDerivativeTransaction"):
+        code = _txt(t, "transactionCoding/transactionCode")
+        if code not in ("P", "S"):
+            continue
+        try:
+            shares = float(_txt(t, "transactionAmounts/transactionShares/value") or 0)
+            price = float(_txt(t, "transactionAmounts/transactionPricePerShare/value") or 0)
+        except ValueError:
+            continue
+        if not shares:
+            continue
+        out.append({"date": _txt(t, "transactionDate/value")[:10], "owner": owner.title(), "role": "、".join(role) or "內部人",
+                    "type": "buy" if code == "P" else "sell", "shares": shares, "value": shares * price, "planned": planned})
+    return out
+
+
+def recent_form4(cik: int, since: str, seen: set[str], limit: int = 20) -> dict[str, list[dict]]:
+    """Form 4 filings for one company filed on or after `since` that are not in `seen`:
+    {accession number: [trades]} (empty list = filed but nothing to report)."""
+    j = http.get_json(f"{SEC}/submissions/CIK{cik:010d}.json")
+    r = j["filings"]["recent"]
+    out: dict[str, list[dict]] = {}
+    for form, acc, filed, doc in zip(r["form"], r["accessionNumber"], r["filingDate"], r["primaryDocument"]):
+        if form != "4" or filed < since or acc in seen:
+            continue
+        raw = doc.split("/")[-1]  # the primary document is an XSL rendering; the raw XML sits beside it
+        try:
+            xml = http.get_text(f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc.replace('-', '')}/{raw}", retries=1)
+            out[acc] = [{**t, "filed": filed} for t in parse_form4(xml)]
+        except Exception:  # noqa: BLE001 - one unreadable filing must not cost the rest
+            continue
+        if len(out) >= limit:
+            break
+    return out
+
+
+def insider_summary(trades: list[dict], since: str) -> dict:
+    """Per-company totals over trades dated on or after `since`."""
+    t = [x for x in trades if x["date"] >= since]
+    buys, sells = [x for x in t if x["type"] == "buy"], [x for x in t if x["type"] == "sell"]
+    return {"buys": len(buys), "sells": len(sells), "buy_value": sum(x["value"] for x in buys),
+            "sell_value": sum(x["value"] for x in sells),
+            "sell_unplanned": sum(x["value"] for x in sells if not x["planned"]),
+            "buyers": len({x["owner"] for x in buys}), "last": max((x["date"] for x in t), default=None)}

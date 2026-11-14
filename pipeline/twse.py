@@ -389,3 +389,11 @@ def trading_flags() -> dict[str, dict]:
     get = lambda path: http.get_json(f"{OPENAPI}/{path}")  # noqa: E731
     return parse_trading_flags(get("announcement/punish"), get("announcement/notice"),
                                get("announcement/notetrans"), get("exchangeReport/TWT48U_ALL"))
+
+
+def foreign_holding(date: str) -> dict[str, dict]:
+    """Foreign investors' holding per listed security on a date: {code: {"pct", "room", "limit"}} (percent)."""
+    j = _rwd("fund/MI_QFIIS", date=date.replace("-", ""), selectType="ALLBUT0999")
+    f = j["fields"]
+    i_p, i_r, i_l = f.index("全體外資及陸資持股比率"), f.index("外資及陸資尚可投資比率"), f.index("外資及陸資共用法令投資上限比率")
+    return {r[0].strip(): {"pct": num(r[i_p]), "room": num(r[i_r]), "limit": num(r[i_l])} for r in j["data"]}

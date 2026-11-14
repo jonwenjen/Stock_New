@@ -980,3 +980,77 @@ def test_previous_week_picks_ignore_the_same_week():
     assert leading.previous_week_picks(c, "2026-11-13") == {"A"}
     assert leading.previous_week_picks(c, "2026-11-18") == {"C"}
     assert leading.previous_week_picks([], "2026-11-18") == set()
+
+
+# ---------------- OTC, foreign holding, TAIFEX history, Form 4 ----------------
+def test_tpex_tables():
+    from pipeline import tpex
+    q = tpex.parse_day_quotes({"fields": ["代號", "名稱", "收盤 ", "漲跌", "開盤 ", "最高 ", "最低", "成交股數  "],
+                               "data": [["6488", "環球晶", "1,085.00", "+5", "1,055.00", "1,135.00", "1,045.00", "24,330,000"],
+                                        ["1234", "沒成交", "---", "", "", "", "", "0"]]})
+    assert q == {"6488": (1055.0, 1135.0, 1045.0, 1085.0, 24330000.0)}
+    row = ["6488", "環球晶", "1", "1", "741,269", "0", "0", "0", "1", "1", "741,269", "1", "1", "-341,881",
+           "1", "1", "-77,499", "1", "1", "-116,695", "1", "1", "-194,194", "205,194"]
+    assert tpex.parse_inst({"data": [row]}) == {"6488": (741269.0, -341881.0, -194194.0)}
+    bad = row[:]; bad[23] = "999"
+    with pytest.raises(ValueError):
+        tpex.parse_inst({"data": [bad]})
+    fl = tpex.parse_flags([{"SecuritiesCompanyCode": "6147", "DispositionPeriod": "1151112~1151118", "DispositionReasons": "連續3個營業日"}],
+                          [{"SecuritiesCompanyCode": "1815", "TradingInformation": "當沖比率", "Date": "1151113"}],
+                          [{"SecuritiesCompanyCode": "3105", "ExRrightsExDividendDate": "1151120", "ExRrightsExDividend": "除息", "CashDividend": "1.5"}])
+    assert fl["6147"]["punish"]["to"] == "2026-11-18" and fl["1815"]["notice"]["count"] == 1
+    assert fl["3105"]["exdiv"] == {"date": "2026-11-20", "kind": "息", "cash": 1.5}
+
+
+def test_foreign_holding_parser():
+    j = {"stat": "OK", "fields": ["證券代號", "證券名稱", "國際證券編碼", "發行股數", "外資及陸資尚可投資股數", "全體外資及陸資持有股數",
+                                  "外資及陸資尚可投資比率", "全體外資及陸資持股比率", "外資及陸資共用法令投資上限比率"],
+         "data": [["2330", "台積電", "x", "1", "1", "1", 31.89, 68.1, "100.00"]]}
+    orig = twse._rwd
+    twse._rwd = lambda *a, **k: j
+    try:
+        assert twse.foreign_holding("2026-11-12")["2330"] == {"pct": 68.1, "room": 31.89, "limit": 100.0}
+    finally:
+        twse._rwd = orig
+
+
+def test_taifex_history_parsers():
+    from pipeline import leading
+    fut = [["2026/10/14", "TX", "202610", "1", "1", "1", "1", "1", "1", "1", "48798", "105601", "", "", "", "", "", "一般"],
+           ["2026/10/14", "TX", "202611", "1", "1", "1", "1", "1", "1", "1", "48900", "20000", "", "", "", "", "", "一般"],
+           ["2026/10/14", "TX", "202610", "1", "1", "1", "1", "1", "1", "1", "-", "-", "", "", "", "", "", "盤後"]]
+    assert leading.parse_front_settle(fut) == {"2026-10-14": 48798.0}
+    assert leading.parse_total_oi(fut) == {"2026-10-14": 125601.0}
+    assert leading.parse_pcr_hist([["2026/11/12", "1", "1", "98", "1", "1", "66.69"]]) == {"2026-11-12": pytest.approx(0.6669)}
+    lt = [["2026/10/14", "TX", "臺股期貨", "999999", "0", "1", "1", "85177", "83794", "126583"],
+          ["2026/10/14", "TX", "臺股期貨", "999999", "1", "1", "1", "1", "999", "126583"],
+          ["2026/10/14", "TX", "臺股期貨", "202610", "0", "1", "1", "1", "999", "126583"]]
+    assert leading.parse_top10_hist(lt) == {"2026-10-14": pytest.approx((85177 - 83794) / 126583)}
+    cp = [["2026/10/14", "臺指選擇權", "CALL", "外資及陸資", *["0"] * 10, "2250"],
+          ["2026/10/14", "臺指選擇權", "PUT", "外資及陸資", *["0"] * 10, "-4306"],
+          ["2026/10/14", "臺指選擇權", "CALL", "投信", *["0"] * 10, "99"]]
+    assert leading.parse_foreign_options(cp) == {"2026-10-14": {"call": 2250.0, "put": -4306.0}}
+    assert leading.options_stance(2250, -4306) == 1 and leading.options_stance(-1, 5) == -1 and leading.options_stance(1, 1) == 0
+    inst = [["2026/10/14", "小型臺指期貨", "自營商", *["0"] * 10, "-500"], ["2026/10/14", "小型臺指期貨", "外資", *["0"] * 10, "-1500"],
+            ["2026/10/14", "臺股期貨", "外資", *["0"] * 10, "-9999"]]
+    assert leading.parse_inst_net_oi(inst, "小型臺指期貨") == {"2026-10-14": -2000.0}
+
+
+FORM4 = """<?xml version="1.0"?><ownershipDocument>
+<reportingOwner><reportingOwnerId><rptOwnerName>DOE JANE</rptOwnerName></reportingOwnerId>
+<reportingOwnerRelationship><isDirector>0</isDirector><isOfficer>1</isOfficer><officerTitle>CFO</officerTitle></reportingOwnerRelationship></reportingOwner>
+<aff10b5One>0</aff10b5One>
+<nonDerivativeTable>
+<nonDerivativeTransaction><transactionDate><value>2026-11-04</value></transactionDate><transactionCoding><transactionCode>P</transactionCode></transactionCoding>
+<transactionAmounts><transactionShares><value>1000</value></transactionShares><transactionPricePerShare><value>50.5</value></transactionPricePerShare></transactionAmounts></nonDerivativeTransaction>
+<nonDerivativeTransaction><transactionDate><value>2026-11-04</value></transactionDate><transactionCoding><transactionCode>G</transactionCode></transactionCoding>
+<transactionAmounts><transactionShares><value>9</value></transactionShares><transactionPricePerShare><value>0</value></transactionPricePerShare></transactionAmounts></nonDerivativeTransaction>
+</nonDerivativeTable></ownershipDocument>"""
+
+
+def test_form4_keeps_open_market_trades_only():
+    t = us_data.parse_form4(FORM4)
+    assert t == [{"date": "2026-11-04", "owner": "Doe Jane", "role": "CFO", "type": "buy", "shares": 1000.0,
+                  "value": 50500.0, "planned": False}]
+    s = us_data.insider_summary(t + [{"date": "2026-01-01", "type": "sell", "value": 9e9, "owner": "x", "planned": False}], "2026-08-01")
+    assert s["buys"] == 1 and s["sells"] == 0 and s["buyers"] == 1 and s["last"] == "2026-11-04"

@@ -5,6 +5,7 @@
     "max_per_industry": 3
   },
   "tw_universe_size": 90,
+  "otc_universe_size": 30,
   "flow_history_days": 40,
   "stock_flow_days": 20,
   "indices": [

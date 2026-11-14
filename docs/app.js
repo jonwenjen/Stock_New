@@ -829,7 +829,7 @@
             table([{ key: "n", label: "精選", left: true, cell: (x) => h("span", {}, x.r.name, " ", mkChip(x.r.market, x.r.symbol)) },
               { key: "s", label: "停損距離", val: (x) => x.r.plan && x.r.plan.stop_pct, cell: (x) => h("span", { class: "num" }, x.r.plan && ok(x.r.plan.stop_pct) ? num(x.r.plan.stop_pct * 100, 1) + "%" : "–") },
               { key: "a", label: "建議金額（台幣）", val: (x) => x.amt, cell: (x) => h("span", { class: "num" }, nf(0).format(x.amt)) },
-              { key: "q", label: "約當股數", val: (x) => x.shares, cell: (x) => h("span", { class: "num" }, x.r.market === "TW" ? lots(x.shares) : `${x.shares} 股`) }],
+              { key: "q", label: "約當股數", val: (x) => x.shares, cell: (x) => h("span", { class: "num" }, x.r.market === "TW" ? (x.shares ? lots(x.shares) : "不足 1 股") : (x.shares ? `${x.shares} 股` : "不足 1 股（可買零碎股）")) }],
               rows, { csv: "budget", sort: "a" }),
             small ? h("p", { class: "chart-note" }, `有 ${small} 檔台股單筆金額低於約 2.34 萬元：多數券商最低手續費 20 元，實際費率會比牌告高。`) : null);
         };
@@ -862,7 +862,7 @@
             h("div", { class: "pick-px" }, h("div", { class: "p num" }, px(r.close)), h("div", { class: "num small " + cls(r.chg5d) }, "週 " + pct(r.chg5d)))),
           h("div", { class: "scorebar" }, "綜合", meter(r.overall), h("b", { class: "num " + cls(r.overall) }, signed(r.overall, 2)),
             h("span", { class: "chip mk" }, rankText(r)), r.kept ? h("span", { class: "chip", title: "排名仍在緩衝範圍內，續留名單" }, "續留") : null),
-          r.watch_first ? h("div", { class: "tags" }, h("span", { class: "chip warn", title: "不代表會漲或會跌：買進前要先想清楚的事實" }, "先觀察：" + r.watch_first.join("・"))) : null,
+          r.watch_first ? h("div", { class: "tags" }, h("span", { class: "chip warn", style: "white-space:normal;text-align:left", title: "不代表會漲或會跌：買進前要先想清楚的事實" }, "先觀察：" + r.watch_first.join("・"))) : null,
           tagChips(r, r.watch_first ? 2 : 3),
           h("div", { class: "hz" }, relText(r) || "", dual(r)),
           h("ul", { class: "why" }, r.reasons.slice(0, 3).map((t) => h("li", { class: "pro" }, t)), r.risks.slice(0, 2).map((t) => h("li", { class: "con" }, t))),
@@ -1375,7 +1375,7 @@
               { key: "sh", label: "占比", cell: (r) => h("span", { class: "num" }, num(r.share * 100, 0) + "%") }, ...fwdCols],
             ["bull", "range", "pullback", "rebound", "bear"].filter((k) => G.stats[k]).map((k) => ({ name: { bull: "多頭趨勢", range: "高檔盤整", pullback: "多頭回檔", rebound: "空頭反彈", bear: "空頭趨勢" }[k], cur: k === G.state, ...G.stats[k] }))),
             h("p", { class: "chart-note" }, `依收盤價與季線、年線的位置分成五個階段，新階段須連續 3 日成立才算轉變。各欄為該階段之後 5／20／60 個交易日的上漲比率，括號內為平均報酬。統計自 ${G.sample_from} 起的每一個交易日，樣本彼此重疊，且這段期間台股整體大漲，各階段之後的上漲比率都偏高，請比較階段之間的差異而不是絕對數字。`))),
-        O ? h("div", { class: "panel stack" }, h("h3", {}, "加權指數：未來 5／20／60 日", help("pup", "近 5 年上漲比率")),
+        O ? h("div", { class: "panel stack" }, h("h3", {}, "加權指數：未來 5／20／60 日", help("horizons", "近 5 年上漲比率")),
           table([{ key: "h", label: "期間", left: true, cell: (r) => r.t },
             { key: "p", label: "近 5 年上漲比率", cell: (r) => h("span", { class: "num" }, ok(r.p_up) ? num(r.p_up * 100, 0) + "%" : "–") },
             { key: "r", label: "預估區間", cell: (r) => h("span", { class: "num" }, `${px(r.low)} – ${px(r.high)}`) },
@@ -1510,7 +1510,6 @@
         { key: "d", label: "一年最大回檔", val: (r) => r.mdd, cell: (r) => numEl(pct(r.mdd), r.mdd) },
         { key: "v", label: "年化波動", val: (r) => r.vol_ann, cell: (r) => h("span", { class: "num" }, ok(r.vol_ann) ? num(r.vol_ann * 100, 0) + "%" : "–") },
         { key: "f", label: "外資 5 日（張）", tip: "僅台股 ETF", val: (r) => r.foreign5, cell: (r) => numEl(ok(r.foreign5) ? signed(r.foreign5, 0) : "–", r.foreign5) },
-        rankCol,
         { key: "o", label: "綜合分", val: (r) => r.overall, cell: (r) => h("span", { class: "row", style: "justify-content:flex-end;flex-wrap:nowrap" }, meter(r.overall), numEl(signed(r.overall, 2), r.overall)) }];
       const tbl = table(cols, E, { sort: "o", onRow: (r) => openDrawer(r.symbol) });
       const apply = () => tbl.setRows(E.filter((r) => (state.m === "ALL" || r.market === state.m) && (state.c === "ALL" || r.industry === state.c)));
@@ -1612,7 +1611,7 @@
             h("p", { class: "small" }, "做法：過去約三年每 5 個交易日，用當時能取得的價格資料計算技術面分數，比較分數最高與最低各 20% 個股在之後一週／一月／一季的平均報酬。"),
             S.backtest_imom && Object.values(S.backtest_imom).some(Boolean) ? h("p", { class: "small" }, "對照：純超額強度（扣掉大盤後的個股動能）的 IC 為 " +
               Object.keys(HZ).map((k) => `${HZ[k]} ${S.backtest_imom[k] ? signed(S.backtest_imom[k].ic, 3) : "–"}`).join("、") + "。目前只列為參考欄位，未計入分數。", help("imom", "純超額強度")) : null,
-            h("p", { class: "small muted" }, "限制：樣本是「現在」的熱門股，存在倖存者偏差；籌碼與基本面因子沒有足夠歷史資料，未納入回測；過去績效不代表未來。"))),
+            h("p", { class: "small muted" }, "限制：樣本是「現在」的熱門股，存在倖存者偏差" + (S.selection_bias ? `（${S.selection_bias.from} 到 ${S.selection_bias.to} 的 ${S.selection_bias.days} 個交易日，今日名單等權 ${pct(S.selection_bias.today, 0)}，當時成交值前 90 名只有 ${pct(S.selection_bias.pit, 0)}，所以 IC 與跑贏比例都只是上限）` : "") + "；籌碼與基本面因子沒有足夠歷史資料，未納入回測；過去績效不代表未來。"))),
         calibNote() ? h("div", { class: "panel stack" }, h("h3", {}, "跑贏中位數機率的校準"), calibNote()) : null,
         (S.calendar || []).length ? h("div", { class: "panel stack" }, h("h3", {}, "接下來兩週的行事曆"), table([
           { key: "d", label: "日期", left: true, cell: (r) => h("span", { class: "num" }, r.date) },

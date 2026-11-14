@@ -7,12 +7,18 @@
 <title>週三選股雷達</title>
 <meta name="description" content="每週三更新：外資與融資動向、名人與議員持股、財報指標、Podcast 熱議、未來一週/一月/一季趨勢預測與精選 20 檔。">
 <link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap">
 <link rel="stylesheet" href="style.css">
 <link rel="preload" href="data/summary.json" as="fetch" crossorigin>
 <link rel="preload" href="data/universe.json" as="fetch" crossorigin>
+<link rel="preload" href="data/market.json" as="fetch" crossorigin>
+<link rel="preload" href="data/leading.json" as="fetch" crossorigin>
+<link rel="preload" href="data/ai.json" as="fetch" crossorigin>
+<link rel="alternate" type="application/atom+xml" title="週三選股雷達：本週變化" href="feed.xml">
 </head>
 <body>
+<a class="skip" href="#app">跳到主要內容</a>
 <header class="mast">
   <div class="wrap">
     <div class="mast-row">
@@ -27,13 +33,12 @@
     <nav class="subtabs" id="tabs" aria-label="分頁"><a href="#overview" aria-current="page">總覽與預測</a><a href="#alerts">漲跌預警</a></nav>
   </div>
 </header>
-<main class="wrap"><div id="app" class="view"><div class="empty">資料載入中…</div></div></main>
+<main class="wrap"><div id="app" class="view" tabindex="-1"><div class="empty">資料載入中…</div></div></main>
 <footer><div class="wrap"><p class="disclaimer">
   本站為程式自動彙整的研究資訊，所有分數、機率、價位皆為模型推估，不構成任何投資建議，亦不保證獲利。
   投資有風險，買賣前請自行判斷並控管部位。<span id="legend"></span>
 </p></div></footer>
 <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
-<script src="knowledge.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

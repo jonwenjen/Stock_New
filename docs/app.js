@@ -40,7 +40,9 @@
     return h("span", { class: "meter", role: "img", "aria-label": `分數 ${signed(score, 2)}` }, bar);
   };
   const mkChip = (m, sym) => h("span", { class: "chip mk" }, m === "TW" ? (sym && sym.endsWith(".TWO") ? "上櫃" : "台股") : "美股");
-  const nameCell = (r) => h("span", { class: "nm-cell" }, h("b", {}, r.name), h("span", { class: "code" }, r.code));
+  const nameCell = (r) => (r && r.symbol && bySymbol.has(r.symbol)
+    ? h("a", { class: "nm-cell", href: "#" + (current || "overview") + "?s=" + encodeURIComponent(r.symbol) }, h("b", {}, r.name), h("span", { class: "code" }, r.code))
+    : h("span", { class: "nm-cell" }, h("b", {}, r.name), h("span", { class: "code" }, r.code)));
 
   function spark(values) {
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -116,11 +118,10 @@
   };
   // A star that works inside a card that is itself a button (so it cannot be a <button>).
   const star = (sym) => {
-    const el = h("span", { class: "star", role: "button", tabindex: 0, "aria-pressed": String(WATCH.has(sym)), title: "加入或移出自選股" }, WATCH.has(sym) ? "★" : "☆");
-    const flip = (e) => { e.stopPropagation(); e.preventDefault(); toggleWatch(sym);
-      el.textContent = WATCH.has(sym) ? "★" : "☆"; el.setAttribute("aria-pressed", String(WATCH.has(sym))); };
-    el.addEventListener("click", flip);
-    el.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") flip(e); });
+    const nm = (bySymbol.get(sym) || {}).name || sym;
+    const el = h("button", { type: "button", class: "star", "aria-pressed": String(WATCH.has(sym)), "aria-label": "加入或移出自選：" + nm, title: "加入或移出自選" }, WATCH.has(sym) ? "★" : "☆");
+    el.addEventListener("click", (e) => { e.stopPropagation(); e.preventDefault(); toggleWatch(sym);
+      el.textContent = WATCH.has(sym) ? "★" : "☆"; el.setAttribute("aria-pressed", String(WATCH.has(sym))); });
     return el;
   };
   // Official trading flags (處置, 注意, 除權息) come first: they change what can actually be traded.
@@ -157,16 +158,16 @@
   // Rows and cards that open a chart carry data-sym; hovering or touching one starts fetching its chart file.
   const rowSym = (r) => (r && typeof r === "object" ? (r.symbol && bySymbol.has(r.symbol) ? r.symbol
     : r.code && bySymbol.has(r.code + ".TW") ? r.code + ".TW" : r.ticker && bySymbol.has(r.ticker) ? r.ticker : null) : null);
-  const preload = (e) => { const el = e.target.closest && e.target.closest("[data-sym]"); if (el) load("charts/" + fileOf(el.dataset.sym)).catch(() => {}); };
+  const preload = (e) => { if (e.pointerType && e.pointerType !== "mouse") return;
+    const el = e.target.closest && e.target.closest("[data-sym]"); if (el) load("charts/" + fileOf(el.dataset.sym)).catch(() => {}); };
   document.addEventListener("pointerover", preload, { passive: true });
   document.addEventListener("focusin", preload);
-  document.addEventListener("touchstart", preload, { passive: true });
 
   function table(cols, rows, opts = {}) {
     let sortKey = opts.sort || null, dir = opts.dir || -1;
     const tbody = h("tbody");
     const ths = cols.map((c) => h("th", { class: c.left ? "l" : null, "data-sort": c.val ? c.key : null,
-      scope: "col", title: c.tip || null }, c.label));
+      scope: "col", title: c.tip || null }, c.val ? h("button", { type: "button", class: "th-sort" }, c.label) : c.label));
     const draw = () => {
       const col = cols.find((c) => c.key === sortKey);
       const data = col ? [...rows].sort((a, b) => {
@@ -177,11 +178,14 @@
         return (x - y) * dir;
       }) : rows;
       tbody.replaceChildren(...data.map((r) => {
-        const tr = h("tr", { class: opts.onRow ? "click" : null, tabindex: opts.onRow ? 0 : null, "data-sym": rowSym(r) },
+        const tr = h("tr", { class: opts.onRow ? "click" : null, "data-sym": rowSym(r) },
           cols.map((c) => h("td", { class: [c.left ? "l" : "", c.wrap ? "wrap" : ""].join(" ").trim() || null }, c.cell(r))));
         if (opts.onRow) {
-          tr.addEventListener("click", () => opts.onRow(r));
-          tr.addEventListener("keydown", (e) => { if (e.key === "Enter") opts.onRow(r); });
+          tr.addEventListener("click", (e) => { if (!e.target.closest("a,button,input")) opts.onRow(r); });
+          if (!tr.querySelector("a[href]")) {  // no link to reach: the row itself takes the focus
+            tr.tabIndex = 0;
+            tr.addEventListener("keydown", (e) => { if (e.key === "Enter") opts.onRow(r); });
+          }
         }
         return tr;
       }));
@@ -190,7 +194,7 @@
     };
     ths.forEach((th, i) => {
       if (!cols[i].val) return;
-      th.addEventListener("click", () => {
+      th.querySelector(".th-sort").addEventListener("click", () => {
         if (sortKey === cols[i].key) dir = -dir; else { sortKey = cols[i].key; dir = -1; }
         draw();
       });
@@ -493,6 +497,7 @@
     drawerEl.querySelectorAll(".stack").forEach((n) => n.destroy && n.destroy());
     drawerEl.remove(); drawerEl = null; drawerSym = null;
     document.body.style.overflow = "";
+    document.querySelectorAll("body > header, body > main, body > footer").forEach((el) => { el.inert = false; });
     if (lastFocus && document.contains(lastFocus)) lastFocus.focus();
   }
   const closeDrawer = () => { if (drawerEl) setHash(current || "overview", {}); };
@@ -579,6 +584,7 @@
       drawerEl = h("div", { class: "scrim", onclick: (e) => { if (e.target === drawerEl) closeDrawer(); } }, fd);
       document.body.append(drawerEl);
       document.body.style.overflow = "hidden";
+      document.querySelectorAll("body > header, body > main, body > footer").forEach((el) => { el.inert = true; });
       fd.querySelector(".close").focus();
       return;
     }
@@ -657,12 +663,15 @@
     drawerEl = h("div", { class: "scrim", onclick: (e) => { if (e.target === drawerEl) closeDrawer(); } }, drawer);
     document.body.append(drawerEl);
     document.body.style.overflow = "hidden";
+    document.querySelectorAll("body > header, body > main, body > footer").forEach((el) => { el.inert = true; });
     drawer.querySelector(".close").focus();
+    const title = drawer.querySelector(".drawer-head .t");
+    if (title) document.title = item.name + "｜週三選股雷達";
   }
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDrawer(); });
 
   // ---------- views ----------
-  const head = (title, lead) => h("div", { class: "stack" }, h("h2", {}, title), lead ? h("p", { class: "lead" }, lead) : null);
+  const head = (title, lead) => h("div", { class: "stack" }, h("h1", { class: "h2" }, title), lead ? h("p", { class: "lead" }, lead) : null);
   const statBox = (k, v, s, c) => h("div", { class: "stat" }, h("div", { class: "k" }, k),
     h("div", { class: "v " + (/[\u4e00-\u9fff]{2}/.test(v) ? "txt " : "num ") + (c || "") }, v), s ? h("div", { class: "s" }, s) : null);
   const mdLite = (text) => text.split(/\n+/).filter((l) => l.trim()).map((l) =>
@@ -866,10 +875,10 @@
       const filter = { m: "ALL" };
       const grid = h("div", { class: "picks" });
       const draw = () => grid.replaceChildren(...S.picks.filter((r) => filter.m === "ALL" || r.market === filter.m).map((r, i) =>
-        h("button", { class: "pick", type: "button", "data-sym": r.symbol, onclick: () => openDrawer(r.symbol) },
+        h("article", { class: "pick", "data-sym": r.symbol },
           h("div", { class: "pick-top" },
             h("div", { class: "pick-id" }, h("div", { class: "rk" }, `#${i + 1}・${r.industry}`, diffBadges(r)),
-              h("div", { class: "t" }, r.name, h("span", { class: "num muted small" }, r.code), mkChip(r.market, r.symbol), star(r.symbol))),
+              h("h3", { class: "t" }, h("a", { class: "pick-link", href: "#picks?s=" + encodeURIComponent(r.symbol) }, r.name), h("span", { class: "num muted small" }, r.code), mkChip(r.market, r.symbol), star(r.symbol))),
             h("div", { class: "pick-px" }, h("div", { class: "p num" }, px(r.close)), h("div", { class: "num small " + cls(r.chg5d) }, "週 " + pct(r.chg5d)))),
           h("div", { class: "scorebar" }, "綜合", meter(r.overall), h("b", { class: "num " + cls(r.overall) }, signed(r.overall, 2)),
             h("span", { class: "chip mk" }, rankText(r)), r.kept ? h("span", { class: "chip", title: "排名仍在緩衝範圍內，續留名單" }, "續留") : null),
@@ -1574,6 +1583,7 @@
     },
 
     async learn() {
+      if (!window.KB) await new Promise((ok_, bad) => { const sc = document.createElement("script"); sc.src = "knowledge.js"; sc.onload = ok_; sc.onerror = () => bad(new Error("knowledge.js")); document.head.append(sc); });
       const KB = window.KB || [];
       const USE = { score: ["mk", "計入分數"], context: ["", "僅供判讀"], plan: ["warn", "操作參考"], info: ["", "觀念"] };
       const live = (it) => {
@@ -1701,8 +1711,9 @@
       h("a", { href: "#" + vs[0][0], "aria-current": i === gi ? "page" : null }, label)));
     const sub = NAV[gi][1].map(([v, label]) => h("a", { href: "#" + v, "aria-current": v === name ? "page" : null }, label));
     document.getElementById("tabs").replaceChildren(...sub);
-    const cur = document.querySelector('#groups a[aria-current="page"]');
-    if (cur) cur.scrollIntoView({ block: "nearest", inline: "center" });
+    // Scroll the strip itself: scrollIntoView would also move the browser's Tab starting point past the skip link.
+    const cur = document.querySelector('#groups a[aria-current="page"]'), strip = document.getElementById("groups");
+    if (cur && strip.scrollWidth > strip.clientWidth) strip.scrollLeft = cur.offsetLeft - (strip.clientWidth - cur.offsetWidth) / 2;
     measureMast();
   }
   // Anchored scrolling (knowledge entries) has to clear the sticky masthead, whose height depends on wrapping.
@@ -1741,6 +1752,8 @@
       app.replaceChildren(...nodes);
       current = name;
       window.scrollTo(0, 0);
+      const tab = document.querySelector(`#tabs a[href="#${name}"]`);
+      document.title = (tab ? tab.textContent + "｜" : "") + "週三選股雷達";
     }
     if (seq !== routeSeq) return;
     const sym = p.get("s");

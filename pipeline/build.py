@@ -551,6 +551,18 @@ def build_calendar(data_date: str, flags: dict, meta: dict) -> list[dict]:
             out.append({"date": day.isoformat(), "kind": "營收", "text": "上市櫃公司上月營收公布截止日"})
         if (day.month, day.day) in ((3, 31), (5, 15), (8, 14), (11, 14)):
             out.append({"date": day.isoformat(), "kind": "財報", "text": "上市櫃公司季報（或年報）公布截止日"})
+        # Index rebalances move a lot of passive money on known dates (review 2026-11-14, chips-7). The
+        # dates follow each index provider's published rule; holidays can shift them, so they are marked.
+        last_weekday = day.weekday() < 5 and all((day + dt.timedelta(days=k)).month != day.month or
+                                                 (day + dt.timedelta(days=k)).weekday() >= 5 for k in range(1, 4))
+        if day.month in (2, 5, 8, 11) and last_weekday:
+            out.append({"date": day.isoformat(), "kind": "指數調整",
+                        "text": "MSCI 季度調整生效日（依規則推算，以公告為準）：被動資金在收盤換股，成分股尾盤量價常異常"})
+        if day.month in (3, 6, 9, 12) and day.weekday() == 4 and 15 <= day.day <= 21:
+            out.append({"date": day.isoformat(), "kind": "指數調整",
+                        "text": "臺灣 50 指數（0050）季度成分股調整，收盤後生效（依規則推算，以公告為準）"})
+        if day.month in (3, 6, 9, 12) and last_weekday:
+            out.append({"date": day.isoformat(), "kind": "季底", "text": "季底：投信作帳與法人結帳的最後一天"})
         day += dt.timedelta(days=1)
     return sorted(out, key=lambda x: (x["date"], x["kind"]))
 
@@ -2262,7 +2274,10 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
         now = rows[-1]["pcr_oi"]
         cards.append(_card("pcr", "台指選擇權 Put/Call 未平倉比", f"{now:.0%}", f"5 日 {pp(now - rows[-6]['pcr_oi'])}",
                            ("高於 100%：賣權未平倉多於買權，一般解讀為下檔有支撐、偏多。" if now >= 1 else
-                            "低於 100%：買權未平倉多於賣權，一般解讀為上檔有壓、偏空。"),
+                            "低於 100%：買權未平倉多於賣權，一般解讀為上檔有壓、偏空。")
+                           + ("今天是週選結算日，結算日的 P/C 平均比其他日子高約 14 個百分點，讀數要打折。"
+                              if pd.Timestamp(rows[-1]["date"]).weekday() == 2 else
+                              "每週三週選結算日的 P/C 常跳高約 14 個百分點，比較時要避開結算日。"),
                            1 if now >= 1.1 else -1 if now < 0.9 else 0,
                            dseries("pcr_oi").tail(120) if len(dseries("pcr_oi")) > 20 else [x["pcr_oi"] for x in rows]))
         cards[-1]["change_text"] += pct_note("pcr_oi", now)

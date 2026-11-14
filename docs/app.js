@@ -41,7 +41,7 @@
   };
   const mkChip = (m, sym) => h("span", { class: "chip mk" }, m === "TW" ? (sym && sym.endsWith(".TWO") ? "上櫃" : "台股") : "美股");
   const nameCell = (r) => (r && r.symbol && bySymbol.has(r.symbol)
-    ? h("a", { class: "nm-cell", href: "#" + (current || "overview") + "?s=" + encodeURIComponent(r.symbol) }, h("b", {}, r.name), h("span", { class: "code" }, r.code))
+    ? h("a", { class: "nm-cell", href: (() => { const { name, p } = parseHash(); p.set("s", r.symbol); return "#" + name + "?" + p; })() }, h("b", {}, r.name), h("span", { class: "code" }, r.code))
     : h("span", { class: "nm-cell" }, h("b", {}, r.name), h("span", { class: "code" }, r.code)));
 
   function spark(values, neutral = false) {
@@ -502,11 +502,12 @@
     document.querySelectorAll("body > header, body > main, body > footer").forEach((el) => { el.inert = false; });
     if (lastFocus && document.contains(lastFocus)) lastFocus.focus();
   }
-  const closeDrawer = () => { if (drawerEl) setHash(current || "overview", {}); };
+  const viewParams = () => { const p = parseHash().p; p.delete("s"); return Object.fromEntries(p); };
+  const closeDrawer = () => { if (drawerEl) setHash(current || "overview", viewParams()); };
   function openDrawer(symbol) {
     if (!bySymbol.has(symbol) && !S.indices.some((i) => i.symbol === symbol)) return;
     lastFocus = document.activeElement;
-    setHash(current || "overview", { s: symbol });
+    setHash(current || "overview", { ...viewParams(), s: symbol });
   }
   // One score for every horizon; what differs per horizon is the width of the range and the
   // base rates. Stocks show the chance of beating their market's median stock; indices show how
@@ -1159,7 +1160,14 @@
     },
 
     async fund() {
-      const state = { m: "ALL", q: "" };
+      const P0 = parseHash().p;
+      const state = { m: P0.get("m") || "ALL", q: (P0.get("q") || "").toLowerCase(),
+        cols: P0.get("cols") || (window.matchMedia("(max-width: 560px)").matches ? "core" : "all") };
+      // the filter, search and column set live in the address, so a filtered table can be shared
+      const keep = () => { const p = new URLSearchParams(); if (state.m !== "ALL") p.set("m", state.m); if (state.q) p.set("q", state.q);
+        if (state.cols !== "all") p.set("cols", state.cols); if (state.quad && state.quad !== "ALL") p.set("quad", state.quad);
+        const sym = parseHash().p.get("s"); if (sym) p.set("s", sym);
+        history.replaceState(null, "", "#fund" + (p.toString() ? "?" + p : "")); };
       const cols = [
         { key: "n", label: "個股", left: true, cell: (r) => h("span", {}, nameCell(r), " ", mkChip(r.market, r.symbol)) },
         { key: "i", label: "產業", left: true, cell: (r) => r.industry },
@@ -1182,11 +1190,22 @@
         { key: "tc", label: "籌碼分", tip: "外資、投信、融資（只有台股）", val: (r) => r.tactical, cell: (r) => numEl(ok(r.tactical) ? signed(r.tactical, 2) : "–", r.tactical) },
         { key: "st", label: "基本面分", tip: "財報＋申報持股", val: (r) => r.structural, cell: (r) => numEl(ok(r.structural) ? signed(r.structural, 2) : "–", r.structural) },
         { key: "o", label: "綜合分", val: (r) => r.overall, cell: (r) => h("span", { class: "row", style: "justify-content:flex-end;flex-wrap:nowrap" }, meter(r.overall), numEl(signed(r.overall, 2), r.overall)) }];
-      const tbl = table(cols, U, { sort: "o", csv: "fundamentals", onRow: (r) => openDrawer(r.symbol) });
+      const SETS = { core: ["精簡", ["n", "c", "w", "o"]], val: ["評價", ["n", "c", "pe", "pp", "pb", "y"]], grow: ["成長", ["n", "rv", "rm", "cl", "e", "eg"]],
+        chips: ["籌碼", ["n", "w", "tc", "st", "o"]], tech: ["技術", ["n", "c", "w", "r", "im", "o"]], all: ["全部", null] };
+      if (!SETS[state.cols]) state.cols = "all";
+      const makeTable = () => { const keys = SETS[state.cols][1];
+        const t = table(keys ? cols.filter((c) => keys.includes(c.key)) : cols, U, { sort: keys && !keys.includes("o") ? keys[1] : "o", csv: "fundamentals", onRow: (r) => openDrawer(r.symbol) });
+        // table row <-> dot: hovering a row rings its dot
+        t.addEventListener("pointerover", (e) => { const tr = e.target.closest("tr[data-sym]");
+          svg.querySelectorAll(".sc-dot.hl").forEach((n) => n.classList.remove("hl"));
+          if (tr) { const dot = svg.querySelector(`.sc-dot[data-sym="${CSS.escape(tr.dataset.sym)}"]`); if (dot) { dot.classList.add("hl"); svg.append(dot); } } });
+        return t; };
+      let tbl;
       const QUAD = { ALL: ["全部", () => true], pp: ["基本面佳・籌碼強", (r) => r.structural >= 0 && r.tactical >= 0], pn: ["基本面佳・籌碼弱", (r) => r.structural >= 0 && r.tactical < 0],
         np: ["基本面弱・籌碼強", (r) => r.structural < 0 && r.tactical >= 0], nn: ["基本面弱・籌碼弱", (r) => r.structural < 0 && r.tactical < 0] };
-      state.quad = "ALL";
-      const shown = () => U.filter((r) => (state.m === "ALL" || r.market === state.m) &&
+      state.quad = QUAD[P0.get("quad")] ? P0.get("quad") : "ALL";
+      const inMarket = (r) => state.m === "ALL" || (state.m === "TWO" ? r.symbol.endsWith(".TWO") : state.m === "TW" ? r.market === "TW" && !r.symbol.endsWith(".TWO") : r.market === state.m);
+      const shown = () => U.filter((r) => inMarket(r) &&
         (!state.q || (r.name + r.code + r.industry).toLowerCase().includes(state.q)) &&
         (state.quad === "ALL" || (ok(r.tactical) && ok(r.structural) && QUAD[state.quad][1](r))));
       // Scatter: x = short-term read, y = structural read. Click a dot for the stock, a corner label to filter the table.
@@ -1213,25 +1232,28 @@
             c.addEventListener("keydown", (e) => { if (e.key === "Enter") openDrawer(r.symbol); });
             return c; }));
       };
-      const apply = () => { tbl.setRows(shown()); drawScatter();
+      const count = h("span", { class: "small muted" });
+      const apply = () => { const rows = shown(); tbl.setRows(rows); drawScatter(); keep();
+        count.textContent = rows.length ? `${rows.length} 檔` : "沒有符合的個股";
         quadBtns.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.q === state.quad))); };
-      // table row <-> dot: hovering a row rings its dot
-      tbl.addEventListener("pointerover", (e) => { const tr = e.target.closest("tr[data-sym]");
-        svg.querySelectorAll(".sc-dot.hl").forEach((n) => n.classList.remove("hl"));
-        if (tr) { const dot = svg.querySelector(`.sc-dot[data-sym="${CSS.escape(tr.dataset.sym)}"]`); if (dot) { dot.classList.add("hl"); svg.append(dot); } } });
+      tbl = makeTable();
       drawScatter();
-      const seg = h("div", { class: "seg", role: "group", "aria-label": "市場" }, [["ALL", "全部"], ["TW", "台股"], ["US", "美股"]].map(([k, t]) =>
-        h("button", { type: "button", "aria-pressed": String(k === "ALL"), onclick: (e) => {
-          state.m = k; seg.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b === e.currentTarget))); apply();
-        } }, t)));
-      const q = h("input", { type: "search", id: "fund-q", placeholder: "搜尋名稱、代號或產業", "aria-label": "搜尋個股",
+      const segOf = (label, items, key, after) => { const g = h("div", { class: "seg", role: "group", "aria-label": label }, items.map(([k, t]) =>
+        h("button", { type: "button", "aria-pressed": String(k === state[key]), onclick: (e) => {
+          state[key] = k; g.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b === e.currentTarget))); if (after) after(); apply();
+        } }, t))); return g; };
+      const seg = segOf("市場", [["ALL", "全部"], ["TW", "上市"], ["TWO", "上櫃"], ["US", "美股"]], "m");
+      const colSeg = segOf("欄位組", Object.entries(SETS).map(([k, [t]]) => [k, t]), "cols", () => { const nt = makeTable(); tbl.replaceWith(nt); tbl = nt; });
+      const q = h("input", { type: "search", id: "fund-q", placeholder: "搜尋名稱、代號或產業", "aria-label": "搜尋個股", value: state.q,
         oninput: () => { state.q = q.value.trim().toLowerCase(); apply(); } });
+      queueMicrotask(apply);
       return [
         head("財報與各項指標", "觀察名單全部個股的評價、成長與技術指標。點欄位標題排序，點列看圖表。台股財報來自證交所公開資訊，美股來自 SEC XBRL 申報。"),
         h("p", { class: "small muted" }, "每個欄位的意義與本站的計分方式：", h("a", { href: "#learn?k=pe" }, "基本面與財報解說"), "。合約負債（客戶預付款）季增常領先營收一到兩季，", h("a", { href: "#learn?k=cl" }, "說明在此"), "。"),
         h("div", { class: "panel stack" }, h("div", { class: "sec-head" }, h("h3", {}, "因子象限圖：籌碼 × 基本面", help("tactical", "籌碼分與基本面分")), quadBtns),
           svg, h("p", { class: "chart-note" }, "每個點是一檔股票（藍＝台股、灰＝美股，較大的點是本週精選）。點一下看個股，按象限按鈕會同時篩選下方表格；滑過表格的列，對應的點會被圈出來。")),
-        h("div", { class: "panel stack" }, h("div", { class: "row" }, seg, q), tbl),
+        h("div", { class: "panel stack" }, h("div", { class: "row", style: "flex-wrap:wrap;gap:8px" }, seg, colSeg, q, count), tbl,
+          h("p", { class: "chart-note" }, "篩選、搜尋與欄位組都會寫進網址，可以直接分享這張表的目前狀態。")),
         (() => {
           const tw = U.filter((r) => r.market === "TW" && r.kind !== "etf");
           const med = (a) => { const v = a.filter(ok).sort((x, y) => x - y); return v.length ? v[Math.floor(v.length / 2)] : null; };

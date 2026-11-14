@@ -210,6 +210,11 @@ def _pe_score(pe: float | None, bands: tuple[float, float, float, float]) -> tup
     return -0.20, f"本益比 {pe:.1f} 倍，評價昂貴"
 
 
+def odd_yield(dy: float | None, pe: float | None) -> bool:
+    """A yield above 15%, or one implying a payout above 150% of earnings, is a one-off or an error."""
+    return dy is not None and (dy > 15 or (pe is not None and pe > 0 and dy * pe / 100 > 1.5))
+
+
 def fund_tw(m: dict) -> tuple[float | None, list[tuple[str, float]]]:
     """m keys: rev_yoy, rev_mom, rev_cum_yoy (percent), pe, pb, yield (percent), eps."""
     notes: list[tuple[str, float]] = []
@@ -230,11 +235,17 @@ def fund_tw(m: dict) -> tuple[float | None, list[tuple[str, float]]]:
     mom = _num(m.get("rev_mom"))
     if mom is not None:
         s += 0.10 * math.tanh(mom / 20)
-    w, txt = _pe_score(pe, (12, 20, 30, 45))
+    eps = _num(m.get("eps"))
+    # TWSE/TPEx leave the P/E blank for loss-makers: a blank P/E with a loss is a loss, not "neutral".
+    w, txt = _pe_score(-1.0 if pe is None and eps is not None and eps < 0 else pe, (12, 20, 30, 45))
+    if pe is None and w < 0:
+        txt = f"今年累計 EPS {eps:.2f} 元為虧損"
     s += w
     if txt:
         notes.append((txt, w))
     dy = _num(m.get("yield"))
+    if odd_yield(dy, pe):
+        dy = None  # a one-off payout or a data error: not a dividend you can count on
     if dy is not None and dy >= 3:
         w = 0.10 if dy >= 5 else 0.05
         s += w
@@ -243,11 +254,11 @@ def fund_tw(m: dict) -> tuple[float | None, list[tuple[str, float]]]:
     if pb is not None and 0 < pb < 1:
         s += 0.05
         notes.append((f"股價淨值比 {pb:.2f} 低於 1", 0.05))
-    eps = _num(m.get("eps"))
-    if eps is not None:
-        s += 0.05 if eps > 0 else -0.10
-        if eps < 0:
-            notes.append((f"最新一季 EPS {eps:.2f} 元為虧損", -0.10))
+    if eps is not None and eps > 0:
+        s += 0.05
+    elif eps is not None and eps < 0 and pe is not None:  # profitable over four quarters, losing this year
+        s -= 0.10
+        notes.append((f"今年累計 EPS {eps:.2f} 元為虧損", -0.10))
     # Revenue momentum: 3-month average against the 12-month average (monthly filings lead quarterly reports).
     ratio = _num(m.get("rev_ratio"))
     if ratio is not None:
@@ -283,7 +294,8 @@ def fund_us(m: dict) -> tuple[float | None, list[tuple[str, float]]]:
         s += w
         if abs(rv) >= 8:
             notes.append((f"最新一季營收年增 {rv:+.0f}%", w))
-    w, txt = _pe_score(pe, (15, 25, 40, 60))
+    ttm = _num(m.get("eps_ttm"))
+    w, txt = _pe_score(-1.0 if pe is None and ttm is not None and ttm <= 0 else pe, (15, 25, 40, 60))
     s += w
     if txt:
         notes.append((txt, w))

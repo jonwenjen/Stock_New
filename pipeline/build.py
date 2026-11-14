@@ -655,6 +655,12 @@ def backfill_tw_actions(today: dt.date) -> None:
         twse.THROTTLED = saved
 
 
+def industry_fallback(code: str) -> str:
+    """Industry when the monthly-revenue table has none. Financial holding companies (28xx) file
+    no monthly revenue, so they would otherwise land in "其他" and escape the per-industry cap."""
+    return "金融保險業" if re.fullmatch(r"28\d\d", code) else "其他"
+
+
 def fill_scale(applied: list[str], date: pd.Timestamp) -> float:
     """Factor that puts a raw bar from `date` on the same scale as an adjusted history."""
     f, seen = 1.0, set()
@@ -822,7 +828,9 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     tw_api = "https://openapi.twse.com.tw"
     # These endpoints occasionally answer 200 with an empty body, hence retry(); if one is
     # still down, last week's per-stock values (kept in universe.json) stand in for it.
-    prev_tw = {r["code"]: r for r in read_json(DATA / "universe.json", []) if r.get("market") == "TW"}
+    prev_all = read_json(DATA / "universe.json", [])
+    prev_tw = {r["code"]: r for r in prev_all if r.get("market") == "TW" and not str(r.get("symbol", "")).endswith(".TWO")}
+    prev_otc = {r["code"]: r for r in prev_all if str(r.get("symbol", "")).endswith(".TWO")}
     carry = lambda keys: {c: {k: r.get(k) for k in keys} for c, r in prev_tw.items()}  # noqa: E731
     quotes = safe("證交所 每日收盤行情", lambda: retry(twse.quotes), {}, tw_api)
     valuation = safe("證交所 本益比/殖利率/淨值比", lambda: retry(twse.valuation), None, tw_api)
@@ -902,12 +910,25 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         otc_flags = safe("櫃買中心 處置／注意股與除權息預告", tpex.trading_flags, {}, "https://www.tpex.org.tw")
         otc_qfii = safe("櫃買中心 外資持股比率", tpex.foreign_holding, {}, "https://www.tpex.org.tw")
         for dst, src in ((valuation, otc_val), (revenue, otc_rev), (eps, otc_eps), (margin_now, otc_margin), (flags, otc_flags)):
-            dst.update({c: v for c, v in src.items() if c not in dst})
+            dst.update(src)
+        for dst, keys in ((valuation, ("pe", "pb", "yield")), (eps, ("eps", "eps_period"))):
+            for c in otc_codes:
+                old = {k: (prev_otc.get(c) or {}).get(k) for k in keys}
+                if c not in dst and any(v is not None for v in old.values()):
+                    dst[c] = old
     tdcc = safe("集保 股權分散表（千張大戶）", lambda: update_tdcc(set(tw_codes) | set(otc_codes)), {}, "https://www.tdcc.com.tw")
     qfii = safe("證交所 外資持股比率", lambda: update_qfii(trading_days, set(tw_codes)), {}, "https://www.twse.com.tw")
-    for c in otc_codes:  # OTC holding comes as a snapshot only; its 20-day change builds up from the weekly archive
-        if c in otc_qfii:
-            qfii[c] = {**otc_qfii[c], "chg20": None}
+    if otc_qfii:  # OTC holding comes as a snapshot only; its 20-day change builds up from the weekly archive
+        qpath = DATA / "history" / "tw_qfii.json"
+        qhist = read_json(qpath, {})
+        qhist.setdefault(trading_days[-1], {}).update(
+            {c: otc_qfii[c]["pct"] for c in otc_codes if c in otc_qfii and otc_qfii[c].get("pct") is not None})
+        write_json(qpath, {d: qhist[d] for d in sorted(qhist)[-60:]})
+        ref = max((d for d in qhist if len(trading_days) > 21 and d <= trading_days[-21]), default=None)
+        for c in otc_codes:
+            if c in otc_qfii:
+                a, p = (qhist.get(ref) or {}).get(c) if ref else None, otc_qfii[c].get("pct")
+                qfii[c] = {**otc_qfii[c], "chg20": round(p - a, 2) if a is not None and p is not None else None}
     derivs = safe("期交所 期貨選擇權歷史（散戶、十大交易人、基差、Put/Call、外資選擇權）",
                   lambda: update_derivs(today, twii["close"]), None, "https://www.taifex.com.tw") \
         or read_json(DATA / "history" / "tw_derivs.json", {})
@@ -931,7 +952,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                          "industry": etf_category(code, name)}
         else:
             meta[sym] = {"name": name, "market": "TW", "kind": "stock", "code": code, "scored": code in tw_codes,
-                         "industry": revenue.get(code, {}).get("industry") or "其他"}
+                         "industry": revenue.get(code, {}).get("industry") or industry_fallback(code)}
     if otc_codes:
         try:
             ev = tpex.ex_rights_recent()
@@ -956,7 +977,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         frames[sym] = otc_frames[code]
         meta[sym] = {"name": (otc_margin.get(code) or {}).get("name") or load_store(sym)[1].get("name") or code,
                      "market": "TW", "exchange": "OTC", "kind": "stock", "code": code, "scored": True,
-                     "industry": revenue.get(code, {}).get("industry") or "其他"}
+                     "industry": revenue.get(code, {}).get("industry") or industry_fallback(code)}
     def us_prices(tkr: str) -> pd.DataFrame:
         raw = []
         try:
@@ -1184,6 +1205,9 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                     fn.append((f"合約負債季減 {lg['qoq']:+.0%}，預收訂單消化中", -0.08))
             rec.update({k: fund_in.get(k) for k in ("pe", "pb", "yield", "rev_yoy", "rev_mom",
                                                     "rev_cum_yoy", "eps", "eps_period", "month")})
+            # The quarterly table gives this year's cumulative EPS; price / P/E is the trailing four quarters.
+            rec["eps_ttm"] = round(last / fund_in["pe"], 2) if (fund_in.get("pe") or 0) > 0 else None
+            rec["yield_odd"] = scoring.odd_yield(fund_in.get("yield"), fund_in.get("pe")) or None
             ins = insiders.get(code)
             if ins:
                 rec["insider_pledge"] = ins["pledge_ratio"]

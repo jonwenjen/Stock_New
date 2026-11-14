@@ -1078,3 +1078,18 @@ def test_sanitize_applies_one_event_per_date_whatever_the_rounding():
     assert total2 == 1.0 and applied2 == applied and again["close"].iloc[0] == pytest.approx(97.07)
     from pipeline.build import fill_scale
     assert fill_scale([f"{d}:0.970723", f"{d}:0.970700"], idx[0]) == pytest.approx(0.970723)
+
+
+def test_fundamentals_losses_odd_yields_and_financials():
+    from pipeline import scoring
+    from pipeline.build import industry_fallback
+    loss, n = scoring.fund_tw({"pe": None, "eps": -1.2, "rev_yoy": 0})
+    cheap, _ = scoring.fund_tw({"pe": 10, "eps": 3.0, "rev_yoy": 0})
+    assert loss < 0 < cheap and any("虧損" in t for t, _ in n)
+    assert scoring.odd_yield(125.97, 5.42) and scoring.odd_yield(9.0, 20) and not scoring.odd_yield(5.0, 15)
+    odd, _ = scoring.fund_tw({"pe": 14, "yield": 125.97, "rev_yoy": 0})
+    plain, _ = scoring.fund_tw({"pe": 14, "yield": None, "rev_yoy": 0})
+    assert odd == plain                                   # an implausible yield earns nothing
+    us_loss, _ = scoring.fund_us({"pe": None, "eps_ttm": -0.04, "rev_yoy": 0})
+    assert us_loss < 0
+    assert industry_fallback("2885") == "金融保險業" and industry_fallback("6199") == "其他"

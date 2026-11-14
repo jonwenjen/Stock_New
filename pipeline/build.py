@@ -990,6 +990,9 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                 if c not in dst and any(v is not None for v in old.values()):
                     dst[c] = old
     tdcc = safe("集保 股權分散表（千張大戶）", lambda: update_tdcc(set(tw_codes) | set(otc_codes)), {}, "https://www.tdcc.com.tw")
+    val_hist = safe("本益比與淨值比歷史（FinMind 一次性回補，之後取自交易所）",
+                    lambda: update_valuation_history(list(tw_codes) + list(otc_codes), valuation, today), {},
+                    "https://finmindtrade.com")
     qfii = safe("證交所 外資持股比率", lambda: update_qfii(trading_days, set(tw_codes)), {}, "https://www.twse.com.tw")
     if otc_qfii:  # OTC holding comes as a snapshot only; its 20-day change builds up from the weekly archive
         qpath = DATA / "history" / "tw_qfii.json"
@@ -1007,6 +1010,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         or read_json(DATA / "history" / "tw_derivs.json", {})
     rev_hist = safe("公開資訊觀測站 月營收歷史", lambda: update_revenue_history(revenue, set(otc_codes)), {},
                     "https://mopsov.twse.com.tw")
+    shard_put("revenue", {ym: t for ym, t in rev_hist.items() if len(t) >= 500})
     liab = safe("FinMind 合約負債（資產負債表）", lambda: update_contract_liabilities(tw_codes[:5] if QUICK else tw_codes, today),
                 {}, "https://finmindtrade.com")
 
@@ -1292,6 +1296,9 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
             rec["eps_ttm"] = round(last / fund_in["pe"], 2) if (fund_in.get("pe") or 0) > 0 else None
             if fund_in.get("yield") and (fund_in.get("pe") or 0) > 0:  # dividends / trailing earnings
                 rec["payout"] = round(fund_in["yield"] * fund_in["pe"] / 100, 3)
+            vb = research.valuation_band(val_hist.get(code, {}), fund_in.get("pe"), fund_in.get("pb"))
+            if vb:
+                rec.update(vb)
             mg = margins.get(code)
             if mg:
                 rec.update({"gm": mg["gm"], "om": mg["om"], "nm": mg["nm"], "margin_period": mg["period"]})
@@ -1801,6 +1808,8 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                "behind": {mk: [r["symbol"] for r in records if r["market"] == mk and newest[mk] is not None
                                and pd.Timestamp(r["date"]) < newest[mk]] for mk in ("TW", "US")}}
     safe("證交所 除權息歷史回補（供下週使用）", lambda: backfill_tw_actions(today), None, "https://www.twse.com.tw")
+    safe("驗證用歷史資料回補（T86／日表／期交所／月營收，每週少量）", lambda: backfill_history(today, trading_days), None)
+    prereg = safe("預先登錄的檢驗", preregistered_status, None)
     write_json(DATA / "summary.json", {
         "generated_at": now.isoformat(timespec="seconds"), "data_date": trading_days[-1],
         "calendar": calendar, "quality": quality,
@@ -1810,6 +1819,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         "bullish": [slim(r) for r in bullish], "bearish": [slim(r) for r in bearish],
         "backtest": bt, "backtest_imom": bt_imom, "calibration": CALIB, "picks_diff": picks_diff,
         "selection_bias": sel_bias, "weekly": weekly, "portfolio": portfolio, "follow": follow,
+        "preregistered": prereg,
         "weights": scoring.WEIGHTS, "weights_us": scoring.WEIGHTS_SLOW_CHIPS,
         "sources": SOURCES, "picks_track": track,
         "counts": {"tw": sum(r["market"] == "TW" for r in records),
@@ -1856,6 +1866,115 @@ def portfolio_panel(picks: list[dict], records: list[dict], tframes: dict, frame
         if both:
             out["ALL"] = both
     return out
+
+
+def update_valuation_history(codes: list[str], valuation: dict, today: dt.date, budget: int = 40) -> dict:
+    """Month-end P/E and P/B per Taiwan company over five years (review 2026-11-14, fund-3).
+
+    History comes once per company from FinMind (third party: used only for this back-fill, at most
+    `budget` companies a run); every later month comes from the exchanges' own valuation tables."""
+    path = DATA / "history" / "tw_valuation.json"
+    store: dict[str, dict] = read_json(path, {})
+    start = dt.date(today.year - 5, today.month, 1).isoformat()
+    fails = 0
+    for code in [c for c in codes if c not in store][: 3 if QUICK else budget]:
+        try:
+            store[code] = leading.valuation_history(code, start)
+            fails = 0
+        except Exception as e:  # noqa: BLE001 - the free tier refuses when busy: try again next week
+            fails += 1
+            if fails >= 5:
+                log(f"  valuation history: stopping after {fails} failures ({str(e)[:80]})")
+                break
+    month = today.strftime("%Y-%m")
+    for c in codes:
+        v = valuation.get(c) or {}
+        if c in store and (v.get("pe") or v.get("pb")):
+            store[c][month] = [v.get("pe"), v.get("pb")]
+    store = {c: {m: store[c][m] for m in sorted(store[c])[-61:]} for c in sorted(store)}
+    write_json(path, store)
+    return store
+
+
+def backfill_history(today: dt.date, trading_days: list[str]) -> dict:
+    """Fill the archives that the pre-registered tests need, a little every week (review 2026-11-14).
+
+    Budgets keep the run polite: TWSE 40 requests (per-stock institutional flows in even ISO weeks,
+    daily price tables in odd ones), TAIFEX 4 monthly windows, MOPS 12 months of revenue. A refusal
+    ends that source for this run; nothing in this run depends on the result."""
+    saved, twse.THROTTLED = twse.THROTTLED, False
+    done: dict[str, int] = {}
+    try:
+        if today.isocalendar()[1] % 2 == 0:  # one year of T86
+            have = shard_days("stock_flows_tw")
+            need = [d for d in trading_days[-250:] if d not in have][::-1][: 5 if QUICK else 40]
+            got = twse.fetch_days(need, twse.inst_stocks, "T86 backfill", log)
+            shard_put("stock_flows_tw", {d: {c: [round(v[0] / 1000), round(v[1] / 1000)] for c, v in t.items()
+                                             if twse.tracked(c) and (v[0] or v[1])} for d, t in got.items()})
+            done["t86"] = len(got)
+        else:  # about 2.5 years of daily tables: point-in-time universe and closes
+            have = shard_days("pit_closes")
+            need = [d for d in trading_days[-600:] if d not in have][::-1][: 5 if QUICK else 40]
+            got = twse.fetch_days(need, cached_day, "day-table backfill", log)
+            pit_path = DATA / "history" / "tw_universe_pit.json"
+            pit = read_json(pit_path, {})
+            for d, t in got.items():
+                vals = sorted(((c, b[3] * b[4]) for c, b in t.items() if twse.COMMON_STOCK.match(c)), key=lambda x: -x[1])
+                pit.setdefault(d, [c for c, _ in vals[:150]])
+            write_json(pit_path, {d: pit[d] for d in sorted(pit)[-1300:]})
+            shard_put("pit_closes", {d: {c: round(b[3], 2) for c, b in t.items() if twse.COMMON_STOCK.match(c) and b[3]}
+                                     for d, t in got.items()})
+            done["days"] = len(got)
+    finally:
+        twse.THROTTLED = saved
+    # TAIFEX keeps about three years: walk back a few months a run
+    dpath, fpath = DATA / "history" / "tw_derivs.json", DATA / "history" / "tw_futures.json"
+    derivs, fut = read_json(dpath, {}), read_json(fpath, {})
+    floor = today - dt.timedelta(days=3 * 365 - 20)
+    end = dt.date.fromisoformat(min(derivs)) - dt.timedelta(days=1) if derivs else None
+    n = 0
+    while end and end > floor and n < (1 if QUICK else 4):
+        start = max(end - dt.timedelta(days=30), floor)
+        try:
+            for d, v in leading.derivatives_window(start.isoformat(), end.isoformat()).items():
+                derivs.setdefault(d, {}).update(v)
+            for d, v in market.futures_history(start.isoformat(), end.isoformat()).items():
+                fut.setdefault(d, v)
+        except Exception as e:  # noqa: BLE001 - beyond TAIFEX's range or refused: stop for this run
+            log(f"  derivatives backfill {start}..{end}: {str(e)[:80]}")
+            break
+        n += 1
+        end = start - dt.timedelta(days=1)
+    write_json(dpath, {d: derivs[d] for d in sorted(derivs)})
+    write_json(fpath, {d: fut[d] for d in sorted(fut)})
+    done["taifex_windows"] = n
+    # five years of monthly revenue, listed and OTC
+    have = shard_days("revenue")
+    months, y, m = [], today.year, today.month
+    for _ in range(62):
+        y, m = (y - 1, 12) if m == 1 else (y, m - 1)
+        months.append(f"{y}-{m:02d}")
+    got_rev: dict[str, dict] = {}
+    for ym in [x for x in months if x not in have][: 1 if QUICK else 12]:
+        try:
+            got_rev[ym] = {**leading.mops_revenue(ym, "sii"), **leading.mops_revenue(ym, "otc")}
+        except Exception as e:  # noqa: BLE001
+            log(f"  revenue backfill {ym}: {str(e)[:80]}")
+            break
+    shard_put("revenue", got_rev)
+    done["revenue_months"] = len(got_rev)
+    log(f"history backfill: {done}")
+    return done
+
+
+def preregistered_status() -> list[dict]:
+    """Progress of the data each pre-registered test needs (review 2026-11-14)."""
+    derivs = read_json(DATA / "history" / "tw_derivs.json", {})
+    t86, closes, rev = shard_days("stock_flows_tw"), shard_days("pit_closes"), shard_days("revenue")
+    weeks = len(list((DATA / "history" / "weekly").glob("*.json")))
+    progress = {"futures_d20": (len(derivs), 730), "chips_weight": (len(t86), 240), "fund_weight": (len(rev), 60),
+                "pit_backtest": (len(closes), 500), "watch_first": (weeks, 52)}
+    return [{**t, "have": progress[t["id"]][0], "need": progress[t["id"]][1]} for t in research.PREREGISTERED]
 
 
 def weekly_snapshot(data_date: str, mkt: dict | None, lead: dict, picks: list[dict], records: list[dict]) -> dict:

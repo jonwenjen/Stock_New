@@ -638,6 +638,8 @@
           ["當沖比率（最新一日）", ok(r.daytrade) ? num(r.daytrade * 100, 0) + "%" : "–"],
           ["毛利率／營益率（今年累計）", ok(r.gm) ? `${num(r.gm, 1)}%／${ok(r.om) ? num(r.om, 1) + "%" : "–"}` : "–"],
           ["稅後純益率（今年累計）", ok(r.nm) ? num(r.nm, 1) + "%" : "–"],
+          ["本益比位階（5 年月底）", ok(r.pe_pct) ? `${num(r.pe_pct * 100, 0)}%（${r.pe_band[0]}–${r.pe_band[2]} 倍，中位 ${r.pe_band[1]}）` : "–"],
+          ["淨值比位階（5 年月底）", ok(r.pb_pct) ? `${num(r.pb_pct * 100, 0)}%（${r.pb_band[0]}–${r.pb_band[2]} 倍）` : "–"],
           ["配發率（殖利率 × 本益比）", ok(r.payout) ? num(r.payout * 100, 0) + "%" + (r.payout > 1 ? "（高於獲利）" : "") : "–"],
           ["外資持股比例", ok(r.qfii) ? num(r.qfii, 1) + "%" : "–"],
           ["外資持股 20 日", ok(r.qfii_chg20) ? signed(r.qfii_chg20, 2) + " pp" : "–"],
@@ -1141,6 +1143,7 @@
         { key: "c", label: "收盤", val: (r) => r.close, cell: (r) => h("span", { class: "num" }, px(r.close)) },
         { key: "w", label: "週漲跌", val: (r) => r.chg5d, cell: (r) => numEl(pct(r.chg5d), r.chg5d) },
         { key: "pe", label: "本益比", val: (r) => r.pe, cell: (r) => h("span", { class: "num" }, num(r.pe, 1)) },
+        { key: "pp", label: "本益比位階", tip: "台股：目前本益比高於過去 5 年多少比例的月底", val: (r) => r.pe_pct, cell: (r) => h("span", { class: "num" }, ok(r.pe_pct) ? num(r.pe_pct * 100, 0) + "%" : "–") },
         { key: "pb", label: "淨值比", val: (r) => r.pb, cell: (r) => h("span", { class: "num" }, num(r.pb, 2)) },
         { key: "y", label: "殖利率", tip: "超過 15%，或隱含配發率超過 150% 的標「異常」，不計分", val: (r) => (r.yield_odd ? null : r.yield), cell: (r) => h("span", { class: "num" }, ok(r.yield) ? num(r.yield, 1) + "%" + (r.yield_odd ? "（異常）" : "") : "–") },
         { key: "rv", label: "營收年增", tip: "台股為最新月營收，美股為最新一季", val: (r) => r.rev_yoy, cell: (r) => numEl(pctRaw(r.rev_yoy), r.rev_yoy) },
@@ -1621,8 +1624,17 @@
       const bt = BT.TW || BT;
       const W = S.weights || {};
       const G = { tech: "技術面（趨勢＋動能）", chips: "籌碼面", fund: "基本面", buzz: "Podcast 聲量（只顯示，不計分）" };
+      const PR = S.preregistered || [];
+      const prereg = PR.length ? h("div", { class: "panel stack" }, h("h3", {}, "預先登錄的檢驗"),
+        h("p", { class: "small" }, "下列檢驗在資料到齊之前就把規則寫死，資料滿了只判定一次，不會看了結果再改條件。進度是目前已存檔或回補的資料量。"),
+        table([{ key: "n", label: "檢驗", left: true, wrap: true, cell: (t) => h("span", {}, h("b", {}, t.name), h("br"), h("span", { class: "small muted" }, t.hypothesis)) },
+          { key: "r", label: "判定規則", left: true, wrap: true, cell: (t) => h("span", { class: "small" }, t.rule) },
+          { key: "d", label: "資料與判定時間", left: true, wrap: true, cell: (t) => h("span", { class: "small" }, `${t.data}；${t.judge}`) },
+          { key: "p", label: "進度", val: (t) => t.have / t.need, cell: (t) => h("span", { class: "num small" }, `${t.have}／${t.need}（${num(Math.min(1, t.have / t.need) * 100, 0)}%）`) }],
+          PR, { csv: false })) : null;
       return [
         head("方法與資料來源", "所有分數都由公開資料以固定規則計算，沒有人工挑選。以下說明計算方式、回測結果與每個來源本週的取得狀態。"),
+        prereg,
         h("div", { class: "grid g2" },
           h("div", { class: "panel stack" }, h("h3", {}, "因子權重"),
             table([{ key: "g", label: "因子", left: true, cell: (r) => G[r] },

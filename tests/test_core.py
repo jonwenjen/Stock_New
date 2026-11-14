@@ -1163,3 +1163,13 @@ def test_margin_and_etf_nav_parsers():
     assert twse.parse_margins(rows)["1101"] == {"gm": 18.87, "om": 8.51, "nm": 7.04, "rev_m": 112522.88, "period": "2026Q3"}
     j = {"a1": [{"msgArray": [{"a": "0050", "c": 1000.0, "d": -10.0, "e": 101.0, "f": 100.0, "g": 1.0, "j": "15:00:00"}]}]}
     assert twse.parse_etf_nav(j)["0050"] == {"prem": 1.0, "nav": 100.0, "aum": 100000.0, "flow": -1000.0, "time": "15:00:00"}
+
+
+def test_valuation_band_and_preregistration_list():
+    from pipeline import research
+    hist = {f"20{22 + i // 12}-{i % 12 + 1:02d}": [10.0 + i, 1.0 + i / 10] for i in range(30)}
+    vb = research.valuation_band(hist, 25.0, None)
+    assert vb["pe_pct"] == pytest.approx(16 / 30, abs=1e-3) and vb["pe_band"] == [10.0, 25.0, 39.0] and "pb_pct" not in vb
+    assert research.valuation_band({"2026-01": [10, 1]}, 12, 1) is None          # too short a history
+    ids = [t["id"] for t in research.PREREGISTERED]
+    assert len(ids) == len(set(ids)) and all(t["rule"] and t["judge"] for t in research.PREREGISTERED)

@@ -188,3 +188,41 @@ def stress_replay(weights: dict[str, float], closes: dict[str, pd.Series], bench
         out.append({"from": a.strftime("%Y-%m-%d"), "to": z.strftime("%Y-%m-%d"),
                     "bench": round(float(bench[z] / bench[a] - 1), 4), "picks": round(port, 4)})
     return out
+
+
+def valuation_band(hist: dict[str, list], pe: float | None, pb: float | None, min_months: int = 24) -> dict | None:
+    """Where today's P/E and P/B sit in the company's own month-end history (review 2026-11-14, fund-3).
+    Returns percentiles (0-1) and the [low, median, high] of each history; losses (no P/E) are skipped."""
+    out = {}
+    for key, now, idx in (("pe", pe, 0), ("pb", pb, 1)):
+        vals = sorted(v[idx] for v in hist.values() if v and len(v) > idx and v[idx] and v[idx] > 0)
+        if now and now > 0 and len(vals) >= min_months:
+            out[f"{key}_pct"] = round(sum(v <= now for v in vals) / len(vals), 3)
+            out[f"{key}_band"] = [round(vals[0], 2), round(vals[len(vals) // 2], 2), round(vals[-1], 2)]
+    return out or None
+
+
+# Tests registered before their data exists (review 2026-11-14). The rules are fixed here and are not
+# tuned after the data comes in; each is judged once, when its data is complete.
+PREREGISTERED = [
+    {"id": "futures_d20", "name": "台指期法人部位的 20 日變化",
+     "hypothesis": "外資、投信、三大法人合計的台指期淨未平倉 20 日變化，和加權指數之後 5 日、20 日的報酬或 20 日內最大回檔有關。",
+     "rule": "三條序列各自計算 Spearman 相關與 Newey-West t；|t| ≥ 2 而且前後兩段方向一致才算通過，通過的才可能回到風險分數。",
+     "data": "期交所三大法人期貨部位，回補到約 3 年", "judge": "2027 年 1 月，只判定一次"},
+    {"id": "chips_weight", "name": "籌碼分數的權重（目前 0.25）",
+     "hypothesis": "外資與投信的個股買賣超分數，能排序之後一週與一個月的相對報酬。",
+     "rule": "訊號隔一個交易日開盤才進場；樣本外 IC ≤ 0 → 權重改為 0；0 到 0.02 → 0.05；≥ 0.02 且 t ≥ 2 → 維持。投信項另外檢驗。",
+     "data": "個股三大法人買賣超（T86），回補一年", "judge": "一年資料回補完成後"},
+    {"id": "fund_weight", "name": "基本面分數的權重（目前 0.15）",
+     "hypothesis": "月營收成長等基本面項目，能排序之後一個月與一季的相對報酬。",
+     "rule": "營收在公布截止日（次月 10 日）之後才可使用；樣本外 IC ≤ 0 → 權重 0；0 到 0.02 → 0.05；≥ 0.02 且 t ≥ 2 → 維持。",
+     "data": "月營收回補 5 年", "judge": "5 年月營收回補完成後"},
+    {"id": "pit_backtest", "name": "以當時名單重做回測與校準",
+     "hypothesis": "排名在當時成交值前 90 名的股票中，仍然有跑贏中位數的區分力。",
+     "rule": "只用每個日期當時的前 90 名，評估實際排名用的分數；結果取代目前以今日名單算出的上限。",
+     "data": "每日成交值前 150 名與全部上市股收盤價，回補到約 2.5 年", "judge": "存檔滿 2 年後"},
+    {"id": "watch_first", "name": "先觀察旗標的區分力",
+     "hypothesis": "有先觀察旗標的精選，之後 20 日的最大回檔比沒有旗標的大。",
+     "rule": "比較兩組之後 20 日的報酬與最大回檔；差異的 t ≥ 2 才算有用。條件不再修改。",
+     "data": "每週精選名單與旗標存檔", "judge": "累積 52 週之後（2027 年 11 月）"},
+]

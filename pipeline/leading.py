@@ -744,3 +744,16 @@ def follow_track(cohorts: list[dict], frames: dict[str, pd.DataFrame], bench: di
                        "t": None if t is None else round(t, 2), "growth": growth, "bench_growth": bgrowth,
                        "verdict": verdict}
     return {"rows": rows, "summary": summary, "rules": {"cost": TRACK_COST, "min_weeks": TRACK_MIN_WEEKS}}
+
+
+def valuation_history(code: str, start: str) -> dict[str, list]:
+    """Month-end P/E and P/B for one Taiwan company since `start`, from FinMind's TaiwanStockPER
+    (third party; used only for the one-time back-fill - later months come from the exchanges)."""
+    j = http.get_json(FINMIND, params={"dataset": "TaiwanStockPER", "data_id": code, "start_date": start},
+                      retries=0, timeout=30)
+    out: dict[str, list] = {}
+    for r in j.get("data") or []:  # daily rows in date order: the last one of each month wins
+        out[r["date"][:7]] = [r.get("PER") or None, r.get("PBR") or None]
+    if not out:
+        raise RuntimeError(f"no valuation history for {code}")
+    return out

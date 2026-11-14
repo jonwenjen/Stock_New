@@ -542,9 +542,10 @@
       h("div", { class: "panel stack" }, h("div", { class: "sec-head" }, h("h3", {}, "績效評估"), scoreCell(r)),
         h("p", {}, r.verdict),
         h("div", { class: "factors" },
-          part("peer", "同類排名", "近 1／3／5 年贏過同類基金的比例"), part("excess", "勝過指數", "年化報酬與對比指數的差距"),
-          part("sharpe", "風險調整報酬", "Sharpe ratio"), part("drawdown", "抗跌", "三年內最大回檔")),
-        h("p", { class: "chart-note" }, "四個面向各換算成 0–100 分，權重為同類排名 40%、勝過指數 20%、風險調整報酬 25%、抗跌 15%。")),
+          part("peer", "同類排名", "近 1／3／5 年贏過同類基金的比例"), part("excess", "勝過同類平均", "年化報酬與同類平均的差距"),
+          part("sharpe", "風險調整報酬", "Sharpe ratio 在同組基金中的位置"), part("drawdown", "抗跌", "三年最大回檔在同組基金中的位置"),
+          part("consistency", "穩定度", "6 個月、1 年、3 年、5 年中贏過一半同類的期數比例")),
+        h("p", { class: "chart-note" }, "五個面向各換算成 0–100 分，權重為同類排名 35%、勝過同類平均 20%、風險調整報酬 20%、抗跌 15%、穩定度 10%；風險調整報酬與抗跌是在同組基金裡比。管理費超過 1% 的部分，每 0.5 個百分點扣 5 分" + (r.fee_penalty ? `（本基金扣 ${num(r.fee_penalty, 0)} 分）` : "") + "。這樣比的是「同一類裡挑哪一檔」，而不是哪個市場過去漲最多。")),
       h("div", { class: "panel" }, h("h3", {}, "各期間報酬與同類排名"), table([
         { key: "p", label: "期間", left: true, cell: ([, label]) => label },
         { key: "f", label: "本基金", cell: ([k]) => numEl(pct(r.ret[k]), r.ret[k]) },

@@ -1453,6 +1453,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         trend = scoring.score_stock(scoring.tech_frame(df), None, None, None)
         rec.update({"horizons": trend["horizons"], "trend": trend["label"], "trend_score": trend["overall"]})
         fund_records.append(rec)
+    funds.rescore(fund_records)  # peer-relative scores need the whole set (review 2026-11-14, fund-7)
     SOURCES.append({"name": "鉅亨網 基金淨值與同類排名", "ok": bool(fund_records) or not fund_list,
                     "url": "https://fund.cnyes.com", "note": f"{len(fund_records)}/{len(fund_list)} 檔取得"})
     if not fund_records:  # source down: keep last week's table

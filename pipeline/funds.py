@@ -201,3 +201,61 @@ def build_record(fund_id: str, group: str, items: dict, perf: dict, rf_by_curren
     }
     rec["verdict"] = verdict(rec)
     return rec, nav
+
+
+# ----------------------------- peer-relative re-scoring (review 2026-11-14, fund-7) ----------------------------- #
+PEER_WEIGHTS = {"peer": 0.35, "excess": 0.20, "sharpe": 0.20, "drawdown": 0.15, "consistency": 0.10}
+
+
+def _pct_in(values: list[float], x: float) -> float:
+    """Share of the group at or below x, 0-100 (ties count half)."""
+    below = sum(v < x for v in values) + 0.5 * sum(v == x for v in values)
+    return 100.0 * below / len(values)
+
+
+def rescore(records: list[dict]) -> None:
+    """Judge each fund against its own kind of fund, not against how its market did.
+
+    The first score rewarded whole categories (Taiwan equity funds averaged 75 because the market
+    rallied; bond funds scored high on drawdown simply for being bonds). Here: excess return is
+    against the category average (Morningstar's), Sharpe and drawdown are percentiles within our
+    group when it has 5+ funds, consistency counts the periods (6m, 1y, 3y, 5y) in which the fund
+    beat half its peers, and management fees above 1% cost 5 points per 0.5 percentage point."""
+    groups: dict[str, list[dict]] = {}
+    for r in records:
+        groups.setdefault(r.get("group") or "", []).append(r)
+    pw = {"1y": 0.30, "3y": 0.45, "5y": 0.25}
+    for r in records:
+        if (r.get("span_years") or 0) < 1:
+            continue
+        g = groups[r.get("group") or ""]
+        ret, cat, beat = r.get("ret") or {}, r.get("cat") or {}, r.get("beat") or {}
+        a3, c3 = annualise(ret.get("3y"), 3), annualise(cat.get("3y"), 3)
+        exc = (a3 - c3) if a3 is not None and c3 is not None else \
+            (ret["1y"] - cat["1y"]) if ret.get("1y") is not None and cat.get("1y") is not None else None
+
+        def rel(key: str, lo: float, hi: float) -> float | None:
+            vals = [x[key] for x in g if x.get(key) is not None]
+            if r.get(key) is None:
+                return None
+            return _pct_in(vals, r[key]) if len(vals) >= 5 else _scale(r[key], lo, hi)
+
+        have = {k: v for k, v in beat.items() if k in pw and v is not None}
+        periods = [beat[k] for k in ("6m", "1y", "3y", "5y") if beat.get(k) is not None]
+        parts = {"peer": sum(pw[k] * v for k, v in have.items()) / sum(pw[k] for k in have) if have else None,
+                 "excess": _scale(exc, -0.05, 0.05),
+                 "sharpe": rel("sharpe", -0.75, 1.75),
+                 "drawdown": rel("mdd_3y", -0.50, 0.0),
+                 "consistency": 100.0 * sum(v >= 50 for v in periods) / len(periods) if periods else None}
+        got = {k: v for k, v in parts.items() if v is not None}
+        if len(got) < 2:
+            continue
+        score = sum(PEER_WEIGHTS[k] * v for k, v in got.items()) / sum(PEER_WEIGHTS[k] for k in got)
+        fee = r.get("fee")
+        penalty = max(0.0, (float(fee) - 1.0) / 0.5 * 5) if isinstance(fee, (int, float)) else 0.0
+        score = max(0.0, score - penalty)
+        r.update({"score": round(score, 1), "grade": next(label for floor, label in GRADES if score >= floor),
+                  "parts": {k: (None if v is None else round(v, 1)) for k, v in parts.items()},
+                  "excess_cat": exc, "fee_penalty": round(penalty, 1) or None,
+                  "lagging_1y": bool(beat.get("1y") is not None and beat["1y"] <= 25)})
+        r["verdict"] = verdict(r) + ("近一年只贏過 {:.0f}% 的同類，近況落後。".format(beat["1y"]) if r["lagging_1y"] else "")

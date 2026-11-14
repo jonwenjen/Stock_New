@@ -35,7 +35,7 @@
 6. 提交並推送。只提交資料，不要改程式。
 
    ```bash
-   git add docs/data config/cusip_cache.json && git commit -m "data: weekly update $(date +%Y-%m-%d)" && git push origin main
+   git add docs/data docs/calendar.ics docs/feed.xml config/cusip_cache.json && git commit -m "data: weekly update $(date +%Y-%m-%d)" && git push origin main
    ```
 
    推送因網路失敗時最多重試 4 次（間隔 2、4、8、16 秒）。若被拒絕是因為遠端較新，
@@ -108,6 +108,9 @@
 - `selection_bias` 是用今日名單回測的高估程度（`today` 對 `pit`）；提到回測或優勢時要說明它是上限。
 - `portfolio` 是精選放在一起的風險（`beta`、`vol`、`loss95_1m` 一個月 95% 虧損界線、`avg_corr`），可在操作建議中帶一句。
 - 下列字詞已停用，`check_ai` 會擋下：上漲機率、一月目標、風險報酬比、建議降低持股、建議持股。
+- `follow` 是照精選名單操作的實際結果（事先寫定的規則）；`verdict` 寫「樣本不足」時就照實寫，不要自己推算績效。
+  `preregistered` 是預先登錄的檢驗與資料進度，只描述進度，判定時間到之前不要寫結論。
+- 建置最後會用每週少量的額度回補 T86、日表、期交所與月營收，日誌裡的 `history backfill` 是進度，被拒絕屬正常。
 - `podcast.overview`：這兩週節目在談什麼主題（依 `podcast_hot[].episodes` 的標題與摘要），
   以及被談論的標的整體是強是弱。
 - `podcast.stocks`：`podcast_hot` 前 8 檔各寫一則（鍵用 `symbol` 欄位，至少要涵蓋前 5 檔）。

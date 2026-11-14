@@ -153,6 +153,19 @@
       d.weeks >= 2 ? h("span", { class: "chip" }, `連續 ${d.weeks} 週`) : null];
   };
   const bySymbol = new Map();
+  let libP = null;
+  const chartLib = () => libP || (libP = new Promise((resolve, reject) => {
+    const sc = document.createElement("script");
+    sc.src = "https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js";
+    sc.onload = resolve; sc.onerror = () => { libP = null; reject(new Error("圖表程式載入失敗")); };
+    document.head.append(sc);
+  }));
+  function deferChart(make, height) {
+    const ph = h("div", { class: "chart-wait", style: `min-height:${height}px` }, h("span", { class: "state" }, "圖表載入中…"));
+    chartLib().then(() => { let tries = 0; const swap = () => { if (ph.parentNode) ph.replaceWith(make()); else if (tries++ < 300) requestAnimationFrame(swap); }; swap(); })
+      .catch((e) => ph.replaceChildren(h("span", { class: "state stale" }, e.message)));
+    return ph;
+  }
   function searchBox(onPick, opts = {}) {
     const sugg = h("div", { class: "sugg", role: "listbox" });
     const q = h("input", { type: "search", placeholder: opts.placeholder || "搜尋名稱或代號", "aria-label": opts.label || "搜尋個股", autocomplete: "off",
@@ -304,6 +317,7 @@
   }
 
   function priceChart(symbol, opts = {}) {
+    if (!window.LightweightCharts) return deferChart(() => priceChart(symbol, opts), 380);
     const state = { range: opts.range || "6m", data: null };
     const readout = h("div", { class: "readout", "aria-live": "off" });
     const box = h("div", { class: "chart loading" + (opts.small ? " sm" : "") });
@@ -434,6 +448,7 @@
   // ---------- flow chart (bars with sign colour + TAIEX line in its own panel) ----------
   // opts: { line, scale, digits, marks: [[value, title], ...] } - marks draw labelled reference lines.
   function flowChart(history, series, label, unit, opts = {}) {
+    if (!window.LightweightCharts) return deferChart(() => flowChart(history, series, label, unit, opts), 300);
     const scale = opts.scale || 1, digits = opts.digits || 0;
     const rows = history.filter((r) => ok(r[series])).map((r) => ({ ...r, [series]: r[series] * scale }));
     const readout = h("div", { class: "readout" });
@@ -979,8 +994,8 @@
         h("tbody", {}, F.map(([label, f]) => h("tr", {}, h("th", { scope: "row" }, label), rows.map((r) => h("td", { class: "num wrap" }, f(r)))))))) : null;
       // prices rebased to 100 at the start of the last 120 sessions, one line per stock (no red/green: these are not up/down marks)
       const chartBox = h("div", { class: "chart", style: "height:260px" });
-      if (rows.length && window.LightweightCharts) {
-        requestAnimationFrame(async () => {
+      if (rows.length) {
+        chartLib().then(async () => {
           const chart = LightweightCharts.createChart(chartBox, { height: 260, layout: { background: { color: "transparent" }, textColor: css("--ink-2") },
             grid: { vertLines: { color: css("--line-soft") }, horzLines: { color: css("--line-soft") } }, rightPriceScale: { borderColor: css("--line") }, timeScale: { borderColor: css("--line") } });
           const colours = ["--ma1", "--ma2", "--ma3", "--ink"], styles = [0, 2, 1, 3];
@@ -1917,6 +1932,17 @@
     booted = true;
     current = null;
     route();
+    // after the first screen: fetch the chart library in the background, and keep a copy for offline use
+    setTimeout(() => chartLib().catch(() => {}), 1200);
+    if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost")) {
+      navigator.serviceWorker.register("sw.js").catch(() => {});
+    }
+    const offline = () => {
+      const st = document.getElementById("stamp"), old = st.querySelector(".offline");
+      if (old) old.remove();
+      if (!navigator.onLine) st.prepend(h("span", { class: "state stale offline" }, `離線：顯示 ${S.data_date} 的資料`));
+    };
+    window.addEventListener("online", offline); window.addEventListener("offline", offline); offline();
   }
 
   // Up/down colours: Taiwan convention (red up) by default, switchable to the US one (green up).

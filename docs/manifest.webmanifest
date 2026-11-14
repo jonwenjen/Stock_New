@@ -1,0 +1,11 @@
+{
+  "name": "週三選股雷達",
+  "short_name": "選股雷達",
+  "description": "每週三更新的台股與美股研究資訊：市場風險、精選名單、籌碼與基本面。不構成投資建議。",
+  "lang": "zh-Hant-TW",
+  "start_url": "./#overview",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f3f5f8",
+  "theme_color": "#ffffff"
+}

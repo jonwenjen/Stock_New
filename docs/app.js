@@ -101,7 +101,7 @@
   // Two-level navigation: five groups, each holding the views that are read together.
   const NAV = [
     ["市場總覽", [["overview", "總覽與預測"], ["safety", "市場安全"], ["alerts", "漲跌預警"]]],
-    ["核心選股", [["picks", "精選 20 檔"], ["fund", "財報指標"], ["watch", "自選"]]],
+    ["核心選股", [["picks", "精選 20 檔"], ["fund", "財報指標"], ["watch", "自選"], ["compare", "比較"]]],
     ["籌碼與聰明錢", [["flows", "外資法人"], ["margin", "融資融券"], ["smart", "名人・議員・董監"]]],
     ["資產配置", [["etf", "ETF"], ["funds", "基金"]]],
     ["輿情與知識", [["podcast", "Podcast"], ["learn", "指標與模型解說"], ["method", "方法與來源"]]]];
@@ -153,6 +153,24 @@
       d.weeks >= 2 ? h("span", { class: "chip" }, `連續 ${d.weeks} 週`) : null];
   };
   const bySymbol = new Map();
+  function searchBox(onPick, opts = {}) {
+    const sugg = h("div", { class: "sugg", role: "listbox" });
+    const q = h("input", { type: "search", placeholder: opts.placeholder || "搜尋名稱或代號", "aria-label": opts.label || "搜尋個股", autocomplete: "off",
+      oninput: () => {
+        const v = q.value.trim().toLowerCase();
+        const hits = v ? [...bySymbol.values()].filter((r) => (opts.filter ? opts.filter(r) : true) && (r.name + " " + (r.code || "") + " " + r.symbol).toLowerCase().includes(v)).slice(0, 8) : [];
+        sugg.replaceChildren(...hits.map((r) => h("button", { type: "button", class: "sugg-item", role: "option", onclick: () => { q.value = ""; sugg.replaceChildren(); onPick(r); } },
+          h("b", {}, r.name), " ", h("span", { class: "muted small num" }, r.code || r.symbol), " ",
+          h("span", { class: "chip" }, r.kind === "fund" ? "基金" : r.kind === "etf" ? "ETF" : r.market === "US" ? "美股" : r.symbol.endsWith(".TWO") ? "上櫃" : "台股"))));
+      },
+      onkeydown: (e) => { if (e.key === "Enter") { const first = sugg.querySelector(".sugg-item"); if (first) first.click(); } else if (e.key === "Escape") { q.value = ""; sugg.replaceChildren(); } } });
+    const box = h("div", { class: "searchbox" + (opts.cls ? " " + opts.cls : "") }, q, sugg);
+    box.input = q;
+    return box;
+  }
+  const compareList = () => { try { return JSON.parse(localStorage.getItem("compare") || "[]"); } catch (e) { return []; } };
+  const goCompare = (list) => { const l = [...new Set(list)].slice(-4); try { localStorage.setItem("compare", JSON.stringify(l)); } catch (e) { /* storage unavailable */ }
+    setHash("compare", l.length ? { c: l.join(",") } : {}); };
 
   // ---------- sortable table ----------
   // Rows and cards that open a chart carry data-sym; hovering or touching one starts fetching its chart file.
@@ -598,7 +616,9 @@
       h("div", { class: "row" }, h("span", { class: "p num" }, px(item.close)), numEl(pct(item.chg1d, 2), item.chg1d),
         h("span", { class: "muted small" }, "資料日 " + item.date)),
       r ? tagChips(r) : null),
-      h("button", { class: "close", type: "button", onclick: closeDrawer }, "關閉")));
+      h("div", { class: "row", style: "gap:6px;flex-wrap:nowrap;align-self:flex-start" },
+        r && r.kind !== "fund" ? h("button", { class: "chip", type: "button", onclick: () => goCompare([...compareList(), symbol]) }, "＋比較") : null,
+        h("button", { class: "close", type: "button", onclick: closeDrawer }, "關閉"))));
     if (r && r.plan) {
       const v = [r.watch_first ? h("span", { class: "chip warn", style: "white-space:normal;text-align:left" }, "先觀察：" + r.watch_first.join("・")) : null,
         r.rank ? h("span", { class: "chip mk" }, rankText(r) + "（同市場）") : null,
@@ -935,6 +955,55 @@
         (S.picks_diff || {}).ref_date ? h("p", { class: "small" }, `與 ${S.picks_diff.ref_date} 的名單相比：新進 ${S.picks_diff.new} 檔（標示 NEW）` +
           (S.picks_diff.dropped.length ? `；移出 ${S.picks_diff.dropped.map((x) => x.name).join("、")}。` : "；沒有移出。") + "↑↓ 是名次變化，「連續 n 週」是連續上榜的週數。") : null,
         grid, h("div", { id: "picks-risk" }, portfolioPanel()), budgetPanel(), track];
+    },
+
+    async compare() {
+      const P0 = parseHash().p;
+      let list = (P0.get("c") || "").split(",").filter((x) => bySymbol.has(x)).slice(0, 4);
+      if (!list.length) list = compareList().filter((x) => bySymbol.has(x));
+      const rows = list.map((x) => bySymbol.get(x));
+      const add = searchBox((r) => goCompare([...list, r.symbol]), { placeholder: "加入要比較的股票或 ETF（最多 4 檔）", label: "加入比較", filter: (r) => r.kind !== "fund" });
+      const F = [
+        ["收盤", (r) => px(r.close)], ["週漲跌", (r) => pct(r.chg5d)], ["近一月", (r) => pct(r.r20)], ["近一季", (r) => pct(r.r60)], ["今年以來", (r) => pct(r.ytd)],
+        ["同市場排名", (r) => rankText(r) || "–"], ["綜合分", (r) => (ok(r.overall) ? signed(r.overall, 2) : "–")],
+        ["技術貢獻", (r) => (r.contrib && ok(r.contrib.tech) ? signed(r.contrib.tech, 2) : "–")], ["籌碼貢獻", (r) => (r.contrib && ok(r.contrib.chips) ? signed(r.contrib.chips, 2) : "–")],
+        ["基本面貢獻", (r) => (r.contrib && ok(r.contrib.fund) ? signed(r.contrib.fund, 2) : "–")],
+        ["本益比", (r) => num(r.pe, 1)], ["本益比位階（5 年）", (r) => (ok(r.pe_pct) ? num(r.pe_pct * 100, 0) + "%" : "–")], ["殖利率", (r) => (ok(r.yield) ? num(r.yield, 2) + "%" : "–")],
+        ["近四季 EPS", (r) => num(r.eps_ttm, 2)], ["月營收年增", (r) => pctRaw(r.rev_yoy)], ["外資 5 日（張）", (r) => (ok(r.foreign5) ? signed(r.foreign5, 0) : "–")],
+        ["外資持股比例", (r) => (ok(r.qfii) ? num(r.qfii, 1) + "%" : "–")], ["當沖比率", (r) => (ok(r.daytrade) ? num(r.daytrade * 100, 0) + "%" : "–")],
+        ["年化波動", (r) => (ok(r.vol_ann) ? num(r.vol_ann * 100, 0) + "%" : "–")], ["距 52 週高點", (r) => (ok(r.hi52) ? pct(r.hi52 - 1) : "–")],
+        ["停損距離", (r) => (r.plan && ok(r.plan.stop_pct) ? num(r.plan.stop_pct * 100, 1) + "%" : "–")], ["先觀察", (r) => (r.watch_first ? r.watch_first.join("・") : "–")]];
+      const tableEl = rows.length ? h("div", { class: "tbl-wrap" }, h("table", { class: "compare" },
+        h("thead", {}, h("tr", {}, h("th", { scope: "col" }, "項目"), rows.map((r) => h("th", { scope: "col" }, h("a", { class: "nm-cell", href: "#compare?c=" + list.join(",") + "&s=" + encodeURIComponent(r.symbol) }, h("b", {}, r.name), h("span", { class: "code" }, r.code)), " ",
+          h("button", { class: "linkish", type: "button", "aria-label": "從比較移除 " + r.name, onclick: () => goCompare(list.filter((x) => x !== r.symbol)) }, "移除"))))),
+        h("tbody", {}, F.map(([label, f]) => h("tr", {}, h("th", { scope: "row" }, label), rows.map((r) => h("td", { class: "num wrap" }, f(r)))))))) : null;
+      // prices rebased to 100 at the start of the last 120 sessions, one line per stock (no red/green: these are not up/down marks)
+      const chartBox = h("div", { class: "chart", style: "height:260px" });
+      if (rows.length && window.LightweightCharts) {
+        requestAnimationFrame(async () => {
+          const chart = LightweightCharts.createChart(chartBox, { height: 260, layout: { background: { color: "transparent" }, textColor: css("--ink-2") },
+            grid: { vertLines: { color: css("--line-soft") }, horzLines: { color: css("--line-soft") } }, rightPriceScale: { borderColor: css("--line") }, timeScale: { borderColor: css("--line") } });
+          const colours = ["--ma1", "--ma2", "--ma3", "--ink"], styles = [0, 2, 1, 3];
+          for (const [i, r] of rows.entries()) {
+            try {
+              const d = (await load("charts/" + fileOf(r.symbol))).d.slice(-120);
+              const base = d[0][4];
+              chart.addLineSeries({ color: css(colours[i]), lineWidth: 2, lineStyle: styles[i], title: r.name, priceLineVisible: false })
+                .setData(d.map((x) => ({ time: x[0], value: (x[4] / base) * 100 })));
+            } catch (e) { /* a missing chart file only drops that line */ }
+          }
+          chart.timeScale().fitContent();
+        });
+      }
+      return [head("比較", "把 2 到 4 檔股票或 ETF 的事實並排，價格走勢以 120 個交易日前為 100。比較清單寫在網址裡，可以直接分享。"),
+        h("div", { class: "panel stack" }, add,
+          !rows.length ? h("p", { class: "state" }, "還沒有選股票。可以在上方搜尋，或在任何一檔的詳細資料按「＋比較」。") : null,
+          rows.length ? h("div", { class: "row small", style: "flex-wrap:wrap;gap:8px" }, "快速加入精選：",
+            S.picks.filter((r) => !list.includes(r.symbol)).slice(0, 6).map((r) => h("button", { class: "chip", type: "button", onclick: () => goCompare([...list, r.symbol]) }, r.name))) : null),
+        rows.length ? h("div", { class: "panel stack" }, h("h3", {}, "價格走勢（起點＝100）"), chartBox,
+          h("p", { class: "chart-note" }, "線型依序為實線、虛線、點線、長虛線，不用紅綠，因為這裡比的是相對走勢，不是漲跌。")) : null,
+        tableEl ? h("div", { class: "panel stack" }, h("h3", {}, "並排比較"), tableEl,
+          h("p", { class: "chart-note" }, "數字都不上色：哪一檔比較好取決於你看重什麼，網站不替你判斷。排名與貢獻只比較同一市場內的強弱。")) : null];
     },
 
     async flows() {
@@ -1827,6 +1896,12 @@
     U.forEach((r) => bySymbol.set(r.symbol, r));
     E.forEach((r) => bySymbol.set(r.symbol, r));
     [...S.picks, ...S.bullish, ...S.bearish].forEach((r) => bySymbol.set(r.symbol, r));
+    // site-wide search: any stock, ETF or fund by name or code opens its details ("/" jumps here) (ia-6)
+    const gs = searchBox((r) => openDrawer(r.symbol), { placeholder: "搜尋個股、ETF、基金（按 /）", label: "全站搜尋" });
+    document.getElementById("gsearch").replaceChildren(gs);
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "/" && !/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)) { e.preventDefault(); gs.input.focus(); }
+    });
     document.getElementById("stamp").replaceChildren(
       h("span", {}, "資料日 ", h("b", { class: "num" }, S.data_date)),
       h("span", {}, "更新於 ", h("b", { class: "num" }, S.generated_at.slice(0, 16).replace("T", " "))),

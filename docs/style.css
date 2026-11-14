@@ -460,3 +460,14 @@ input[type="number"] { border: 1px solid var(--line-strong); border-radius: 6px;
 .state.stale { display: inline-block; border: 1px dashed var(--warn); color: var(--warn); border-radius: 999px; padding: 0 10px; }
 tbody th { font-size: inherit; font-weight: inherit; color: inherit; top: auto; text-align: left; }
 .tbl-wrap tbody th:first-child a:focus-visible { outline-offset: -2px; }
+
+/* site-wide search in the masthead (desktop); phones search on the list pages */
+#gsearch { position: relative; flex: 0 1 240px; min-width: 160px; }
+#gsearch input { width: 100%; }
+.searchbox { position: relative; }
+.searchbox .sugg { position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 20; background: var(--surface); border: 1px solid var(--line-strong); border-radius: 8px; box-shadow: var(--shadow); }
+.searchbox .sugg:empty { display: none; }
+@media (max-width: 560px) { #gsearch { display: none; } }
+table.compare th[scope="row"] { color: var(--ink-2); font-weight: 500; white-space: nowrap; }
+table.compare td { text-align: right; }
+@media (max-width: 1360px) and (min-width: 561px) { .stamp > span:nth-child(2) { display: none; } }

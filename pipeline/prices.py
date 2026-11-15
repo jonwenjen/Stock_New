@@ -334,7 +334,8 @@ def sanitize(df: pd.DataFrame, *, market: str, code: str = "", calendar: pd.Date
         notes.append(f"{d} 除權息還原 ×{f:.4f}")
     lim = daily_limit(code) if market == "TW" else None
     thr = lim or spike_limit
-    tol = lim or 0.15  # "undone" = back within this distance of the price before the jump
+    # "undone" = back within this distance of the price before the jump; wider for volatile series
+    tol = lim or (0.15 if spike_limit <= 0.35 else 0.25)
     # 4. spikes
     i = 1
     while i < len(df):

@@ -490,3 +490,6 @@ button.statbtn { font: inherit; text-align: left; background: var(--surface); cu
 button.statbtn:hover { background: var(--accent-soft); }
 .chip.capsule { white-space: normal; text-align: left; line-height: 1.35; }
 @media (pointer: coarse) { .chip.capsule { min-height: 44px; } }
+
+/* review 2026-11-15 (product-7): on a phone the sticky first column may not eat the table */
+@media (max-width: 560px) { .tbl-wrap :is(th, td):first-child { max-width: 44vw; white-space: normal; } }

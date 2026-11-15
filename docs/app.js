@@ -86,11 +86,11 @@
   const calibNote = () => {
     const C = S.calibration || {};
     const rows = [];
-    for (const mk of ["TW", "US"]) for (const [k, v] of Object.entries(C[mk] || {})) rows.push({ mk, k, ...v });
+    for (const mk of ["TW", "US"]) for (const [k, v] of Object.entries(C[mk] || {})) rows.push({ ...v, mk, hz: k });
     if (!rows.length) return null;
     return h("div", { class: "stack" }, table([
       { key: "m", label: "市場", left: true, cell: (r) => mkChip(r.mk) },
-      { key: "h", label: "期間", left: true, cell: (r) => HZ[r.k] },
+      { key: "h", label: "期間", left: true, cell: (r) => HZ[r.hz] },
       { key: "k", label: "斜率", tip: "跑贏中位數機率＝50% ＋ 斜率 × 排名分數（−1 至 +1）", cell: (r) => h("b", { class: "num" }, num(r.k, 3)) },
       { key: "b", label: "Brier（樣本外）", cell: (r) => h("span", { class: "num" }, num(r.brier, 4)) },
       { key: "c", label: "一律 50%", cell: (r) => h("span", { class: "num" }, num(r.brier_coin, 4)) },
@@ -140,8 +140,8 @@
   const musd = (v) => (ok(v) ? "US" + "\u0024" + num(v / 1e6, 1) + "M" : "–");
   const relText = (r, h1 = "1m") => {
     const f = (r.horizons || {})[h1];
-    if (!f || f.p_beat == null) return null;
-    if (r.market === "US" && !r.edge) return "美股：無可驗證優勢";
+    if (!f) return null;
+    if (f.p_beat == null) return `${HZ[h1]}跑贏中位數：無可驗證優勢`;
     return `${HZ[h1]}跑贏同市場中位數 ${nf(0).format(f.p_beat * 100)}%`;
   };
   // Risk levels get their own colours: they must not borrow the up/down colours, which swap.
@@ -551,7 +551,7 @@
       h("span", { class: "h" }, "未來" + HZ[k]),
       h("span", { class: "b" },
         h("span", { class: "small muted num" }, `一個標準差區間 ${px(f.low)} – ${px(f.high)}`),
-        stock ? h("span", { class: "small" }, item.market === "US" && !item.edge ? "跑贏同市場中位數：無可驗證優勢"
+        stock ? h("span", { class: "small" }, f.p_beat == null ? "跑贏同市場中位數：這個期間沒有可驗證的優勢"
           : ["同排名股票跑贏同市場中位數的比例 ", h("b", { class: "num" }, nf(0).format(f.p_beat * 100) + "%"), h("span", { class: "muted" }, "（擲硬幣 50%；屬上限）")]) : null,
         ok(f.p_up) && !stock ? h("span", { class: "small muted" }, "近 5 年上漲比率 " + nf(0).format(f.p_up * 100) + "%") : null)]);
     return h("div", { class: "stack", style: "gap:8px" },
@@ -758,7 +758,7 @@
     const b = (R.buckets || []).find((x) => x.level === R.name);
     return h("p", { class: "small" }, h("b", {}, "市場環境（台股）："),
       `${G.name || "–"}${ok(G.days) ? ` 第 ${G.days} 日` : ""}・短期回檔風險 ${num(R.score, 0)}（${R.name}` +
-      (b && b.dd20 ? `；歷來同等級 20 日內跌逾 5% 約 ${num(b.dd20.dd * 100, 0)}%` : "") + "）", help("riskscore", "短期回檔風險"));
+      (b && b.dd20 ? `；歷來同等級 20 日內跌逾 5% 約 ${num(b.dd20.dd * 100, 0)}%` + (ok(b.dd20.n_eff) && b.dd20.n_eff < 10 ? `，但只有約 ${b.dd20.n_eff} 段獨立行情` : "") : "") + "）", help("riskscore", "短期回檔風險"));
   };
   const entryText = (r) => (r.entry ? `入選：${r.entry.date}（當時收盤 ${px(r.entry.close)}）・至今 ${pct(r.entry.chg)}` : null);
   const rsLine = (r) => (r.rs ? h("p", { class: "small" }, `相對 ${r.market === "US" ? "SPY" : "0050"}：` +
@@ -812,14 +812,14 @@
     let spotDone = false;
     [...o.ladder].reverse().forEach(([k, c, pv]) => {
       if (!spotDone && k < o.spot) { rows.push(h("div", { class: "spot" }, `加權指數 ${num(o.spot, 0)}`)); spotDone = true; }
-      const tag = k === o.call_wall ? "壓力" : k === o.put_wall ? "支撐" : k === o.max_pain ? "Max Pain" : null;
+      const tag = [k === o.call_wall ? "買權最大" : null, k === o.put_wall ? "賣權最大" : null, k === o.max_pain ? "Max Pain" : null].filter(Boolean).join("・") || null;
       rows.push(h("div", { class: "lr" }, h("span", { class: "p" }, h("span", { class: "num small" }, pv ? num(pv, 0) : ""), bar(pv, "put")),
         h("span", { class: "k num" }, num(k, 0), tag ? h("span", { class: "chip" + (tag === "Max Pain" ? "" : " mk") }, tag) : null),
         h("span", { class: "c" }, bar(c, "call"), h("span", { class: "num small" }, c ? num(c, 0) : ""))));
     });
     return h("div", { class: "stack" },
       h("div", { class: "row" }, h("b", {}, `${o.expiry.slice(5).replace("-", "/")} 結算${o.monthly ? "（月選）" : "（週選）"}`),
-        h("span", { class: "small muted" }, `下檔支撐 ${num(o.put_wall, 0)}・上檔壓力 ${num(o.call_wall, 0)}・Max Pain ${num(o.max_pain, 0)}`)),
+        h("span", { class: "small muted" }, `賣權最大 ${num(o.put_wall, 0)}・買權最大 ${num(o.call_wall, 0)}・Max Pain ${num(o.max_pain, 0)}`)),
       h("div", { class: "ladder" }, h("div", { class: "lr head" }, h("span", { class: "p" }, "賣權未平倉（口）"), h("span", { class: "k" }, "履約價"), h("span", { class: "c" }, "買權未平倉（口）")), rows));
   }
   const REGIME = { risk_on: ["風險偏好", "rk0", "信用利差仍窄、半導體領漲：股市拉回較可能是買點，可維持股票型與科技型部位。"],
@@ -885,7 +885,8 @@
         weeklyCard(),
         funnel(),
         h("div", { class: "tiles" }, S.indices.map((i) => h("button", { class: "tile", type: "button", onclick: () => openDrawer(i.symbol) },
-          h("span", { class: "nm" }, i.name), h("span", { class: "px num" }, px(i.close)),
+          h("span", { class: "nm" }, i.name, i.date && i.date < S.data_date ? h("span", { class: "small muted num", title: "這個序列的最新資料日（來源公布較晚）" }, ` ${i.date.slice(5).replace("-", "/")}`) : null),
+          h("span", { class: "px num" }, px(i.close)),
           h("span", { class: "chg" }, h("span", { class: "num " + cls(i.chg1d) }, "日 " + chgText(i, i.chg1d, 2)), h("span", { class: "num " + cls(i.chg5d) }, "週 " + chgText(i, i.chg5d))),
           spark(i.spark)))),
         h("div", { class: "grid g2" },
@@ -1054,7 +1055,9 @@
       const chartBox = h("div", { class: "chart", style: "height:260px" });
       if (rows.length) {
         chartLib().then(async () => {
-          const chart = LightweightCharts.createChart(chartBox, { height: 260, layout: { background: { color: "transparent" }, textColor: css("--ink-2") },
+          // the box may not be in the page yet (or have width 0): wait a frame and size to the panel
+          if (!chartBox.isConnected || !chartBox.clientWidth) await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+          const chart = LightweightCharts.createChart(chartBox, { height: 260, autoSize: true, layout: { background: { color: "transparent" }, textColor: css("--ink-2") },
             grid: { vertLines: { color: css("--line-soft") }, horzLines: { color: css("--line-soft") } }, rightPriceScale: { borderColor: css("--line") }, timeScale: { borderColor: css("--line") } });
           const colours = ["--ma1", "--ma2", "--ma3", "--ink"], styles = [0, 2, 1, 3];
           for (const [i, r] of rows.entries()) {
@@ -1618,7 +1621,9 @@
         R.series.length ? h("div", { class: "panel stack" }, h("h3", {}, "風險分數的歷史與驗證"),
           flowChart(R.series, "v", "風險分數（可回溯版）", "0–100", { line: true, digits: 0, marks: [[70, "高風險"], [30, "低風險"]] }),
           table([{ key: "l", label: "當時的風險等級", left: true, cell: (r) => r.level }, { key: "s", label: "占比", cell: (r) => h("span", { class: "num" }, num(r.share * 100, 0) + "%") },
-            { key: "d", label: "之後 20 日內跌逾 5% 的比例", cell: (r) => h("span", { class: "num" }, r.dd20 ? `${num(r.dd20.dd * 100, 0)}%（${r.dd20.n} 日）` : "–") }, ...fwdCols], R.buckets),
+            { key: "d", label: "之後 20 日內跌逾 5% 的比例", cell: (r) => h("span", { class: "num" + (r.dd20 && r.dd20.n_eff < 10 ? " muted" : "") }, r.dd20 ? `${num(r.dd20.dd * 100, 0)}%（${r.dd20.n} 日` +
+              (ok(r.dd20.n_eff) ? `，約 ${r.dd20.n_eff} 段獨立行情，95% 區間 ${num(r.dd20.ci[0] * 100, 0)}–${num(r.dd20.ci[1] * 100, 0)}%` : "") + "）" : "–") }], R.buckets),
+            h("p", { class: "chart-note" }, "這裡只列回檔比例：各等級之後的漲跌比率並不隨分數單調變化（例如「中等」之後一季上漲的比例反而高於「低」），風險分數分辨不了報酬。"),
           h("p", { class: "chart-note" }, `歷史分數只用能回溯多年的項目（${R.history_parts.join("、")}），所以與上方的今日分數不完全相同。統計自 ${R.sample_from} 起；樣本重疊、期間以多頭為主，高風險等級的天數很少，結論只能當參考。風險分數分辨得出之後的回檔機率，分辨不了之後的報酬；持股水位規則未經驗證，初步回測（單一多頭期、樣本重疊）顯示在相同平均持股下回檔較小，但報酬低於全額持有。`)) : null,
         h("div", { class: "grid g2" },
           h("div", { class: "panel stack" }, h("div", { class: "sec-head" }, h("h3", {}, "市場廣度指數", help("breadthidx", "廣度指數")), h("span", { class: "pill " + (BO[bo.kind] || BO.none)[1] }, (BO[bo.kind] || BO.none)[0])),
@@ -1652,9 +1657,9 @@
           h("h4", {}, "一、本站實際發布過的預測"),
           table([{ key: "t", label: "期間", left: true, cell: (r) => r.t },
             { key: "n", label: "已到期筆數", cell: (r) => h("span", { class: "num" }, r.n ? `${nf(0).format(r.n)}（${r.snapshots} 次發布）` : "尚未到期") },
-            { key: "h", label: "方向命中率", cell: (r) => h("span", { class: "num" }, ok(r.hit) ? num(r.hit * 100, 0) + "%" : "–") },
-            { key: "u", label: "偏多組平均報酬", cell: (r) => numEl(pct(r.bull_ret), r.bull_ret) },
-            { key: "d", label: "偏空組平均報酬", cell: (r) => numEl(pct(r.bear_ret), r.bear_ret) },
+            { key: "h", label: "排名前半跑贏中位數的比例", cell: (r) => h("span", { class: "num" }, ok(r.hit) ? num(r.hit * 100, 0) + "%" : "–") },
+            { key: "u", label: "前半相對中位數", cell: (r) => numEl(pct(r.bull_ret), r.bull_ret) },
+            { key: "d", label: "後半相對中位數", cell: (r) => numEl(pct(r.bear_ret), r.bear_ret) },
 ], live),
           h("p", { class: "small" }, `自 ${A.first_snapshot} 起，每次更新都會把所有個股與指數的預測存檔（目前 ${A.snapshots} 次），期間走完後自動與實際結果比對。累積的次數還少時，這張表的數字不具代表性。`),
           A.index_log.length ? table([{ key: "d", label: "發布日", left: true, cell: (r) => h("span", { class: "num" }, r.date) },
@@ -1662,7 +1667,6 @@
             { key: "h", label: "期間", left: true, cell: (r) => HD[r.h] },
             { key: "p", label: "當時顯示的上漲比率", cell: (r) => h("span", { class: "num" }, num(r.p_up * 100, 0) + "%") },
             { key: "r", label: "實際漲跌", cell: (r) => numEl(pct(r.ret), r.ret) },
-            { key: "o", label: "方向", cell: (r) => (r.dir_ok == null ? "中性" : r.dir_ok ? "✓" : "✗") },
             { key: "i", label: "落在區間內", cell: (r) => (r.in_range ? "✓" : "✗") }], [...A.index_log].reverse()) : null,
           calibNote() ? h("h4", {}, "二、跑贏中位數機率的校準（樣本外）") : null, calibNote(),
           h("h4", {}, calibNote() ? "三、技術面分數的歷史回測（約三年）" : "二、技術面分數的歷史回測（約三年）"),
@@ -1680,7 +1684,6 @@
         { key: "c", label: "收盤", cell: (r) => h("span", { class: "num" }, px(r.close)) },
         { key: "w", label: "週漲跌", cell: (r) => numEl(pct(r.chg5d), r.chg5d) },
         rankCol,
-        { key: "2", label: "同市場排名", val: (r) => r.rank && -r.rank[0], cell: (r) => h("span", { class: "num" }, r.rank ? `${r.rank[0]}／${r.rank[1]}` : "–") },
         { key: "t", label: "籌碼分", tip: "外資、投信、融資（只有台股）", val: (r) => r.tactical, cell: (r) => h("span", { class: "num" }, ok(r.tactical) ? signed(r.tactical, 2) : "–") },
         { key: "s", label: "基本面分", tip: "財報與申報持股", val: (r) => r.structural, cell: (r) => h("span", { class: "num" }, ok(r.structural) ? signed(r.structural, 2) : "–") },
         { key: "a", label: "ATR%", tip: "近 14 日平均每日波動幅度", val: (r) => r.plan.atr_pct, cell: (r) => h("span", { class: "num" }, ok(r.plan.atr_pct) ? num(r.plan.atr_pct * 100, 1) + "%" : "–") },
@@ -1876,7 +1879,7 @@
               Object.keys(HZ).map((k) => `${HZ[k]} 技術 ${nf(0).format(S.weights_us[k].tech * 100)}%／籌碼 ${nf(0).format(S.weights_us[k].chips * 100)}%／基本面 ${nf(0).format(S.weights_us[k].fund * 100)}%`).join("；") + "。") : null,
             h("p", { class: "small" }, h("a", { href: "#learn" }, "每個指標與預測的原理，見「指標與模型解說」")),
             h("p", { class: "small" }, "每個因子先壓縮到 −1 至 +1：趨勢看均線排列與季線斜率；動能看波動度調整後的報酬、MACD、RSI；台股籌碼看外資／投信買賣超占成交量比重、連續天數與融資變化；美股籌碼看議員交易與 13F 增減；基本面看營收與 EPS 成長、近 3 月對 12 月的營收動能、本益比、殖利率。缺少的因子會自動剔除並重新分配權重。"),
-            h("p", { class: "small" }, "預測區間＝現價 ×（1 ＋ 偏移 ± σ），σ 為近 60 日波動度乘以天數平方根，偏移隨機率斜率縮放。綜合分數＝一週 30%＋一月 40%＋一季 30%。Podcast 聲量的權重為 0，只顯示不計分。")),
+            h("p", { class: "small" }, "預測區間＝現價 ×（1 ± σ），以現價為中心、不依分數偏移；σ 為近 60 日波動度乘以天數平方根。三個期間用同一個分數，只有區間寬度不同。Podcast 聲量的權重為 0，只顯示不計分。")),
           h("div", { class: "panel stack" }, h("h3", {}, "技術面分數回測"),
             Object.values(bt).some(Boolean) ? table([
               { key: "h", label: "期間", left: true, cell: (k) => HZ[k] },

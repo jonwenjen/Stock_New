@@ -54,7 +54,9 @@ def evidence(x: pd.Series | None, close: pd.Series, orient: int) -> dict:
     close = close.dropna()
     if not len(x):
         return {"grade": "D", "text": GRADE_TEXT["D"], "n": 0}
-    known = x.reindex(x.index.union(close.index)).ffill().reindex(close.index).shift(1)
+    # carry a value forward at most 7 sessions (a weekly series), never across a long gap: a 19-day hole
+    # in the TAIFEX history was being filled with stale values (review 2026-11-15, chips-2)
+    known = x.reindex(x.index.union(close.index)).ffill(limit=7).reindex(close.index).shift(1)
     known = known[known.index >= x.index[0]]
     recent = x.tail(250)
     pct = round(float((recent <= x.iloc[-1]).mean()), 3) if len(recent) >= 60 else None
@@ -465,3 +467,29 @@ def concentration(industries: list[str], names: list[str], weights: np.ndarray, 
             if pd.notna(v) and (best is None or v > best[2]):
                 best = [names[i], names[j], round(float(v), 2)]
     return {"industries": inds, "top_pair": best}
+
+
+def fdr_adjust(evs: list[dict], q_max: float = 0.10, targets: int = 3) -> list[dict]:
+    """Multiple-testing check across the leading cards (review 2026-11-15, quant-3).
+
+    Each card keeps the best of `targets` tests, so its p-value is Bonferroni-adjusted within the
+    card (normal approximation of the Newey-West t), then Benjamini-Hochberg across all tested cards.
+    A card stays A only with q < q_max; an A or B that fails becomes B 「證據弱（未過多重檢定）」 with
+    fdr False, and the page then gives it no direction colour."""
+    from math import erf, sqrt
+    tested = [e for e in evs if e.get("grade") in ("A", "B", "C") and e.get("t") is not None]
+    if not tested:
+        return evs
+    ps = [min(1.0, targets * (1 - erf(abs(e["t"]) / sqrt(2)))) for e in tested]
+    order = sorted(range(len(ps)), key=lambda i: ps[i])
+    m, q, prev = len(ps), [0.0] * len(ps), 1.0
+    for rank in range(m, 0, -1):
+        i = order[rank - 1]
+        prev = min(prev, ps[i] * m / rank)
+        q[i] = prev
+    for e, p, qq in zip(tested, ps, q):
+        e["p_card"], e["q"] = round(p, 4), round(qq, 4)
+        e["fdr"] = qq < q_max
+        if e["grade"] in ("A", "B") and not e["fdr"]:
+            e["grade"], e["text"] = "B", "證據弱（未過多重檢定）"
+    return evs

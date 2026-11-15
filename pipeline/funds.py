@@ -219,7 +219,7 @@ def rescore(records: list[dict]) -> None:
     The first score rewarded whole categories (Taiwan equity funds averaged 75 because the market
     rallied; bond funds scored high on drawdown simply for being bonds). Here: excess return is
     against the category average (Morningstar's), Sharpe and drawdown are percentiles within our
-    group when it has 5+ funds, consistency counts the periods (6m, 1y, 3y, 5y) in which the fund
+    group when it has 10+ funds, consistency counts the periods (6m, 1y, 3y, 5y) in which the fund
     beat half its peers, and management fees above 1% cost 5 points per 0.5 percentage point."""
     groups: dict[str, list[dict]] = {}
     for r in records:
@@ -233,12 +233,20 @@ def rescore(records: list[dict]) -> None:
         a3, c3 = annualise(ret.get("3y"), 3), annualise(cat.get("3y"), 3)
         exc = (a3 - c3) if a3 is not None and c3 is not None else \
             (ret["1y"] - cat["1y"]) if ret.get("1y") is not None and cat.get("1y") is not None else None
+        # The provider sometimes attaches the wrong category average (hedged bond funds got +44.5% a
+        # 3-year, a global tech fund got the Taiwan tech average). When the excess contradicts the fund's
+        # own peer rank, fall back to the excess over its benchmark (review 2026-11-15, fund F-4).
+        b3 = beat.get("3y")
+        if exc is not None and b3 is not None and ((b3 >= 55 and exc < -0.02) or (b3 <= 45 and exc > 0.02)):
+            exc = r.get("excess_ann")
 
         def rel(key: str, lo: float, hi: float) -> float | None:
             vals = [x[key] for x in g if x.get(key) is not None]
             if r.get(key) is None:
                 return None
-            return _pct_in(vals, r[key]) if len(vals) >= 5 else _scale(r[key], lo, hi)
+            # percentiles only in a group big enough for them (5 balanced funds 1.4 points apart in drawdown
+            # were spread to 90 vs 10)
+            return _pct_in(vals, r[key]) if len(vals) >= 10 else _scale(r[key], lo, hi)
 
         have = {k: v for k, v in beat.items() if k in pw and v is not None}
         periods = [beat[k] for k in ("6m", "1y", "3y", "5y") if beat.get(k) is not None]

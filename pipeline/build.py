@@ -370,10 +370,16 @@ def clean(sym: str, df: pd.DataFrame, market: str, **kw) -> pd.DataFrame:
     return out
 
 
+# Index and macro series move far more than stocks on real days: VIX +65% (2024-08-05), US 10-year
+# 0.73% -> 1.02% (2020-03), BTC -54%. The stock rule (35%, undone within five sessions) deleted 17
+# real VIX spikes (review 2026-11-15, fund F-1). Per-class thresholds keep only obvious bad prints.
+SPIKE = {"VIX": 1.25, "US10Y": 1.0, "WTI": 0.8, "GOLD": 0.8, "BTC": 0.8, "DXY": 0.35, "USDTWD": 0.35}
+
+
 def fetch_index(ix: dict, intraday: dict) -> pd.DataFrame:
     df = _fetch_index(ix, intraday)
     market = {"BTC": "CRYPTO"}.get(ix["symbol"], "US" if ix["source"] == "cboe" else ix["source"].upper())
-    return clean(ix["symbol"], df, market)
+    return clean(ix["symbol"], df, market, spike_limit=SPIKE.get(ix["symbol"], 0.35))
 
 
 def _fetch_index(ix: dict, intraday: dict) -> pd.DataFrame:
@@ -458,7 +464,8 @@ def update_derivs(today: dt.date, twii: pd.Series) -> dict[str, dict]:
         c = twii.get(pd.Timestamp(d))
         if v.get("settle") and c is not None and not pd.isna(c):
             v["basis"] = round(v["settle"] - float(c), 1)
-    store = {d: store[d] for d in sorted(store)[-520:]}
+    # 800 sessions: the back-fill reaches three years for the futures_d20 test (it was cut at 520).
+    store = {d: store[d] for d in sorted(store)[-800:]}
     write_json(path, store)
     if not store:
         raise RuntimeError("no derivatives history")
@@ -1334,6 +1341,8 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                 rec["daytrade"] = round(min(1.0, daytrade[code] / vol), 3)
             fund_in = {**valuation.get(code, {}), **revenue.get(code, {}), **eps.get(code, {})}
             rm = leading.revenue_momentum({ym: t[code] for ym, t in rev_hist.items() if t.get(code)})
+            if rm and rev_hist and rm["month"] < max(rev_hist):
+                rm = None  # not filed for the latest month yet: last month's momentum would pass as current
             if rm:
                 fund_in.update({"rev_ratio": rm["ratio"], "rev_cross_up": rm["cross_up"],
                                 "rev_cross_down": rm["cross_down"]})
@@ -1427,7 +1436,8 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
             r["edge"] = any(v.get("edge") for v in cal.values())
             for h, f in r["horizons"].items():
                 c = cal.get(h)
-                f["p_beat"] = round(market.p_beat(x, c["k"]), 3) if c and c.get("edge") else 0.5
+                # no out-of-sample edge for this market and horizon: say so instead of printing 50%
+                f["p_beat"] = round(market.p_beat(x, c["k"]), 3) if c and c.get("edge") else None
                 f["p_up"] = c["base_up"] if c else None
     for r in records:
         fl = flags.get(r["code"]) if r["market"] == "TW" else None
@@ -2072,6 +2082,11 @@ def backfill_history(today: dt.date, trading_days: list[str]) -> dict:
             break
         n += 1
         end = start - dt.timedelta(days=1)
+    twii = load_store("TWII")[0]["close"] if (CHARTS / "TWII.json").exists() else pd.Series(dtype=float)
+    for d, v in derivs.items():  # basis for back-filled days too (review 2026-11-15, chips-1)
+        c = twii.get(pd.Timestamp(d))
+        if v.get("settle") and v.get("basis") is None and c is not None and not pd.isna(c):
+            v["basis"] = round(v["settle"] - float(c), 1)
     write_json(dpath, {d: derivs[d] for d in sorted(derivs)})
     write_json(fpath, {d: fut[d] for d in sorted(fut)})
     done["taifex_windows"] = n
@@ -2620,8 +2635,8 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
         series["adr"] = dated(prem)
         ev["adr"] = (prem, 1)
         cards.append(_card("adr", "台積電 ADR 溢價", f"{now:.1%}", f"20 日 {pp(now - ago)}",
-                           f"高於過去一年 {pct:.0%} 的日子。溢價擴大代表海外買盤對台積電的出價高於台股，"
-                           "常被視為外資回補的前兆；收斂則相反。", 1 if now > ago else -1, prem.tail(60)))
+                           f"高於過去一年 {pct:.0%} 的日子。溢價是同一家公司在美國與台灣的報價差；"
+                           "本站 5 年資料看不出它和加權指數之後的漲跌有可靠關係（證據等級見下）。", 1 if now > ago else -1, prem.tail(60)))
 
     def fx():
         c = frames["USDTWD"]["close"]
@@ -2657,10 +2672,11 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
         ev[f"breadth_{mk.lower()}"] = (b["above60"], 1)
         series[f"breadth_{mk.lower()}"] = [[d.strftime("%Y-%m-%d"), round(float(x), 3), round(float(y), 3)]
                                            for d, x, y in b.itertuples()]
-        read = ("不到 15% 的個股站上月線，屬於超賣區，常見於急跌尾聲。" if a20 < 0.15 else
-                "超過 85% 的個股站上月線，短線過熱。" if a20 > 0.85 else
-                "站上季線的個股不到四成，指數若續強須留意只靠少數權值股撐盤。" if a60 < 0.4 else
-                "多數個股站上季線，漲勢有廣度支撐。" if a60 > 0.6 else "廣度中性。")
+        read = ("不到 15% 的個股站上月線，屬於極低的位置。" if a20 < 0.15 else
+                "超過 85% 的個股站上月線，屬於極高的位置。" if a20 > 0.85 else
+                "站上季線的個股不到四成。" if a60 < 0.4 else
+                "多數個股站上季線。" if a60 > 0.6 else "廣度在中間位置。")
+        read += "本站 5 年資料看不出廣度能預告指數之後的漲跌，風險分數裡的權重因此只有 5。"
         cards.append(_card(f"breadth_{mk.lower()}", f"{label}廣度（觀察名單 {len(fs)} 檔）",
                            f"月線上 {a20:.0%}・季線上 {a60:.0%}", f"5 日 {pp(a20 - float(b['above20'].iloc[-6]))}",
                            read, 1 if a60 > 0.6 else -1 if a60 < 0.4 else 0, b["above20"].tail(60)))
@@ -2674,9 +2690,10 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
         r = mtx["ratio"]
         cards.append(_card("retail", "散戶小台多空比", f"{r:+.1%}",
                            (f"微台 {tmf['ratio']:+.1%}・" if tmf else "") + fp["date"][5:],
-                           ("散戶明顯偏多。這是反向指標：散戶一面倒做多時，指數常有下跌壓力。" if r >= 0.2 else
-                            "散戶明顯偏空。反向來看，容易出現軋空上漲。" if r <= -0.2 else
-                            "散戶多空部位不極端，反向訊號不明顯。")
+                           ("散戶淨多單占未平倉 20% 以上，屬於較極端的位置。" if r >= 0.2 else
+                            "散戶淨空單占未平倉 20% 以上，屬於較極端的位置。" if r <= -0.2 else
+                            "散戶淨部位不極端。")
+                           + "常被當成反向指標，但本站資料尚未證實它和之後的漲跌有關。"
                            + "算法：小型臺指未平倉扣掉三大法人後的淨部位 ÷ 全市場未平倉。",
                            -1 if r >= 0.2 else 1 if r <= -0.2 else 0,
                            dseries("retail_mtx").tail(120) if len(dseries("retail_mtx")) else
@@ -2690,11 +2707,11 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
                 by_date[x["date"]]["pcr_oi"] = round(x["pcr_oi"], 4)
         now = rows[-1]["pcr_oi"]
         cards.append(_card("pcr", "台指選擇權 Put/Call 未平倉比", f"{now:.0%}", f"5 日 {pp(now - rows[-6]['pcr_oi'])}",
-                           ("高於 100%：賣權未平倉多於買權，一般解讀為下檔有支撐、偏多。" if now >= 1 else
-                            "低於 100%：買權未平倉多於賣權，一般解讀為上檔有壓、偏空。")
-                           + ("今天是週選結算日，結算日的 P/C 平均比其他日子高約 14 個百分點，讀數要打折。"
+                           ("高於 100%：賣權未平倉多於買權。" if now >= 1 else "低於 100%：買權未平倉多於賣權。")
+                           + "市場常把它讀成支撐或壓力，本站資料尚未證實它和之後的漲跌有關。"
+                           + ("今天是週選結算日；近一年結算日的 P/C 平均比其他日子高約 7 個百分點，比較時要避開。"
                               if pd.Timestamp(rows[-1]["date"]).weekday() == 2 else
-                              "每週三週選結算日的 P/C 常跳高約 14 個百分點，比較時要避開結算日。"),
+                              "近一年週三結算日的 P/C 平均比其他日子高約 7 個百分點，比較時要避開結算日。"),
                            1 if now >= 1.1 else -1 if now < 0.9 else 0,
                            dseries("pcr_oi").tail(120) if len(dseries("pcr_oi")) > 20 else [x["pcr_oi"] for x in rows]))
         cards[-1]["change_text"] += pct_note("pcr_oi", now)
@@ -2709,9 +2726,9 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
         c5 = float(c.iloc[-1] - c.iloc[-6]) if len(c) > 6 else 0.0
         cards.append(_card("fo", "外資台指選擇權淨未平倉", f"買權 {cn:+,.0f}・賣權 {pn:+,.0f} 口",
                            f"買權 5 日 {c5:+,.0f}・{d:%m-%d}",
-                           ("外資淨買進買權、淨賣出賣權：兩者都在指數上漲時獲利，部位偏多。" if tone > 0 else
-                            "外資淨賣出買權、淨買進賣權：兩者都在指數下跌時獲利，部位偏空。" if tone < 0 else
-                            "買權與賣權方向不一致，可能是價差或避險組合，看不出明確方向。")
+                           ("外資淨買進買權、淨賣出賣權（兩者都在指數上漲時獲利）。" if tone > 0 else
+                            "外資淨賣出買權、淨買進賣權（兩者都在指數下跌時獲利）。" if tone < 0 else
+                            "買權與賣權的淨部位方向不一致（近一年約六成的日子如此）。")
                            + "外資常用選擇權搭配期貨與現貨避險，單看選擇權容易誤判，要和期貨未平倉一起看。",
                            tone, (c - p_.reindex(c.index).fillna(0)).tail(120)))
 
@@ -2805,8 +2822,9 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
                            -1 if rg["oas"] > 4.0 or rg["oas_chg10"] >= 0.5 else 1 if rg["oas"] < 3.5 else 0, oas.tail(120)))
         gap = rg["ratio"] / rg["ratio_ma60"] - 1
         cards.append(_card("semis", "半導體相對強弱（SOXX ÷ SPY）", f"{rg['ratio']:.3f}", f"較 60 日均值 {gap:+.1%}",
-                           ("半導體跑贏大盤且在季線之上，科技股仍是領漲族群。" if rg["semis_lead"] else
-                            "半導體落後大盤、相對強度跌破季線，領漲地位鬆動；台股與半導體高度連動，須留意。"),
+                           ("半導體相對 S&P 500 的比值在 60 日均值之上。" if rg["semis_lead"] else
+                            "半導體相對 S&P 500 的比值在 60 日均值之下。")
+                           + "台股和半導體高度連動，但本站 5 年資料看不出這個比值能預告台股之後的漲跌。",
                            1 if rg["semis_lead"] else -1, ratio.tail(120)))
 
     def options():
@@ -2818,7 +2836,7 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
         if not walls:
             raise RuntimeError("no live TXO expiry in the report")
         for w in walls:
-            w["ladder"] = leading.trim_ladder(w["ladder"])
+            w["ladder"] = leading.trim_ladder(w["ladder"], keep=(w.get("call_wall"), w.get("put_wall"), w.get("max_pain")))
             w["date"] = data_date.isoformat()
             w["spot"] = spot
         extra["options"] = walls
@@ -2826,8 +2844,8 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
         cards.append(_card("optwall", f"台指選擇權未平倉區間（{w['expiry'][5:].replace('-', '/')} 結算）",
                            f"{w['put_wall']:,.0f} – {w['call_wall']:,.0f}",
                            f"Max Pain {w['max_pain']:,.0f}・該合約 P/C {w['put_oi'] / w['call_oi']:.0%}",
-                           f"賣權最大未平倉在 {w['put_wall']:,.0f}（一般視為下檔支撐），買權最大未平倉在 {w['call_wall']:,.0f}"
-                           f"（上檔壓力）。加權指數 {spot:,.0f} "
+                           f"賣權最大未平倉在 {w['put_wall']:,.0f}，買權最大未平倉在 {w['call_wall']:,.0f}"
+                           f"（市場常稱支撐與壓力，本站尚無歷史可檢驗）。加權指數 {spot:,.0f} "
                            + ("在區間內，結算前常被壓縮在兩者之間。" if w["put_wall"] <= spot <= w["call_wall"] else
                               "已在區間之外，賣方被迫避險時波動會放大。")
                            + f"未平倉為 {data_date:%m/%d} 資料。", 0))
@@ -2839,8 +2857,8 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
         r = lt["ratio"]
         cards.append(_card("top10", "十大交易人台指期淨部位", f"{lt['net']:+,.0f} 口", f"占未平倉 {r:+.1%}・{lt['date'][5:]}",
                            ("前十大交易人（多為外資與大型法人）合計淨多單，" if r > 0 else "前十大交易人合計淨空單，")
-                           + ("部位明顯偏多。" if r >= 0.1 else "部位明顯偏空，大戶在避險或看空。" if r <= -0.1 else "幅度不大。")
-                           + "大戶部位通常比散戶有參考性，方向與散戶相反時尤其值得留意。",
+                           + ("占未平倉 10% 以上。" if abs(r) >= 0.1 else "幅度不大。")
+                           + "其中包含投信槓桿 ETF 的避險與套利部位，不能直接讀成大戶看法；本站資料尚未證實它和之後的漲跌有關。",
                            1 if r >= 0.1 else -1 if r <= -0.1 else 0,
                            dseries("top10").tail(120) if len(dseries("top10")) else
                            [x["top10"] for x in flows if x.get("top10") is not None][-60:]))
@@ -2856,8 +2874,9 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
             by_date[fb["date"]]["basis"] = round(diff, 1)
         pct = diff / float(spot)
         cards.append(_card("basis", "台指期基差（期貨 − 現貨）", f"{diff:+,.0f} 點", f"{pct:+.2%}・{fb['date'][5:]}",
-                           ("正價差：期貨比現貨貴，期貨市場對後市偏樂觀。" if diff > 0 else
-                            "逆價差：期貨比現貨便宜，" + ("幅度大，期貨市場偏悲觀或避險需求高。" if pct <= -0.005 else "幅度不大。"))
+                           ("正價差：期貨比現貨貴。" if diff > 0 else
+                            "逆價差：期貨比現貨便宜" + ("，幅度較大。" if pct <= -0.005 else "，幅度不大。"))
+                           + "市場常把正價差讀成樂觀，但本站資料裡正價差越大，之後 20 日的回檔反而略深，方向並不可靠。"
                            + "6–9 月除權息旺季的逆價差屬正常，接近結算日基差會收斂到零。",
                            1 if pct >= 0.003 else -1 if pct <= -0.005 else 0,
                            dseries("basis").tail(120) if len(dseries("basis")) else
@@ -2889,8 +2908,8 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
                            f"{last['date'][5:]} 單日 漲 {last['adv']}・跌 {last['dec']}",
                            ("指數上漲但下跌家數較多：漲勢集中在少數權值股，廣度沒有跟上。" if idx_up and ratio < 0.95 else
                             "指數下跌但上漲家數較多：賣壓集中在權值股，中小型股相對有撐。" if not idx_up and ratio > 1.05 else
-                            "上漲家數明顯多於下跌，漲勢普遍。" if ratio >= 1.2 else
-                            "下跌家數明顯多於上漲，賣壓普遍。" if ratio <= 0.8 else "漲跌家數接近，沒有明顯方向。"),
+                            "近 10 日上漲家數明顯多於下跌。" if ratio >= 1.2 else
+                            "近 10 日下跌家數明顯多於上漲（看的是 10 日累計，不是單日）。" if ratio <= 0.8 else "近 10 日漲跌家數接近。"),
                            1 if ratio >= 1.2 else -1 if ratio <= 0.8 else 0, line))
 
     for name, fn, url in (("FRED Fed 淨流動性", liq, "https://fred.stlouisfed.org"),
@@ -2931,8 +2950,11 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
         except Exception as e:  # noqa: BLE001 - a failed test only means no grade
             log(f"  evidence {c['key']}: {e}")
             c["evidence"] = {"grade": "D", "text": research.GRADE_TEXT["D"], "n": 0}
-        # without evidence the card shows where the value sits in its own history, not a direction
-        if not (c["evidence"]["grade"] in ("A", "B") and c["evidence"].get("agree")):
+    research.fdr_adjust([c["evidence"] for c in cards])
+    for c in cards:
+        # without evidence the card shows where the value sits in its own history, not a direction;
+        # a grade that does not survive the multiple-testing check gets no direction either
+        if not (c["evidence"]["grade"] in ("A", "B") and c["evidence"].get("agree") and c["evidence"].get("fdr", True)):
             c["tone"] = 0
     write_json(DATA / "history" / "tw_flows.json", flows)
     return {"cards": cards, "series": series, **extra}
@@ -3094,6 +3116,14 @@ def next_wednesday(d: dt.date) -> dt.date:
     return d + dt.timedelta(days=(2 - d.weekday()) % 7 or 7)
 
 
+def half_up(x: float, nd: int = 0) -> int | float:
+    """Round half away from zero, like the page's Intl.NumberFormat (Python rounds half to even, so the
+    same number read 68% here and 69% on the page; review 2026-11-15, product-2)."""
+    from decimal import ROUND_HALF_UP, Decimal
+    v = Decimal(repr(float(x))).quantize(Decimal(1).scaleb(-nd), rounding=ROUND_HALF_UP)
+    return int(v) if nd == 0 else float(v)
+
+
 def build_narrative(indices: list[dict], fl: dict, picks: list[dict], bull: list[dict],
                     bear: list[dict], mkt_risk: dict | None = None) -> list[dict]:
     """Rule-based weekly reading - always available, no LLM involved."""
@@ -3137,16 +3167,17 @@ def build_narrative(indices: list[dict], fl: dict, picks: list[dict], bull: list
                 txt += "融資減、外資買，籌碼趨於安定。"
         fut = fl.get("futures")
         if fut and fut.get("net_oi") is not None:
-            txt += f"外資台指期淨未平倉 {fut['net_oi']:+,.0f} 口（{'偏多' if fut['net_oi'] > 0 else '偏空避險'}）。"
+            txt += (f"台指期外資淨未平倉 {fut['net_oi']:+,.0f} 口、投信 {fut.get('trust_oi') or 0:+,.0f} 口、三大法人合計 "
+                    f"{fut.get('all_oi') or 0:+,.0f} 口（外資空單多為投信槓桿 ETF 多單的對手）。")
         if fl.get("breadth") is not None:
-            txt += f"觀察名單中 {fl['breadth']:.0%} 的個股站上季線。"
+            txt += f"觀察名單站上季線的比例 {half_up(fl['breadth'] * 100)}%。"
         out.append({"title": "籌碼面", "text": txt})
 
     hz = {"1w": "未來一週", "1m": "未來一月", "1q": "未來一季"}
     for i in (tw, sp):
         if not i or "horizons" not in i:
             continue
-        parts = [f"{hz[h]}一個標準差區間 {f['low']:,.0f}–{f['high']:,.0f}（近 5 年同期間上漲比率 {f['p_up']:.0%}）"
+        parts = [f"{hz[h]}一個標準差區間 {half_up(f['low']):,}–{half_up(f['high']):,}（近 5 年同期間上漲比率 {half_up(f['p_up'] * 100)}%）"
                  for h, f in i["horizons"].items() if f.get("p_up") is not None]
         if parts:
             out.append({"title": f"{i['name']}展望", "text": "；".join(parts)

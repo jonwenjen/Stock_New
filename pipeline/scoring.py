@@ -439,7 +439,7 @@ def trade_plan(row: pd.Series, f1m: dict, overall: float) -> dict:
     ma20, ma60 = _num(row.get("ma20")), _num(row.get("ma60"))
     support = ma20 if ma20 and ma20 < c else (ma60 if ma60 and ma60 < c else c - 1.5 * atr)
     stop = min(c - 2.5 * atr, support - 0.5 * atr)
-    target = max(f1m["high"], c + 2 * atr)
+    target = f1m["high"]  # exactly the +1 sigma edge it is labelled as (review 2026-11-15, product-2)
     stop = max(stop, 0.01)
     stop_pct = (c - stop) / c if c > stop else None
     # position that loses RISK_BUDGET of the portfolio if the stop is hit

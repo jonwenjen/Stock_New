@@ -156,6 +156,9 @@ def revenue_momentum(months: dict[str, float]) -> dict | None:
     vals = [months[k] for k in keys]
     if len(vals) < 12 or min(vals[-12:]) <= 0:
         return None
+    ym0 = [int(k[:4]) * 12 + int(k[5:7]) for k in keys[-12:]]
+    if ym0[-1] - ym0[0] != 11:  # a missing month would mix periods (review 2026-11-15, fund F-7)
+        return None
     ratio = (sum(vals[-3:]) / 3) / (sum(vals[-12:]) / 12)
     out = {"month": keys[-1], "ratio": ratio, "cross_up": False, "cross_down": False, "rising": None,
            "yoy3": None, "hi12": None}
@@ -296,9 +299,12 @@ def option_walls(rows: list[dict], after: dt.date, spot: float, contract: str = 
     return out
 
 
-def trim_ladder(ladder: list[list[float]], n: int = 14) -> list[list[float]]:
-    """Keep the n strikes holding the most open interest (the ones worth drawing), in strike order."""
-    return sorted(sorted(ladder, key=lambda r: -(r[1] + r[2]))[:n])
+def trim_ladder(ladder: list[list[float]], n: int = 14, keep: tuple = ()) -> list[list[float]]:
+    """Keep the n strikes holding the most open interest (the ones worth drawing), in strike order.
+    Strikes in `keep` (the walls and max pain) always stay, so the chart can label them."""
+    must = [r for r in ladder if r[0] in set(keep)]
+    rest = [r for r in sorted(ladder, key=lambda r: -(r[1] + r[2])) if r not in must]
+    return sorted(must + rest[:max(0, n - len(must))])
 
 
 def large_traders(rows: list[dict], contract: str = "TX") -> dict | None:

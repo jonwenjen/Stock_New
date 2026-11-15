@@ -307,8 +307,29 @@ def drawdown_odds(groups: pd.Series, close: pd.Series, days: int = 20, threshold
     for g in groups.dropna().unique():
         h = hit.reindex(groups.index[groups == g]).dropna()
         if len(h) >= 10:
-            out[str(g)] = {"n": int(len(h)), "dd": round(float(h.mean()), 3)}
+            # Overlapping days are not independent: count stretches of the level that start at least
+            # `days` sessions apart, and give a Wilson 95% interval on that many events (review 2026-11-15,
+            # quant-4: the 47 "偏高" days were about 2 separate episodes).
+            pos = sorted(close.index.get_indexer(h.index))
+            eff, last = 0, None
+            for p_ in pos:
+                if last is None or p_ - last >= days:
+                    eff += 1
+                    last = p_
+            lo, hi = wilson(float(h.mean()), eff)
+            out[str(g)] = {"n": int(len(h)), "dd": round(float(h.mean()), 3), "n_eff": eff,
+                           "ci": [round(lo, 3), round(hi, 3)]}
     return out
+
+
+def wilson(p: float, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score interval for a share p observed over n independent events."""
+    if n <= 0:
+        return 0.0, 1.0
+    d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    w = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return max(0.0, c - w), min(1.0, c + w)
 
 
 def bucket_stats(score: pd.Series, close: pd.Series) -> list[dict]:
@@ -387,45 +408,55 @@ def p_beat(x: float, k: float) -> float:
     return float(np.clip(0.5 + k * x, 0.3, 0.7))
 
 
+LIVE_FROM = "2026-11-13"  # first snapshot of the current model (one score, ranks within each market)
+
+
 def evaluate_log(log: dict[str, dict], frames: dict[str, pd.DataFrame], horizons: dict[str, int],
                  slopes: dict[str, float] | None = None) -> dict:
-    """Score the forecasts this site actually published.
+    """Score the rankings this site actually published, the way it now states them (review 2026-11-15,
+    quant-1): within each snapshot, did the better-ranked half beat the snapshot's median stock?
 
-    log: data date -> {symbol: [close, score_1w, score_1m, score_1q]}. A forecast counts
-    once its horizon has fully elapsed in the price history. Returns per horizon the
-    number of matured forecasts and snapshots, hit rate of non-neutral calls, Brier
-    score against the base rate, and the mean return of bullish versus bearish calls.
-    """
+    log: data date -> {symbol: [close, score_1w, score_1m, score_1q]}; snapshots before LIVE_FROM used
+    another model and are skipped. Per horizon: matured forecasts and snapshots, the share of the top
+    half that beat the median (hit), the mean return of the top and bottom halves relative to the median
+    (bull_ret / bear_ret), and the Brier score of p = 0.5 + slope x rank against the coin's 0.25."""
     out = {}
     for i, (h, days) in enumerate(horizons.items()):
-        rows, snaps = [], 0
+        hits, tops, bots, briers, snaps, n = [], [], [], [], 0, 0
         for date, syms in sorted(log.items()):
-            matured = False
+            if date < LIVE_FROM:
+                continue
+            rows = []
             for sym, v in syms.items():
                 f = frames.get(sym)
                 if f is None or v[1 + i] is None:
                     continue
-                pos = int(f.index.searchsorted(pd.Timestamp(date), side="right")) - 1  # last bar on or before the data date
+                pos = int(f.index.searchsorted(pd.Timestamp(date), side="right")) - 1
                 if pos < 0 or pos + days >= len(f):
                     continue
                 c = f["close"]
                 rows.append((v[1 + i], float(c.iloc[pos + days] / c.iloc[pos] - 1)))
-                matured = True
-            snaps += matured
-        if not rows:
+            if len(rows) < 10:
+                continue
+            snaps += 1
+            n += len(rows)
+            sc = np.array([x[0] for x in rows])
+            r = np.array([x[1] for x in rows])
+            med = float(np.median(r))
+            rank = pd.Series(sc).rank(pct=True).to_numpy() * 2 - 1
+            top, bot = rank > 0, rank < 0
+            beat = (r > med).astype(float)
+            hits.append(float(beat[top].mean()) if top.any() else np.nan)
+            tops.append(float((r[top] - med).mean()) if top.any() else np.nan)
+            bots.append(float((r[bot] - med).mean()) if bot.any() else np.nan)
+            pb = np.clip(0.5 + (slopes or {}).get(h, 0.0) * rank, 0.05, 0.95)
+            briers.append(float(((pb - beat) ** 2).mean()))
+        if not snaps:
             out[h] = {"n": 0, "snapshots": 0}
             continue
-        s, r = np.array([x[0] for x in rows]), np.array([x[1] for x in rows])
-        up, p = (r > 0).astype(float), np.clip(0.5 + (slopes or {}).get(h, 0.22) * s, 0.28, 0.72)
-        act, bull, bear = np.abs(s) >= 0.15, s >= 0.15, s <= -0.15
-        base = float(up.mean())
-        out[h] = {"n": int(len(rows)), "snapshots": int(snaps), "base_up": round(base, 3),
-                  "hit": round(float((np.sign(s[act]) == np.sign(r[act])).mean()), 3) if act.any() else None,
-                  "brier": round(float(((p - up) ** 2).mean()), 4),
-                  "base_brier": round(float(((base - up) ** 2).mean()), 4),
-                  "bull_ret": round(float(r[bull].mean()), 4) if bull.any() else None,
-                  "bear_ret": round(float(r[bear].mean()), 4) if bear.any() else None,
-                  "bull_n": int(bull.sum()), "bear_n": int(bear.sum())}
+        out[h] = {"n": n, "snapshots": snaps, "hit": round(float(np.nanmean(hits)), 3),
+                  "bull_ret": round(float(np.nanmean(tops)), 4), "bear_ret": round(float(np.nanmean(bots)), 4),
+                  "brier": round(float(np.mean(briers)), 4), "base_brier": 0.25}
     return out
 
 
@@ -436,6 +467,8 @@ def evaluate_index_log(log: dict[str, dict], frames: dict[str, pd.DataFrame], ho
     """
     out = []
     for date, syms in sorted(log.items()):
+        if date < LIVE_FROM:  # older snapshots shifted the range by the score
+            continue
         for sym, rec in syms.items():
             f = frames.get(sym)
             if f is None:
@@ -449,7 +482,8 @@ def evaluate_index_log(log: dict[str, dict], frames: dict[str, pd.DataFrame], ho
                 ret = actual / float(f["close"].iloc[pos]) - 1
                 out.append({"date": date, "symbol": sym, "h": h, "p_up": fc[0], "low": fc[1], "high": fc[2],
                             "actual": round(actual, 2), "ret": round(ret, 4),
-                            "dir_ok": None if abs(fc[0] - 0.5) < 0.033 else bool((fc[0] > 0.5) == (ret > 0)),
+                            # the index ranges are centred on the price: there is no direction to score
+                            "dir_ok": None,
                             "in_range": bool(fc[1] <= actual <= fc[2])})
     return out
 

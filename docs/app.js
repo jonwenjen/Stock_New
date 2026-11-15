@@ -209,9 +209,11 @@
         return (x - y) * dir;
       }) : rows;
       tbody.replaceChildren(...data.map((r) => {
-        const tr = h("tr", { class: opts.onRow ? "click" : null, "data-sym": rowSym(r) },
+        // a row naming a stock outside the watch list has no drawer to open: not clickable (review 2026-11-15)
+        const can = opts.onRow && (rowSym(r) || !(r && typeof r === "object" && (r.code || r.symbol)));
+        const tr = h("tr", { class: can ? "click" : null, "data-sym": rowSym(r) },
           cols.map((c, ci) => h(ci === 0 ? "th" : "td", { class: [c.left ? "l" : "", c.wrap ? "wrap" : ""].join(" ").trim() || null, scope: ci === 0 ? "row" : null }, c.cell(r))));
-        if (opts.onRow) {
+        if (can) {
           tr.addEventListener("click", (e) => { if (!e.target.closest("a,button,input")) opts.onRow(r); });
           if (!tr.querySelector("a[href]")) {  // no link to reach: the row itself takes the focus
             tr.tabIndex = 0;
@@ -429,7 +431,7 @@
       note.textContent = (isLine ? `每日淨值・${rows.length} 筆` : `${unit}K・${rows.length} 根`) +
         (fallback ? (isLine ? "・基金每日只有一個淨值，顯示最近 5 筆" : "・此標的無分時資料，改以最近 5 根日 K 呈現") : "") +
         (intraday ? "・分時資料為更新當下的最近交易日" : "") + (start ? `・歷史資料起始 ${start}` : "") +
-        (hasCone ? "・右側虛線是模型對未來的一個標準差區間（約三分之二的情況落在其中），不是目標價" : "");
+        (hasCone ? "・右側虛線是以現價為中心的一個標準差區間（常態下約三分之二落在其中，實際比例見首頁），不是目標價" : "");
     }
     chart.subscribeCrosshairMove((p) => {
       if (!p.time) { const { rows } = selectBars(state.data || {}, state.range); show(rows[rows.length - 1]); return; }
@@ -894,7 +896,11 @@
           h("div", { class: "panel stack" }, h("h3", {}, "趨勢預測：一週／一月／一季"),
             main.map((i) => h("div", { class: "stack" }, h("div", { class: "row" }, h("b", {}, i.name), h("span", { class: "num muted small" }, px(i.close)),
               h("button", { class: "chip", type: "button", onclick: () => openDrawer(i.symbol) }, "看圖")), forecastGrid(i.horizons))),
-            h("p", { class: "chart-note" }, "區間是一個標準差（約三分之二的情況落在其中），中心是現價，不是方向預測；上漲比率是近 5 年的歷史統計。",
+            h("p", { class: "chart-note" }, "區間是一個標準差，中心是現價，不是方向預測；上漲比率是近 5 年的歷史統計。" + (() => {
+              const t = (S.indices.find((i) => i.symbol === "TWII") || {}).horizons || {};
+              const c = Object.keys(HZ).filter((k) => t[k] && ok(t[k].cov)).map((k) => `${HZ[k]} ${num(t[k].cov * 100, 0)}%`);
+              return c.length ? `過去 5 年同樣算法的區間，加權指數實際落在其中的比例：${c.join("、")}（常態假設是 68%；期間越長，趨勢越容易衝出區間）。` : "";
+            })(),
               h("a", { href: "#learn?k=labels" }, "各種標籤與機率代表什麼？")))),
         aiBlock("AI 觀點", AI && AI.market),
         LEAD.cards.length ? h("div", { class: "panel stack" }, h("h3", {}, "領先指標"), leadGroups(),
@@ -1539,7 +1545,7 @@
         regimePanel(),
         aiBlock("本週基金觀察", AI && AI.fund),
         FUNDS.length ? h("div", { class: "panel stack" }, seg, tbl,
-          h("p", { class: "chart-note" }, "績效評分 0–100：同類排名 40%、年化勝過對比指數 20%、風險調整報酬（Sharpe）25%、抗跌（三年最大回檔）15%。75 以上優異、60 良好、45 普通、30 偏弱。報酬為原幣計價、含配息；點列看完整評估。"))
+          h("p", { class: "chart-note" }, "績效評分 0–100：同類排名 35%、勝過同類平均 20%、Sharpe 20%、抗跌（三年最大回檔）15%、穩定度 10%，管理費超過 1% 另外扣分。Sharpe 與回檔在 10 檔以上的組內用百分位，否則用固定區間。75 以上優異、60 良好、45 普通、30 偏弱。報酬為原幣計價、含配息；點列看完整評估。"))
           : h("div", { class: "empty" }, "尚無基金資料，下次更新後會出現"),
       ];
     },
@@ -1793,7 +1799,9 @@
       const sel = h("select", { id: "etf-cat", "aria-label": "ETF 類別", onchange: () => { state.c = sel.value; apply(); } },
         h("option", { value: "ALL" }, "所有類別"), cats.map((c) => h("option", { value: c }, c)));
       const best = (rows) => rows.slice(0, 3).map((r) => `${r.name}（${signed(r.overall, 2)}）`).join("、") || "–";
-      const tw = E.filter((r) => r.market === "TW"), us = E.filter((r) => r.market === "US");
+      // leveraged and inverse funds move by design, not by trend: left out of the strongest / weakest lists
+      const plain = E.filter((r) => !/槓桿|反向/.test(r.industry || ""));
+      const tw = plain.filter((r) => r.market === "TW"), us = plain.filter((r) => r.market === "US");
       return [
         head("ETF", "台股熱門與核心 ETF、美股主要市值型／產業／債券／商品 ETF。ETF 沒有個別財報，分數只看價格趨勢與動能，台股 ETF 另計外資與投信買賣超。"),
         E.length ? h("div", { class: "stats" },
@@ -1934,7 +1942,7 @@
           h("span", { class: "dot " + (s.ok ? "ok" : "bad") }, s.ok ? "✓ 成功" : "✕ 未取得"),
           h("span", {}, s.url ? h("a", { href: s.url, target: "_blank", rel: "noopener noreferrer" }, s.name) : s.name, s.note ? h("span", { class: "muted" }, "　" + s.note) : null)]))),
         h("div", { class: "panel stack" }, h("h3", {}, "基金績效怎麼評"),
-          h("p", { class: "small" }, "報酬、對比指數報酬、同類平均與同類排名採用鉅亨網基金頁提供的晨星資料（含配息）；年化波動、最大回檔、Sharpe、正報酬月份比例由本站用每日淨值自行計算。評分把四個面向各換算成 0–100 分再加權：同類排名 40%（近 1／3／5 年贏過同類的比例，3 年權重最高）、年化報酬勝過對比指數 20%（±10 個百分點對應 0／100 分）、Sharpe 25%（0.5 為中點）、三年最大回檔 15%。成立未滿一年不評等。"),
+          h("p", { class: "small" }, "報酬、對比指數報酬、同類平均與同類排名採用鉅亨網基金頁提供的晨星資料（含配息）；年化波動、最大回檔、Sharpe、正報酬月份比例由本站用每日淨值自行計算。評分把五個面向各換算成 0–100 分再加權：同類排名 35%（近 1／3／5 年贏過同類的比例，3 年權重最高）、3 年年化報酬勝過同類平均 20%（±5 個百分點對應 0／100 分；同類平均和排名矛盾時改用對比指數）、Sharpe 20%、抗跌 15%、穩定度 10%（6 個月到 5 年各期間贏過一半同類的比例）；管理費超過 1% 每 0.5 個百分點扣 5 分。"),
           h("p", { class: "small muted" }, "限制：淨值不含配息還原，配息級別的回檔會被高估，所以名單優先選累積級別；Sharpe 的無風險利率依計價幣別取固定值；過去績效不代表未來。")),
         h("div", { class: "panel stack" }, h("h3", {}, "更新方式與 AI 觀點"),
           h("p", { class: "small" }, "每週三由 Claude 排程自動執行：抓取資料、計算分數、撰寫觀點，然後直接推送到 GitHub。「AI 觀點」「Podcast 話題解讀」「ETF 觀察」「基金觀察」四段文字由當次執行的 Claude 只根據本頁同一批數據撰寫，並經過程式檢查資料日期一致才會發布；其餘數字與判讀全部由固定規則計算。")),

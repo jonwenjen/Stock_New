@@ -585,3 +585,19 @@ def backtest(frames: dict[str, pd.DataFrame], lookback_days: int = 750, step: in
             "top_beats_bottom": round(float((top_a > bot_a).mean()), 3),
         }
     return res
+
+
+def range_coverage(close: pd.Series, vol: pd.Series | None) -> dict[str, float | None]:
+    """Share of past days on which the close `days` later fell inside today's one-sigma range,
+    [c (1 - sigma), c (1 + sigma)] with sigma = daily vol x sqrt(days), the range the site publishes."""
+    out: dict[str, float | None] = {}
+    if vol is None:
+        return out
+    df = pd.concat([close.rename("c"), vol.rename("v")], axis=1).dropna()
+    for h, d in HORIZONS.items():
+        fut = df["c"].shift(-d)
+        sig = df["v"] * math.sqrt(d)
+        ok_ = fut.notna()
+        inside = ((fut >= df["c"] * (1 - sig)) & (fut <= df["c"] * (1 + sig)))[ok_]
+        out[h] = round(float(inside.mean()), 3) if len(inside) >= 100 else None
+    return out

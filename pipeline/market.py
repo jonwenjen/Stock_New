@@ -266,7 +266,8 @@ def risk_parts(x: dict) -> list[dict]:
     vals = {
         "trend": None if g("regime") is None else min(100.0, REGIME_RISK[g("regime")] + float(lin(g("drawdown") or 0, -0.05, -0.25)) * 0.2),
         "breadth": None if g("breadth") is None else 100.0 - g("breadth"),
-        "foreign": None if g("foreign20_ratio") is None else min(100.0, float(lin(g("foreign20_ratio"), 0.02, -0.06))
+        # -6% saturated on 9 of 24 recent 20-day windows; -10% keeps the deep ones apart (review 2026-11-15, chips-4)
+        "foreign": None if g("foreign20_ratio") is None else min(100.0, float(lin(g("foreign20_ratio"), 0.02, -0.10))
                                                                + (10.0 if (g("foreign_streak") or 0) <= -5 else 0.0)),
         "futures": None if g("fut_pct") is None else (1.0 - g("fut_pct")) * 100.0,
         "margin": None if g("maint") is None else float(lin(g("maint"), 1.70, 1.40)),

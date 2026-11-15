@@ -1505,7 +1505,9 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
             ev = {d: f for d, f in (actions.get(m.get("code") or s.split(".")[0]) or {}).items()
                   if frames[s].index[-1] - pd.Timedelta(days=365) < pd.Timestamp(d) <= frames[s].index[-1]}
             if ev:
-                er["dist12"] = round(1 / math.prod(ev.values()) - 1, 4)
+                # each payout as a share of the price before it, added up; factors below 0.78 are splits or
+                # capital reductions, not dividends (review 2026-11-15, fund F-9)
+                er["dist12"] = round(sum(1 - f for f in ev.values() if f >= 0.78), 4) or None
         etf_records.append(er)
     etf_records.sort(key=lambda r: -r["overall"])
     by_sym = {r["symbol"]: r for r in records + etf_records}
@@ -1671,6 +1673,11 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                 scoring.blend(h, {"tech": float(row["t_slow"]), "chips": chips, "fund": None, "buzz": None})), d,
                 p_up=float((c.shift(-d) / c - 1).dropna().gt(0).mean()))
                 for h, d in scoring.HORIZONS.items()}
+            # how often the same one-sigma range held over the last five years (review 2026-11-15, quant-5:
+            # the TAIEX's one-quarter range held only about half the time, not two thirds)
+            cov = scoring.range_coverage(c, tframes[s]["vol"].tail(1260) if s in tframes else None)
+            for h, v in cov.items():
+                item["horizons"][h]["cov"] = v
             item["reasons"] = [t for t, _ in scoring.tech_reasons(row)]
         indices_out.append(item)
 

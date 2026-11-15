@@ -806,15 +806,47 @@ def test_risk_history_and_bucket_stats():
 
 
 def test_evaluate_logs_only_count_matured_forecasts():
-    f = make_df(np.linspace(100, 160, 60))
-    d0, d_late = f.index[10].strftime("%Y-%m-%d"), f.index[58].strftime("%Y-%m-%d")
-    log = {d0: {"A": [f["close"].iloc[10], 0.5, 0.5, -0.5], "B": [1, 0.5, None, None]}, d_late: {"A": [1, 0.5, 0.5, 0.5]}}
-    res = market.evaluate_log(log, {"A": f}, scoring.HORIZONS)
-    assert res["1w"] == {**res["1w"], "n": 1, "snapshots": 1, "hit": 1.0} and res["1m"]["hit"] == 1.0
+    idx = pd.bdate_range("2026-11-02", periods=70)
+    frames = {f"S{i}": pd.DataFrame({"close": 100 * (1 + 0.002 * i) ** np.arange(70)}, index=idx) for i in range(12)}
+    d0 = idx[9].strftime("%Y-%m-%d")                            # 2026-11-13, the first live snapshot
+    old = idx[2].strftime("%Y-%m-%d")                           # an earlier model: skipped
+    snap = {s: [100, i / 11, i / 11, i / 11] for i, s in enumerate(frames)}   # better score, faster riser
+    res = market.evaluate_log({old: snap, d0: snap}, frames, scoring.HORIZONS)
+    assert res["1w"]["snapshots"] == 1 and res["1w"]["n"] == 12 and res["1w"]["hit"] == 1.0
+    assert res["1w"]["bull_ret"] > 0 > res["1w"]["bear_ret"]
     assert res["1q"] == {"n": 0, "snapshots": 0}  # 63 sessions have not passed
-    ilog = {d0: {"A": {"close": 1, "h": {"1w": [0.6, 0.0, 1.0], "1m": [0.4, 0.0, 1e9]}}}}
-    rows = market.evaluate_index_log(ilog, {"A": f}, scoring.HORIZONS)
-    assert [(r["h"], r["dir_ok"], r["in_range"]) for r in rows] == [("1w", True, False), ("1m", False, True)]
+    f = frames["S0"]
+    ilog = {d0: {"S0": {"close": 100, "h": {"1w": [0.6, 0.0, 1.0], "1m": [0.4, 0.0, 1e9]}}}, old: {"S0": {"h": {"1w": [0.6, 0, 1e9]}}}}
+    rows = market.evaluate_index_log(ilog, {"S0": f}, scoring.HORIZONS)
+    assert [(r["h"], r["dir_ok"], r["in_range"]) for r in rows] == [("1w", None, False), ("1m", None, True)]
+    dd = market.drawdown_odds(pd.Series("x", index=idx), pd.Series(np.r_[np.full(35, 100.0), np.full(35, 90.0)], index=idx))
+    assert dd["x"]["n_eff"] <= 4 and 0 <= dd["x"]["ci"][0] <= dd["x"]["dd"] <= dd["x"]["ci"][1] <= 1
+
+
+def test_review_1115_fixes():
+    from pipeline import build, funds, leading, prices, research
+    # VIX +65% in a day that is undone within a week is real: kept with the index threshold
+    idx = pd.bdate_range("2024-07-01", periods=30)
+    v = pd.Series(16.0, index=idx); v.iloc[10] = 26.4; v.iloc[11] = 17.0
+    df = pd.DataFrame({"open": v, "high": v, "low": v, "close": v, "volume": 0.0})
+    kept, *_ = prices.sanitize(df, market="US", spike_limit=build.SPIKE["VIX"])
+    gone, *_ = prices.sanitize(df, market="US")
+    assert idx[10] in kept.index and idx[10] not in gone.index   # the stock rule would have deleted it
+    # evidence: no carrying a value across a long gap
+    close = pd.Series(np.linspace(100, 120, 400), index=pd.bdate_range("2023-01-02", periods=400))
+    x = pd.Series(np.arange(400.0), index=close.index).drop(close.index[200:230])
+    assert research.evidence(x, close, 1)["n"] < 390
+    # max pain stays in the trimmed ladder
+    ladder = [[k, 100 - i, 100 - i] for i, k in enumerate(range(40000, 41600, 100))] + [[45000, 1, 1]]
+    assert 45000 in [r[0] for r in leading.trim_ladder(ladder, 14, keep=(45000,))]
+    # rounding like the page
+    assert build.half_up(68.5) == 69 and build.half_up(7886.5) == 7887
+    # fund: a category average that contradicts the peer rank is not used
+    recs = [{"group": "債", "span_years": 5, "ret": {"3y": 0.18, "1y": 0.06}, "cat": {"3y": 0.445}, "beat": {"3y": 75, "1y": 70},
+             "excess_ann": 0.01, "sharpe": 1.0, "mdd_3y": -0.05, "fee": 1.0}]
+    funds.rescore(recs)
+    assert recs[0]["excess_cat"] == 0.01
+    assert leading.revenue_momentum({"2025-01": 1.0, **{f"2025-{m:02d}": 1.0 for m in range(3, 13)}, "2026-01": 1.0}) is None
 
 
 def test_momentum_lists_and_alerts():

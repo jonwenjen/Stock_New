@@ -1223,18 +1223,18 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         if m["kind"] == "etf":
             names[s] = [m["code"]] + ([m["name"]] if m["market"] == "TW" and len(m["name"]) >= 4 else [])
     matchers = media.build_matchers(names)
-    feeds = CFG["podcasts"][:3] if QUICK else CFG["podcasts"]
+    pod_feeds = CFG["podcasts"][:3] if QUICK else CFG["podcasts"]  # not `feeds`: that is the module
     # The feeds carry every old episode: the first run matches the whole back catalogue into
     # history/podcast_events.json, later runs only episodes since the last one on file (review 2026-11-14d, G2/G4).
     ev_path = DATA / "history" / "podcast_events.json"
     ev_store = read_json(ev_path, {})
-    pod = media.podcasts(feeds, matchers, history_since=ev_store.get("until") or {})
+    pod = media.podcasts(pod_feeds, matchers, history_since=ev_store.get("until") or {})
     shows, mentions, perr = pod["shows"], pod["mentions"], pod["errors"]
     if shows and not QUICK:
         ev_store = merge_podcast_events(ev_store, pod, today)
         write_json(ev_path, ev_store)
     SOURCES.append({"name": "Podcast RSS", "ok": bool(shows), "url": "",
-                    "note": f"{len(shows)}/{len(feeds)} 個節目" + (f"；失敗：{'；'.join(perr)[:120]}" if perr else "")})
+                    "note": f"{len(shows)}/{len(pod_feeds)} 個節目" + (f"；失敗：{'；'.join(perr)[:120]}" if perr else "")})
     if not shows:
         shows, mentions = prev_pod.get("shows", []), prev_pod.get("mentions", {})
     tools = safe("GitHub 開源投資工具", media.github_tools, [], "https://github.com/search") or \
@@ -2155,7 +2155,7 @@ def factor_check_all(panels: dict, tframes: dict, imom: dict, frames: dict, by_m
             scores["rs_hi250"] = pd.DataFrame({s: flag(s) for s in cols})
         closes = pd.DataFrame({s: frames[s]["close"] for s in cols})
         opens = pd.DataFrame({s: frames[s]["open"] for s in cols})
-        out[mk] = research.factor_check(scores, opens, closes, ref=panels[mk])
+        out[mk] = research.factor_check(scores, opens, closes, ref=panels[mk], lookback=780)  # ~150 weekly periods
     try:
         pit = shard_get("pit_closes")
         members = read_json(DATA / "history" / "tw_universe_pit.json", {})

@@ -473,3 +473,20 @@ table.compare td { text-align: right; }
 @media (max-width: 1360px) and (min-width: 561px) { .stamp > span:nth-child(2) { display: none; } }
 .chart-wait { display: grid; place-items: center; }
 .stamp .offline { margin-right: 8px; }
+
+/* review 2026-11-14d: supporting vs counter data, grouped key data, flow table, flow grid, capsules */
+.g4 { grid-template-columns: repeat(auto-fit, minmax(min(100%, 150px), 1fr)); }
+.contra { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; margin-top: 6px; }
+.contra .why { margin-top: 4px; }
+@media (max-width: 560px) { .contra { grid-template-columns: minmax(0, 1fr); } }
+.why .why-k { font-size: 12px; color: var(--ink-3); margin-right: 6px; font-weight: 600; }
+.kv-g { font-size: 13px; color: var(--ink-2); margin: 12px 0 6px; font-weight: 600; }
+.kv-g:first-of-type { margin-top: 4px; }
+table.mini { border-collapse: collapse; font-size: 13px; margin: 2px 0 4px; }
+table.mini caption { text-align: left; padding-bottom: 4px; }
+table.mini th, table.mini td { padding: 4px 10px; border-bottom: 1px solid var(--line-soft); text-align: right; white-space: nowrap; }
+table.mini th[scope="row"] { text-align: left; font-weight: 500; color: var(--ink-2); }
+button.statbtn { font: inherit; text-align: left; background: var(--surface); cursor: pointer; border-radius: 0; color: inherit; }
+button.statbtn:hover { background: var(--accent-soft); }
+.chip.capsule { white-space: normal; text-align: left; line-height: 1.35; }
+@media (pointer: coarse) { .chip.capsule { min-height: 44px; } }

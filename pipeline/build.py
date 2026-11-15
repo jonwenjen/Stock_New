@@ -2984,7 +2984,7 @@ def etf_record(s: str, df: pd.DataFrame, tf: pd.DataFrame, m: dict, flow_map: di
         notes += cn
         rec.update({"foreign5": sum(f[-5:]) / 1000, "trust5": sum(t[-5:]) / 1000, "foreign_streak": twse.streak(f)})
     if m["industry"] in ("槓桿型", "反向型"):
-        notes.append(("槓桿／反向 ETF 每日重設有耗損，只適合短線", -0.2))
+        notes.append(("槓桿／反向 ETF 每日重設，持有越久和指數倍數的偏離越大", -0.2))
     rec.update(scoring.score_stock(tf, chips, None, scoring.buzz_score(mentions)))
     rec["reasons"] = [t for t, w in sorted(notes, key=lambda x: -x[1]) if w > 0][:4]
     rec["risks"] = [t for t, w in sorted(notes, key=lambda x: x[1]) if w < 0][:3]

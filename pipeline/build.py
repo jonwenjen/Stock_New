@@ -3123,11 +3123,11 @@ def next_wednesday(d: dt.date) -> dt.date:
     return d + dt.timedelta(days=(2 - d.weekday()) % 7 or 7)
 
 
-def half_up(x: float, nd: int = 0) -> int | float:
+def half_up(x: float, nd: int = 0, scale: int = 1) -> int | float:
     """Round half away from zero, like the page's Intl.NumberFormat (Python rounds half to even, so the
     same number read 68% here and 69% on the page; review 2026-11-15, product-2)."""
     from decimal import ROUND_HALF_UP, Decimal
-    v = Decimal(repr(float(x))).quantize(Decimal(1).scaleb(-nd), rounding=ROUND_HALF_UP)
+    v = (Decimal(repr(float(x))) * scale).quantize(Decimal(1).scaleb(-nd), rounding=ROUND_HALF_UP)
     return int(v) if nd == 0 else float(v)
 
 
@@ -3177,14 +3177,14 @@ def build_narrative(indices: list[dict], fl: dict, picks: list[dict], bull: list
             txt += (f"台指期外資淨未平倉 {fut['net_oi']:+,.0f} 口、投信 {fut.get('trust_oi') or 0:+,.0f} 口、三大法人合計 "
                     f"{fut.get('all_oi') or 0:+,.0f} 口（外資空單多為投信槓桿 ETF 多單的對手）。")
         if fl.get("breadth") is not None:
-            txt += f"觀察名單站上季線的比例 {half_up(fl['breadth'] * 100)}%。"
+            txt += f"觀察名單站上季線的比例 {half_up(fl['breadth'], scale=100)}%。"
         out.append({"title": "籌碼面", "text": txt})
 
     hz = {"1w": "未來一週", "1m": "未來一月", "1q": "未來一季"}
     for i in (tw, sp):
         if not i or "horizons" not in i:
             continue
-        parts = [f"{hz[h]}一個標準差區間 {half_up(f['low']):,}–{half_up(f['high']):,}（近 5 年同期間上漲比率 {half_up(f['p_up'] * 100)}%）"
+        parts = [f"{hz[h]}一個標準差區間 {half_up(f['low']):,}–{half_up(f['high']):,}（近 5 年同期間上漲比率 {half_up(f['p_up'], scale=100)}%）"
                  for h, f in i["horizons"].items() if f.get("p_up") is not None]
         if parts:
             out.append({"title": f"{i['name']}展望", "text": "；".join(parts)

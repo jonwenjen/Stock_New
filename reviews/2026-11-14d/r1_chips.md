@@ -1,6 +1,6 @@
 # R1 籌碼隊（chips）：外部建議審查
 
-資料日 2026-11-13（commit 1a36b98），全部本機計算：T86 個股分片（上市 60 日 08-17～11-13、上櫃 20 日）、`.cache/twse_days` 196 日（以 tw_actions 還原除權息）、`.cache/twse_margin` 22 日、tdcc.json 1 週。前瞻報酬：每週三一組、隔日開盤進場、相對同日「當時成交值前 150 名上市股」中位數。台股實有 119 檔（上櫃 29）。網路 6 次（見 C10c、C10e）。
+資料日 2026-11-13（commit 1a36b98），全部本機計算：T86 個股分片（上市 60 日 08-17～11-13、上櫃 20 日）、`.cache/twse_days` 196 日（以 tw_actions 還原除權息）、`.cache/twse_margin` 22 日、tdcc.json 1 週。前瞻報酬：每週三一組、隔日開盤進場、相對同日「當時成交值前 150 名上市股」中位數。台股實有 119 檔（上櫃 29）。網路 6 次（文末查證紀錄）。
 
 ## 1. 判定總表
 
@@ -87,7 +87,7 @@ UA＝StockNewBot/1.0，單次不重試：
 1. bsr.twse.com.tw：回「因為安全性考量，您所執行的頁面無法呈現」。
 2. 櫃買 brokerBS.php（302）→ brokerBS.html（200）：載入 Cloudflare Turnstile 驗證。
 3. 證交所 OpenAPI 143 個路徑（上一輪下載）：只有券商、分公司名錄與月計表。
-4. 櫃買 OpenAPI `tpex_active_broker_volume`（200）：30 檔熱門股 × 前 10 名券商，**總公司層級**（元大、凱基…），無日期參數，週建置只看到 1/5 天。
+4. 櫃買 OpenAPI `tpex_active_broker_volume`（200）：30 檔熱門股 × 前 10 名券商，**總公司層級**（元大、凱基…），無日期參數，週建置只看到 1/5 天；其餘 tpex_daily_broker1／2 是各券商全市場成交金額，不分個股。
 5. FinMind 分點：400「Your level is free. Please update your user level」（付費）。
 
 ### C10f 籌碼階段（修改後採納：只做描述四格）
@@ -105,7 +105,7 @@ UA＝StockNewBot/1.0，單次不重試：
 ## 3. 實作規格
 
 ### C10c
-- **存檔**：twse.inst_stocks 回傳（外資、投信、自營自行、自營避險）；tpex.parse_inst 加 v[16]、v[19]（檢查相加＝v[22]）。三個存檔函式存四個數（張），任一非 0 就存；舊兩元素列讀成 None。每週重抓上次建置最後 1 日 T86（+1 請求）。
+- **存檔**：twse.inst_stocks 回傳（外資、投信、自營自行、自營避險）；tpex.parse_inst 加 v[16]、v[19]（檢查相加＝v[22]）。build.stock_flows、otc_stock_flows、backfill_history 存四個數（張），任一非 0 就存；舊兩元素列讀成 None。每週重抓上次建置最後 1 日 T86（+1 請求）。
 - **紀錄**：foreign10、trust10、trust20、dealer5／10／20（自行買賣，張；不足 20 日為 None）。權重 0。
 - **畫面**：抽屜「外資 5 日」「投信 5 日」換成小表「法人買賣超（張，正數為買超）」，列＝外資／投信／自營商（自行買賣），欄＝5／10／20 日；表下「自營商避險部位多為權證避險，不列入。」
 - **測試** `test_flow_windows`：5／10／20 日加總；舊列得 None；缺「(自行買賣)」欄時丟錯。

@@ -44,20 +44,23 @@ def day_quotes(date: str) -> dict[str, tuple]:
     return parse_day_quotes(_table("afterTrading/otc", date, type="EW"))
 
 
-def parse_inst(table: dict) -> dict[str, tuple[float, float, float]]:
-    """Institutional trades table -> {code: (foreign net, trust net, dealer net)} in shares.
+def parse_inst(table: dict) -> dict[str, tuple[float, ...]]:
+    """Institutional trades table -> {code: (foreign net, trust net, dealer net, dealer own account,
+    dealer hedging)} in shares.
 
     The header repeats 買進/賣出/買賣超 for each group, so columns are taken by position and
-    checked: foreign (excl. dealers) + foreign dealers must equal the foreign total, and the
-    three groups must add up to the grand total."""
+    checked: foreign (excl. dealers) + foreign dealers must equal the foreign total, the dealers'
+    own-account and hedging legs must add up to the dealer total, and the three groups must add up
+    to the grand total."""
     out = {}
     for r in table["data"]:
         if len(r) < 24:
             continue
         v = [num(x) or 0.0 for x in r]
-        if abs(v[4] + v[7] - v[10]) > 1 or abs(v[10] + v[13] + v[22] - v[23]) > 1:
+        if (abs(v[4] + v[7] - v[10]) > 1 or abs(v[10] + v[13] + v[22] - v[23]) > 1
+                or abs(v[16] + v[19] - v[22]) > 1):
             raise ValueError("TPEx institutional table layout changed")
-        out[r[0].strip()] = (v[10], v[13], v[22])
+        out[r[0].strip()] = (v[10], v[13], v[22], v[16], v[19])
     return out
 
 
@@ -67,6 +70,13 @@ def inst_stocks(date: str) -> dict[str, tuple[float, float, float]]:
 
 def _api(path: str) -> list[dict]:
     return http.get_json(f"{OPENAPI}/{path}", timeout=90)
+
+
+def margins() -> dict[str, dict]:
+    """OTC companies' gross / operating / net margins (same layout as TWSE's t187ap17_L; review
+    2026-11-14d, C10a - one request)."""
+    from .twse import parse_margins
+    return parse_margins(_api("mopsfin_187ap17_O"))
 
 
 def valuation() -> dict[str, dict]:
@@ -80,6 +90,7 @@ def monthly_revenue() -> dict[str, dict]:
         ym = str(r.get("資料年月", ""))
         out[r["公司代號"].strip()] = {
             "industry": (r.get("產業別") or "").strip() or "其他",
+            "name": (r.get("公司名稱") or "").strip(),
             "month": f"{int(ym[:-2]) + 1911}-{ym[-2:]}" if len(ym) >= 4 else None,
             "revenue": num(r.get("營業收入-當月營收")),
             "rev_mom": num(r.get("營業收入-上月比較增減(%)")), "rev_yoy": num(r.get("營業收入-去年同月增減(%)")),

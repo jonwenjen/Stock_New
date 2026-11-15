@@ -115,15 +115,16 @@ def tech_reasons(row: pd.Series) -> list[tuple[str, float]]:
             notes.append(("股價跌破季線", -0.25))
     rsi = _num(row.get("rsi"))
     if rsi is not None:
+        # facts, not calls (review 2026-11-14d, H): the thresholds are stated, the reading is the reader's
         if rsi >= 80:
-            notes.append((f"RSI {rsi:.0f} 嚴重超買，短線追高風險大", -0.3))
+            notes.append((f"RSI {rsi:.0f}（≥ 80）", -0.3))
         elif rsi >= 70:
-            notes.append((f"RSI {rsi:.0f} 進入超買區", -0.1))
+            notes.append((f"RSI {rsi:.0f}（≥ 70）", -0.1))
         elif rsi <= 30:
-            notes.append((f"RSI {rsi:.0f} 超賣，留意反彈", 0.2))
+            notes.append((f"RSI {rsi:.0f}（≤ 30）", 0.2))
     h = _num(row.get("macd_hist"))
     if h is not None:
-        notes.append(("MACD 柱狀體為正，動能偏多", 0.2) if h > 0 else ("MACD 柱狀體為負，動能偏空", -0.2))
+        notes.append(("MACD 柱狀體為正", 0.2) if h > 0 else ("MACD 柱狀體為負", -0.2))
     r20, r60 = _num(row.get("r20")), _num(row.get("r60"))
     if r60 is not None and abs(r60) >= 0.15:
         notes.append((f"近一季漲跌 {r60:+.0%}", 0.3 if r60 > 0 else -0.3))
@@ -162,13 +163,13 @@ def chips_tw(m: dict) -> tuple[float | None, list[tuple[str, float]]]:
     if mc is not None:
         if mc >= 0.05 and r5 < -0.02:
             s -= 0.15
-            notes.append((f"融資增 {mc:+.1%} 但股價下跌，散戶接刀籌碼凌亂", -0.15))
+            notes.append((f"融資 5 日 {mc:+.1%}、股價 5 日 {r5:+.1%}", -0.15))
         elif mc <= -0.03 and r5 > 0.01:
             s += 0.10
-            notes.append((f"融資減 {mc:+.1%} 而股價上漲，籌碼沉澱", 0.10))
+            notes.append((f"融資 5 日 {mc:+.1%}、股價 5 日 {r5:+.1%}", 0.10))
         elif mc >= 0.10:
             s -= 0.05
-            notes.append((f"融資一週暴增 {mc:+.1%}，短線過熱", -0.05))
+            notes.append((f"融資 5 日 {mc:+.1%}（≥ 10%）", -0.05))
     return clamp(s), notes
 
 
@@ -364,16 +365,17 @@ def setup_tag(tactical: float | None, structural: float | None, tactical_prev: f
     """Name the combination of the slow (structural) and fast (tactical) reads."""
     if tactical is None or structural is None:
         return None
+    # Names the combination without a direction call (review 2026-11-14d, H).
     if structural >= 0.2 and tactical >= 0.15:
         if tactical_prev is not None and tactical_prev < 0.15:
-            return "基本面佳，籌碼剛轉強"
-        return "基本面與籌碼同步偏多"
+            return "基本面分數為正，籌碼分數本週轉正"
+        return "基本面與籌碼分數同為正"
     if structural >= 0.2 and tactical <= -0.15:
-        return "基本面佳但籌碼偏弱"
+        return "基本面分數為正、籌碼分數為負"
     if structural <= -0.2 and tactical >= 0.15:
-        return "籌碼強但基本面弱"
+        return "籌碼分數為正、基本面分數為負"
     if structural <= -0.2 and tactical <= -0.15:
-        return "基本面與籌碼同步偏空"
+        return "基本面與籌碼分數同為負"
     return None
 
 
@@ -426,34 +428,23 @@ MAX_POSITION = 0.25  # never suggest more than a quarter of the portfolio in one
 
 
 def trade_plan(row: pd.Series, f1m: dict, overall: float) -> dict:
-    """Reference levels (not orders): support, stop, target + a one-line stance.
+    """Reference levels (not orders): support, stop and the +1 sigma edge of the one-month range.
 
-    Distances are measured in ATR (14-day average true range), so a volatile stock
-    gets a wider stop and therefore a smaller suggested position than a steady one.
-    """
+    Distances are measured in ATR (14-day average true range), so a volatile stock gets a wider stop
+    and therefore a smaller position cap than a steady one. The reward-to-risk ratio and the one-line
+    stance were removed (review 2026-11-14d, C10h): the model forecasts no return, so the ratio was only
+    volatility over the stop distance, and the stance read as an instruction. `target` keeps its key
+    for the chart line; the site calls it the +1 sigma edge, not a target."""
     c, atr = float(row["close"]), _num(row.get("atr")) or float(row["close"]) * 0.03
-    ma20, ma60, rsi = _num(row.get("ma20")), _num(row.get("ma60")), _num(row.get("rsi")) or 50
+    ma20, ma60 = _num(row.get("ma20")), _num(row.get("ma60"))
     support = ma20 if ma20 and ma20 < c else (ma60 if ma60 and ma60 < c else c - 1.5 * atr)
     stop = min(c - 2.5 * atr, support - 0.5 * atr)
     target = max(f1m["high"], c + 2 * atr)
-    if overall >= 0.45:
-        stance = "強勢股，偏多操作" + ("；RSI 過熱，等拉回月線附近再分批布局" if rsi >= 72 else "；可沿月線分批布局")
-    elif overall >= 0.15:
-        stance = "偏多看待，拉回支撐不破可分批承接" + ("；短線過熱勿追高" if rsi >= 72 else "")
-    elif overall > -0.15:
-        stance = "多空拉鋸，觀望為主，等待方向表態"
-    elif overall > -0.45:
-        stance = "偏空看待，反彈減碼、不宜攤平"
-    else:
-        stance = "弱勢股，避開或嚴設停損"
     stop = max(stop, 0.01)
-    # reward to the one-month target for each unit of risk down to the stop
-    rr = (target - c) / (c - stop) if c > stop else None
     stop_pct = (c - stop) / c if c > stop else None
     # position that loses RISK_BUDGET of the portfolio if the stop is hit
     size = min(MAX_POSITION, RISK_BUDGET / stop_pct) if stop_pct else None
     return {"support": round(support, 2), "stop": round(stop, 2), "target": round(target, 2),
-            "rr": None if rr is None else round(rr, 2), "stance": stance,
             "atr": round(atr, 2), "atr_pct": round(atr / c, 4),
             "zone_high": round(min(c, support + atr), 2),
             "stop_pct": None if stop_pct is None else round(stop_pct, 4),
@@ -463,6 +454,32 @@ def trade_plan(row: pd.Series, f1m: dict, overall: float) -> dict:
 # --------------------------------------------------------------------------- #
 # Cross-sectional ranks: the technical score as published (Taiwan adds the 52-week high)
 # --------------------------------------------------------------------------- #
+def relative_strength(close: pd.Series, bench: pd.Series, ns: tuple = (20, 60, 120)) -> dict[str, float | None]:
+    """Return over n sessions minus the benchmark's over the same sessions (review 2026-11-14d, C1).
+
+    Every stock subtracts the same benchmark return on a given day, so ranking by this is ranking by
+    the plain return - it is already inside the technical score and is shown, never scored."""
+    df = pd.concat([close.rename("c"), bench.rename("b")], axis=1, sort=True)
+    df["b"] = df["b"].ffill()
+    df = df.dropna()
+    out: dict[str, float | None] = {}
+    for n in ns:
+        out[f"rs{n}"] = (float(df["c"].iloc[-1] / df["c"].iloc[-1 - n] - df["b"].iloc[-1] / df["b"].iloc[-1 - n])
+                         if len(df) > n else None)
+    return out
+
+
+def rs_high(close: pd.Series, bench: pd.Series, n: int = 250) -> bool | None:
+    """Is the price / benchmark ratio at its highest of the last n sessions? None with less history.
+    Archived for the pre-registered test `rs_high`; not shown as a tag."""
+    df = pd.concat([close.rename("c"), bench.rename("b")], axis=1, sort=True)
+    df["b"] = df["b"].ffill()
+    ratio = (df["c"] / df["b"]).dropna()
+    if len(ratio) < n:
+        return None
+    return bool(ratio.iloc[-1] >= ratio.tail(n).max())
+
+
 def pct_rank(s: pd.Series) -> pd.Series:
     """Percentile within the cross-section, 0 (worst) .. 1 (best)."""
     return s.rank(pct=True, method="average")

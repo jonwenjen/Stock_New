@@ -2,7 +2,9 @@
   "picks": {
     "tw": 12,
     "us": 8,
-    "max_per_industry": 3
+    "max_per_industry": 3,
+    "keep_tw": 30,
+    "keep_us": 20
   },
   "tw_universe_size": 90,
   "otc_universe_size": 30,
@@ -461,16 +463,19 @@
   "podcasts": [
     {
       "name": "Gooaye 股癌",
+      "notes": "title",
       "lang": "zh",
       "feed": "https://feeds.soundon.fm/podcasts/954689a5-3096-43a4-a80b-7810b219cef3.xml"
     },
     {
       "name": "財報狗",
+      "notes": "chapters",
       "lang": "zh",
       "feed": "https://feed.firstory.me/rss/user/clcftm46z000201z45w1c47fi"
     },
     {
       "name": "M觀點",
+      "notes": "chapters",
       "lang": "zh",
       "feed": "https://feeds.soundon.fm/podcasts/b8f5a471-f4f7-4763-9678-65887beda63a.xml"
     },
@@ -481,11 +486,13 @@
     },
     {
       "name": "兆華與股惑仔",
+      "notes": "title",
       "lang": "zh",
       "feed": "https://feeds.soundon.fm/podcasts/91be014b-9f55-4bf3-a910-b232eda82d11.xml"
     },
     {
       "name": "美股投資學-財女珍妮",
+      "notes": "title",
       "lang": "zh",
       "feed": "https://feeds.soundon.fm/podcasts/4a8660a0-e0d0-490b-8d46-c28219606f47.xml"
     },
@@ -496,6 +503,7 @@
     },
     {
       "name": "All-In Podcast",
+      "notes": "chapters",
       "lang": "en",
       "feed": "https://rss.libsyn.com/shows/254861/destinations/1928300.xml"
     },

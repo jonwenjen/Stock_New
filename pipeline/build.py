@@ -9,6 +9,7 @@ and the outcome of each source is published in summary.json -> sources.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -78,17 +79,18 @@ def write_json(path: Path, obj) -> None:
     path.write_text(json.dumps(_clean(obj), ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 
 
-def shard_put(folder: str, rows: dict[str, dict]) -> None:
+def shard_put(folder: str, rows: dict[str, dict], replace: tuple | list | set = ()) -> None:
     """Add days to monthly archive shards, history/<folder>/YYYY-MM.json = {"codes": [...], "rows":
-    {date: [value per code]}}. Days already archived are left alone and only shards that gain a day
-    are rewritten, so the weekly commit stays small however long the archive grows."""
+    {date: [value per code]}}. Days already archived are left alone (unless listed in `replace`, for a
+    source that corrects itself after publication) and only shards that gain or change a day are
+    rewritten, so the weekly commit stays small however long the archive grows."""
     by_month: dict[str, dict] = {}
     for d, row in rows.items():
         by_month.setdefault(d[:7], {})[d] = row
     for month, days in by_month.items():
         path = DATA / "history" / folder / f"{month}.json"
         sh = read_json(path, {"codes": [], "rows": {}})
-        new = sorted(d for d in days if d not in sh["rows"])
+        new = sorted(d for d in days if d not in sh["rows"] or d in replace)
         if not new:
             continue
         pos = {c: i for i, c in enumerate(sh["codes"])}
@@ -287,27 +289,52 @@ def update_maintenance(flows: list[dict]) -> tuple[str | None, dict, dict, dict,
             cost_store.get("stocks", {}))
 
 
-def stock_flows(trading_days: list[str]) -> tuple[list[str], dict[str, list[tuple]]]:
-    """Per-stock net shares (foreign, trust) for the latest N trading days.
+def flow_lots(v: tuple) -> list[int]:
+    """Parser tuple in shares -> archived row in lots: [foreign, trust], plus [dealer own account,
+    dealer hedging] when the source splits the dealers (T86 and TPEx do)."""
+    out = [round(v[0] / 1000), round(v[1] / 1000)]
+    if len(v) >= 5:
+        out += [round(v[3] / 1000), round(v[4] / 1000)]
+    return out
 
-    Kept in history/tw_stock_flows.json (in lots) so a weekly run only asks TWSE
-    for the ~5 new days. Returns (dates, {code: [(foreign, trust), ...]}) in shares.
+
+def flow_shares(row: list | None, dealer_known: bool) -> tuple:
+    """Archived row in lots -> (foreign, trust, dealer own account) in shares. The dealer leg is None
+    on days archived before it was kept (review 2026-11-14d, C10c)."""
+    row = row or [0, 0]
+    dealer = row[2] * 1000 if len(row) > 2 else (0 if dealer_known else None)
+    return row[0] * 1000, row[1] * 1000, dealer
+
+
+def _flow_series(store: dict[str, dict], dates: list[str]) -> dict[str, list[tuple]]:
+    known = {d: any(len(x) > 2 for x in store[d].values()) for d in dates}
+    codes = set().union(*(set(store[d]) for d in dates))
+    return {c: [flow_shares(store[d].get(c), known[d]) for d in dates] for c in codes}
+
+
+def stock_flows(trading_days: list[str]) -> tuple[list[str], dict[str, list[tuple]]]:
+    """Per-stock net shares (foreign, trust, dealer own account) for the latest N trading days.
+
+    Kept in history/tw_stock_flows.json (in lots) so a weekly run only asks TWSE for the ~5 new
+    days. T86 is sometimes corrected after publication (6 of 1,066 stocks on 2026-11-13, all in the
+    trust column), so the newest day already on file is fetched once more and replaced (+1 request).
+    Returns (dates, {code: [(foreign, trust, dealer), ...]}) in shares.
     """
     path = DATA / "history" / "tw_stock_flows.json"
     store: dict[str, dict] = read_json(path, {})
     n = 5 if QUICK else CFG["stock_flow_days"]
     need = [d for d in trading_days[-n:] if d not in store]
-    for d, table in twse.fetch_days(need, twse.inst_stocks, "T86", log).items():
-        store[d] = {c: [round(v[0] / 1000), round(v[1] / 1000)] for c, v in table.items()
-                    if twse.tracked(c) and (v[0] or v[1])}
-    shard_put("stock_flows_tw", store)  # kept for good: validating the chips weight needs a long history
+    redo = [] if QUICK else [d for d in sorted(store)[-1:] if d in trading_days[-n:]]
+    for d, table in twse.fetch_days(need + redo, twse.inst_stocks, "T86", log).items():
+        store[d] = {c: flow_lots(v) for c, v in table.items() if twse.tracked(c) and any(v)}
+    # kept for good: validating the chips weight needs a long history
+    shard_put("stock_flows_tw", store, replace=redo)
     store = {d: store[d] for d in sorted(store)[-(n + 10):]}
     if not store:
         raise RuntimeError("no per-stock institutional data")
     write_json(path, store)
     dates = sorted(store)[-n:]
-    codes = set().union(*(set(store[d]) for d in dates))
-    return dates, {c: [tuple(x * 1000 for x in store[d].get(c, (0, 0))) for d in dates] for c in codes}
+    return dates, _flow_series(store, dates)
 
 
 # --------------------------------------------------------------------------- #
@@ -501,18 +528,23 @@ def update_form4(tickers: list[str], ciks: dict, today: dt.date) -> dict:
 def update_tdcc(codes: set[str]) -> dict[str, dict]:
     """Weekly TDCC shareholder distribution, archived in history/tdcc.json (the source only
     ever offers the latest week, so history exists only from the first week it was saved).
+    Every common stock's 400+ lot share, <= 50 lot share and holder count also go to the monthly
+    shards history/tdcc_all/ (review 2026-11-14d, C3: the divergence test needs the whole market).
     Returns {code: {"big1000", "big400", "holders", "chg1000", "chg_holders", "date"}}."""
     path = DATA / "history" / "tdcc.json"
     hist = read_json(path, {})
-    date, now = leading.tdcc_distribution(codes)
-    if not date or not now:
+    date, every = leading.tdcc_distribution(None)
+    if not date or not every:
         raise RuntimeError("empty TDCC table")
+    shard_put("tdcc_all", {date: {c: [v[1], v[3], v[2]] for c, v in every.items() if twse.COMMON_STOCK.match(c)}})
+    now = {c: v for c, v in every.items() if c in codes}
     hist[date] = now
     hist = {d: hist[d] for d in sorted(hist)[-60:]}
     write_json(path, hist)
     prev = hist[sorted(hist)[-2]] if len(hist) >= 2 else {}
     out = {}
-    for code, (b1000, b400, holders) in now.items():
+    for code, v in now.items():
+        b1000, b400, holders = v[0], v[1], v[2]
         p = prev.get(code)
         out[code] = {"big1000": b1000, "big400": b400, "holders": holders, "date": date,
                      "chg1000": round(b1000 - p[0], 2) if p else None,
@@ -651,16 +683,14 @@ def otc_stock_flows(trading_days: list[str]) -> tuple[list[str], dict[str, list[
     n = 5 if QUICK else CFG["stock_flow_days"]
     need = [d for d in trading_days[-n:] if d not in store]
     for d, table in tpex_days(need, tpex.inst_stocks, "OTC institutional").items():
-        store[d] = {c: [round(v[0] / 1000), round(v[1] / 1000)] for c, v in table.items()
-                    if tpex.COMMON_STOCK.match(c) and (v[0] or v[1])}
+        store[d] = {c: flow_lots(v) for c, v in table.items() if tpex.COMMON_STOCK.match(c) and any(v)}
     shard_put("stock_flows_otc", store)
     store = {d: store[d] for d in sorted(store)[-(n + 10):]}
     write_json(path, store)
     dates = sorted(store)[-n:]
     if not dates:
         raise RuntimeError("no OTC institutional data")
-    codes = set().union(*(set(store[d]) for d in dates))
-    return dates, {c: [tuple(x * 1000 for x in store[d].get(c, (0, 0))) for d in dates] for c in codes}
+    return dates, _flow_series(store, dates)
 
 
 def update_tw_actions(today: dt.date, backfill: int = 0, current: bool = True) -> dict[str, dict[str, float]]:
@@ -786,9 +816,12 @@ def update_tw_prices(trading_days: list[str], universe: list[str], actions: dict
     # The closes of every listed common stock go to monthly shards (history/pit_closes), so a later
     # back-test can follow stocks that have since left the universe - no extra requests.
     cached = {f.stem: f for f in DAY_CACHE.glob("*.json")} if DAY_CACHE.exists() else {}
+    # Daily volume of every listed common stock (lots) goes with them (review 2026-11-14d, C10b: a
+    # volume-anomaly test needs point-in-time volume; same tables, no extra requests).
     have_closes, new_closes = shard_days("pit_closes"), {}
+    have_vol, new_vol = shard_days("pit_volume"), {}
     for d in sorted(set(tables) | set(cached)):
-        if d in pit and d in have_closes:
+        if d in pit and d in have_closes and d in have_vol:
             continue
         table = tables.get(d) or read_json(cached[d], {})
         if not table:
@@ -799,8 +832,11 @@ def update_tw_prices(trading_days: list[str], universe: list[str], actions: dict
             pit[d] = [c for c, _ in vals[:150]]
         if d not in have_closes:
             new_closes[d] = {c: round(bar[3], 2) for c, bar in table.items() if twse.COMMON_STOCK.match(c) and bar[3]}
+        if d not in have_vol:
+            new_vol[d] = {c: round(bar[4] / 1000) for c, bar in table.items() if twse.COMMON_STOCK.match(c) and bar[4]}
     write_json(pit_path, {d: pit[d] for d in sorted(pit)[-1300:]})
     shard_put("pit_closes", new_closes)
+    shard_put("pit_volume", new_vol)
     day_rows: dict[str, list] = {}
     for d, table in sorted(tables.items()):
         for code, bar in table.items():
@@ -915,6 +951,8 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     insiders = safe("證交所 董監持股", lambda: retry(twse.insiders), {}, tw_api)
     daytrade = safe("證交所 個股當日沖銷", lambda: twse.day_trading(trading_days[-1]), {}, "https://www.twse.com.tw")
     margins = safe("證交所 營益分析（毛利率、營益率）", lambda: retry(twse.margins), {}, tw_api)
+    # OTC companies file the same table at TPEx (review 2026-11-14d, C10a; +1 request)
+    margins.update(safe("櫃買中心 營益分析（毛利率、營益率）", tpex.margins, {}, "https://www.tpex.org.tw") or {})
     if margins:  # archived per period: quarter-on-quarter trends become possible from the next filing
         mpath = DATA / "history" / "tw_margins.json"
         mh = read_json(mpath, {})
@@ -1186,7 +1224,15 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
             names[s] = [m["code"]] + ([m["name"]] if m["market"] == "TW" and len(m["name"]) >= 4 else [])
     matchers = media.build_matchers(names)
     feeds = CFG["podcasts"][:3] if QUICK else CFG["podcasts"]
-    shows, mentions, perr = media.podcasts(feeds, matchers)
+    # The feeds carry every old episode: the first run matches the whole back catalogue into
+    # history/podcast_events.json, later runs only episodes since the last one on file (review 2026-11-14d, G2/G4).
+    ev_path = DATA / "history" / "podcast_events.json"
+    ev_store = read_json(ev_path, {})
+    pod = media.podcasts(feeds, matchers, history_since=ev_store.get("until") or {})
+    shows, mentions, perr = pod["shows"], pod["mentions"], pod["errors"]
+    if shows and not QUICK:
+        ev_store = merge_podcast_events(ev_store, pod, today)
+        write_json(ev_path, ev_store)
     SOURCES.append({"name": "Podcast RSS", "ok": bool(shows), "url": "",
                     "note": f"{len(shows)}/{len(feeds)} 個節目" + (f"；失敗：{'；'.join(perr)[:120]}" if perr else "")})
     if not shows:
@@ -1220,6 +1266,13 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     tactical_hist = read_json(DATA / "history" / "tactical.json", {})
     earlier = [k for k in sorted(tactical_hist) if k < week_key]
     tactical_prev = tactical_hist[earlier[-1]] if earlier else {}
+    # Same-industry P/E of every listed and OTC company: the stand-in for a company's own five-year band
+    # until 24 months are on file (review 2026-11-14d, G8).
+    peer_pe: dict[str, list[float]] = {}
+    for c, v in valuation.items():
+        ind = (revenue.get(c) or {}).get("industry")
+        if ind and (v.get("pe") or 0) > 0 and twse.COMMON_STOCK.match(c):
+            peer_pe.setdefault(ind, []).append(v["pe"])
     records = []
     for s in stocks:
         df, tf, m = frames[s], tframes[s], meta[s]
@@ -1235,6 +1288,10 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         if im is not None and len(im) and im.index[-1] >= df.index[-1] - pd.Timedelta(days=7):
             rec["imom"] = float(im.iloc[-1])
         rec["hi52"] = None if pd.isna(row.get("hi52")) else float(row["hi52"])
+        rb = frames.get("0050.TW" if m["market"] == "TW" else "SPY")  # dividends included on both sides
+        if rb is not None:  # shown only; its rank equals the return's rank (review 2026-11-14d, C1)
+            rec["rs"] = scoring.relative_strength(df["close"], rb["close"])
+            rec["rs_hi250"] = scoring.rs_high(df["close"], rb["close"])
         if m["market"] == "TW" and code in tdcc:
             rec["tdcc"] = tdcc[code]
         if m["market"] == "TW" and code in qfii:
@@ -1253,6 +1310,8 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                 rec.update({"foreign5": sum(f[-5:]) / 1000, "foreign20": sum(f) / 1000,
                             "trust5": sum(t[-5:]) / 1000, "foreign_streak": chips_in["streak"],
                             "foreign5_value": sum(f[-5:]) * last / 1e8})
+                rec.update(leading.flow_windows(fl))  # 10/20-day and dealer (own account) windows, weight 0
+                rec["grid"] = leading.flow_grid(rec.get("r20"), (sum(f) + sum(t)) if len(fl) >= 20 else None)
             mg, mg0 = margin_now.get(code, {}).get("margin"), margin_ref.get(code, {}).get("margin")
             if mg is not None:
                 rec["margin"] = mg
@@ -1269,7 +1328,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
             if me and mg and mg * last * 1000 >= 1e8:
                 rec.update({"margin_cost": cost, "maint_est": me})
                 if me < 1.40:
-                    cn.append((f"估算融資維持率 {me:.0%}，接近 130% 追繳線，留意斷頭賣壓", -0.12))
+                    cn.append((f"估算融資維持率 {me:.0%}（追繳線 130%）", -0.12))
             vol = (quotes.get(code) or {}).get("volume")
             if daytrade.get(code) is not None and vol:
                 rec["daytrade"] = round(min(1.0, daytrade[code] / vol), 3)
@@ -1279,7 +1338,8 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                 fund_in.update({"rev_ratio": rm["ratio"], "rev_cross_up": rm["cross_up"],
                                 "rev_cross_down": rm["cross_down"]})
                 rec.update({"rev_ratio": rm["ratio"], "rev_cross": "up" if rm["cross_up"] else
-                            "down" if rm["cross_down"] else None, "rev_rising": rm["rising"]})
+                            "down" if rm["cross_down"] else None, "rev_rising": rm["rising"],
+                            "rev_yoy3": rm.get("yoy3"), "rev_hi12": rm.get("hi12")})  # shown only (C2)
             fund, fn = scoring.fund_tw(fund_in)
             # Financials report insurance contract liabilities under the same heading: a different thing.
             lg = None if "金融" in m["industry"] or "保險" in m["industry"] else leading.liability_growth(liab.get(code, {}))
@@ -1294,11 +1354,18 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                                                     "rev_cum_yoy", "eps", "eps_period", "month")})
             # The quarterly table gives this year's cumulative EPS; price / P/E is the trailing four quarters.
             rec["eps_ttm"] = round(last / fund_in["pe"], 2) if (fund_in.get("pe") or 0) > 0 else None
+            # ROE over four quarters = (P/B) / (P/E) = trailing EPS / book value per share (review 2026-11-14d,
+            # C10a: Spearman 0.982 with the third-quarter statements on 71 companies). Shown only.
+            if (fund_in.get("pe") or 0) > 0 and (fund_in.get("pb") or 0) > 0:
+                rec["roe"] = round(fund_in["pb"] / fund_in["pe"], 4)
             if fund_in.get("yield") and (fund_in.get("pe") or 0) > 0:  # dividends / trailing earnings
                 rec["payout"] = round(fund_in["yield"] * fund_in["pe"] / 100, 3)
             vb = research.valuation_band(val_hist.get(code, {}), fund_in.get("pe"), fund_in.get("pb"))
             if vb:
                 rec.update(vb)
+            peers = peer_pe.get((revenue.get(code) or {}).get("industry") or "", [])
+            if (fund_in.get("pe") or 0) > 0 and len(peers) >= 5:
+                rec["pe_peer"] = [round(sum(x < fund_in["pe"] for x in peers) / len(peers), 3), len(peers)]
             mg = margins.get(code)
             if mg:
                 rec.update({"gm": mg["gm"], "om": mg["om"], "nm": mg["nm"], "margin_period": mg["period"]})
@@ -1324,7 +1391,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         buzz = scoring.buzz_score(rec["mentions"])
         # Attention is not a reason to buy; heavy attention on an already stretched stock is a caution.
         if rec["mentions"] >= 3 and ((rec["rsi"] or 0) >= 70 or (rec.get("margin_chg5") or 0) >= 0.05):
-            notes.append((f"近兩週 {rec['mentions']} 集 Podcast 熱議且股價或融資過熱，留意追高風險", -0.08))
+            notes.append((f"近兩週 {rec['mentions']} 集 Podcast 提及，且 RSI ≥ 70 或融資一週增 5% 以上", -0.08))
         sc = scoring.score_stock(tf, chips, fund, buzz, slow_chips=m["market"] == "US", tech=tech_today.get(s))
         rec.update(sc)
         rec["setup"] = scoring.setup_tag(sc["tactical"], sc["structural"], tactical_prev.get(s))
@@ -1398,7 +1465,8 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                 out.append(r)
         return out
 
-    picks = pick("TW", CFG["picks"]["tw"], 30) + pick("US", CFG["picks"]["us"], 20)
+    picks = (pick("TW", CFG["picks"]["tw"], CFG["picks"]["keep_tw"])
+             + pick("US", CFG["picks"]["us"], CFG["picks"]["keep_us"]))
     picks.sort(key=lambda r: (r["market"] != "TW", r["rank"][0]))  # scores of the two markets are not comparable
     pick_syms = {r["symbol"] for r in picks}
     bullish = sorted(records, key=lambda r: -r["overall"])[:12]
@@ -1438,15 +1506,6 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     mention_hist[week_key] = dict(mentions)
     mention_hist = {k: mention_hist[k] for k in sorted(mention_hist)[-26:]}
     write_json(DATA / "history" / "podcast_mentions.json", mention_hist)
-    past_weeks = [mention_hist[k] for k in sorted(mention_hist) if k < week_key][::-1]
-
-    def talk_weeks(sym: str) -> int:
-        n = 1
-        for wk in past_weeks:
-            if sym not in wk:
-                break
-            n += 1
-        return n
 
     hot = []
     for s, n in sorted(mentions.items(), key=lambda kv: -kv[1]):
@@ -1454,13 +1513,14 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         if not r:
             continue
         eps = [{"show": sh["name"], "title": e["title"], "date": e["date"], "link": e["link"],
-                "summary": e.get("summary", "")}
+                "summary": e.get("summary", ""), "where": (e.get("where") or {}).get(s)}
                for sh in shows for e in sh["episodes"] if s in e.get("mentions", [])]
+        tl = mention_timeline(ev_store, s, today)
         hot.append({**{k: r.get(k) for k in ("symbol", "code", "name", "market", "industry", "close", "chg5d",
-                                             "r20", "rsi", "overall", "label", "horizons", "reasons", "risks")},
-                    "kind": r.get("kind", "stock"), "mentions": n, "episodes": eps[:6], "view": hot_view(r, n),
-                    "weeks": talk_weeks(s),
-                    "signal": leading.attention_signal(n, talk_weeks(s), r.get("f5_adv"), r.get("margin_chg5"))
+                                             "r20", "rsi", "overall", "rank", "reasons", "risks", "foreign5")},
+                    "kind": r.get("kind", "stock"), "mentions": n, "episodes": eps[:6], "facts": hot_facts(r),
+                    "weeks": tl["streak"], "prior12": tl["prior12"], "first12": tl["first12"],
+                    "signal": leading.attention_signal(n, tl["streak"], r.get("f5_adv"), r.get("margin_chg5"))
                     if r["market"] == "TW" else None})
 
     # ---- 8c. mutual funds: provider figures + our own evaluation --------------
@@ -1515,6 +1575,10 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                               for r in picks]})
     cohorts = cohorts[-60:]
     write_json(DATA / "history" / "picks.json", cohorts)
+    for r in picks:  # facts instead of an "entry price" (review 2026-11-14d, C10g)
+        ei = leading.entry_info(cohorts, r["symbol"])
+        if ei and ei.get("close"):
+            r["entry"] = {"date": ei["date"], "close": ei["close"], "chg": round(r["close"] / ei["close"] - 1, 4)}
     track = leading.cohort_results(cohorts[:-1], frames, {"TW": "TWII", "US": "SPX"})
     # following the lists by rules fixed in advance: next-day open to next-day open, net of costs
     follow = safe("精選名單的實際追蹤（事先寫定的規則）", lambda: leading.follow_track(
@@ -1604,18 +1668,39 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         frames, tframes, stocks, meta, flows, lead, tw_flow, records, tactical_prev, indices_out,
         trading_days[-1], today), None) or read_json(DATA / "market.json", {})
     narrative = build_narrative(indices_out, tw_flow, picks, bullish, bearish, (mkt or {}).get("risk"))
-    weekly = safe("每週快照與本週變化", lambda: weekly_snapshot(trading_days[-1], mkt, lead, picks, records), None)
+    # ---- 8e. review 2026-11-14d: factor check, the ranking by market phase, the market-wide industry table,
+    # what happened after podcast mentions, and the divergence flags archived for their test
+    fcheck = safe("因子體檢（各因子之後 5／10／20 日的排序能力）",
+                  lambda: factor_check_all(panels, tframes, imom, frames, by_mkt), None)
+    states = market.regime_states(frames["TWII"]["close"]) if "TWII" in frames else pd.Series(dtype=object)
+    regime_edge = safe("排名在各市場階段的實測", lambda: {
+        "now": states.iloc[-1] if len(states) else None,
+        "by": research.regime_spread(panels["TW"], pd.DataFrame({s: tframes[s]["close"] for s in panels["TW"].columns}),
+                                     states)} if "TW" in panels and len(states) else None, None)
+    industries = safe("全市場產業概況（上市＋上櫃）", lambda: industry_overview(revenue, frames["TWII"]["close"], records, picks), [])
+    ev_list = [(d, s_) for d, _, s_ in ev_store.get("rows") or []]
+    drift = safe("Podcast 提及之後的表現（歷史統計）", lambda: leading.mention_drift(
+        ev_list, frames, {s_: m_["market"] for s_, m_ in meta.items()}, {"TW": "0050.TW", "US": "SPY"}), None)
+    safe("個股融資存檔", archive_margins, 0)
+    tag_divergence(records, flow_map, frames, margin_ref)
+    prereg_extra = prereg_progress(ev_store, meta, states)
+    weekly = safe("每週快照與本週變化", lambda: weekly_snapshot(trading_days[-1], mkt, lead, picks, records,
+                                                                 industries, flags), None)
     portfolio = safe("精選組合風險", lambda: portfolio_panel(picks, records, tframes, frames), None)
 
+    for r in records + etf_records:
+        r["contra"] = contra(r)
+
     def brief(r: dict) -> dict:
-        out = {k: r.get(k) for k in ("code", "name", "market", "industry", "close", "chg5d", "r20", "overall", "label",
-                                     "tactical", "structural", "setup", "rank", "reasons", "risks", "watch_first")}
+        out = {k: r.get(k) for k in ("code", "name", "market", "industry", "close", "chg5d", "r20", "overall",
+                                     "tactical", "structural", "setup", "rank", "reasons", "risks", "watch_first",
+                                     "contra", "entry")}
         fl = r.get("flags") or {}
         out["p_beat_1m"] = r["horizons"]["1m"].get("p_beat")
         out["official_flags"] = [k for k in ("punish", "notice", "near_punish", "exdiv") if fl.get(k)]
         return out
 
-    write_json(ROOT / ".cache" / "digest.json", {
+    digest = {
         "data_date": trading_days[-1],
         "indices": [{k: i.get(k) for k in ("name", "close", "chg5d", "r20", "ytd", "rsi", "horizons")}
                     for i in indices_out],
@@ -1633,15 +1718,22 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         "picks_track": track[-8:],
         "picks": [brief(r) for r in picks],
         "bullish": [brief(r) for r in bullish[:8]], "bearish": [brief(r) for r in bearish[:8]],
-        "podcast_hot": [{**{k: h[k] for k in ("symbol", "name", "market", "industry", "close", "chg5d", "r20",
-                                              "rsi", "overall", "label", "mentions", "reasons", "risks", "view")},
-                         "episodes": [{k: e[k] for k in ("show", "title", "date", "summary")} for e in h["episodes"]]}
+        "podcast_hot": [{**{k: h.get(k) for k in ("symbol", "name", "market", "industry", "close", "chg5d", "r20",
+                                                  "rsi", "overall", "rank", "mentions", "weeks", "prior12", "facts",
+                                                  "signal")},
+                         "episodes": [{k: e.get(k) for k in ("show", "title", "date", "where")} for e in h["episodes"]]}
                         for h in hot[:12]],
+        "podcast_drift": drift,
         "etf": [{k: r.get(k) for k in ("symbol", "name", "market", "industry", "close", "chg5d", "r20", "r60", "ytd",
                                        "overall", "label", "foreign5")} for r in etf_records],
         "funds": [{k: r.get(k) for k in ("symbol", "name", "group", "industry", "currency", "ret", "bench", "beat",
                                          "excess_ann", "sharpe", "vol_3y", "mdd_3y", "score", "grade", "trend",
-                                         "dist", "bench_name")} for r in fund_records]})
+                                         "dist", "bench_name")} for r in fund_records]}
+    # The commentary must be written from exactly this digest (review 2026-11-14d, H): ai.json carries the
+    # same fingerprint, and check_ai.py and the page refuse commentary written for an earlier build.
+    digest_sha = hashlib.sha256(json.dumps(_clean(digest), ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:12]
+    digest["digest_sha"] = digest_sha
+    write_json(ROOT / ".cache" / "digest.json", digest)
 
     # ---- 10. charts (also the on-disk price store for the next run) ----------
     if prices.Yahoo.enabled:  # optional Taiwan intraday for the names people will open first
@@ -1757,7 +1849,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                 1 if r["qfii_chg20"] > 0 else -1)
         if r.get("mentions", 0) >= 2:
             hot_too = r["mentions"] >= 3 and ((r.get("rsi") or 0) >= 70 or (r.get("margin_chg5") or 0) >= 0.05)
-            put(r["symbol"], "Podcast 過熱" if hot_too else "Podcast 熱議", -1 if hot_too else 0)
+            put(r["symbol"], "Podcast 提及・RSI 或融資偏高" if hot_too else "Podcast 提及", -1 if hot_too else 0)
         r["tags"] = tagmap.get(r["symbol"], [])
     for r in etf_records:
         r["tags"] = tagmap.get(r["symbol"], [])
@@ -1789,7 +1881,11 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                         "by_ticker": sorted(({"ticker": k, "name": meta.get(k, {}).get("name", k), **v} for k, v in insider_us.items()),
                                             key=lambda r: -(r["buy_value"] + r["sell_value"]))}})
     write_json(DATA / "podcasts.json", {"shows": shows, "mentions": mentions, "hot": hot,
-                                        "names": {s: meta[s]["name"] for s in mentions if s in meta}})
+                                        "names": {s: meta[s]["name"] for s in mentions if s in meta},
+                                        "drift": drift, "history": {"shows": len(ev_store.get("shows") or []),
+                                                                    "events": len(ev_store.get("rows") or []),
+                                                                    "since": min((ev_store.get("first") or {"": today.isoformat()}).values()),
+                                                                    "backfill": ev_store.get("backfill")}})
     write_json(DATA / "etf.json", etf_records)
     write_json(DATA / "funds.json", fund_records)
     write_json(DATA / "leading.json", {"cards": lead["cards"], "series": lead["series"],
@@ -1809,7 +1905,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                                and pd.Timestamp(r["date"]) < newest[mk]] for mk in ("TW", "US")}}
     safe("證交所 除權息歷史回補（供下週使用）", lambda: backfill_tw_actions(today), None, "https://www.twse.com.tw")
     safe("驗證用歷史資料回補（T86／日表／期交所／月營收，每週少量）", lambda: backfill_history(today, trading_days), None)
-    prereg = safe("預先登錄的檢驗", preregistered_status, None)
+    prereg = safe("預先登錄的檢驗", lambda: preregistered_status(prereg_extra), None)
     write_json(DATA / "summary.json", {
         "generated_at": now.isoformat(timespec="seconds"), "data_date": trading_days[-1],
         "calendar": calendar, "quality": quality,
@@ -1819,7 +1915,8 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         "bullish": [slim(r) for r in bullish], "bearish": [slim(r) for r in bearish],
         "backtest": bt, "backtest_imom": bt_imom, "calibration": CALIB, "picks_diff": picks_diff,
         "selection_bias": sel_bias, "weekly": weekly, "portfolio": portfolio, "follow": follow,
-        "preregistered": prereg,
+        "preregistered": prereg, "factor_check": fcheck, "regime_edge": regime_edge, "industries": industries,
+        "pick_rules": {"keep_tw": CFG["picks"]["keep_tw"], "keep_us": CFG["picks"]["keep_us"]}, "digest_sha": digest_sha,
         "weights": scoring.WEIGHTS, "weights_us": scoring.WEIGHTS_SLOW_CHIPS,
         "sources": SOURCES, "picks_track": track,
         "counts": {"tw": sum(r["market"] == "TW" for r in records),
@@ -1856,6 +1953,7 @@ def portfolio_panel(picks: list[dict], records: list[dict], tframes: dict, frame
                                                    frames[fund_sym]["close"], frames[bench]["close"])
         res.update({"weights": {r["symbol"]: round(float(x), 4) for r, x in zip(ps, w)},
                     "hi52": med(ps, "hi52"), "hi52_all": med(uni, "hi52"), "r60": med(ps, "r60"), "r60_all": med(uni, "r60")})
+        res.update(research.concentration([r["industry"] for r in ps], [r["name"] for r in ps], w, rets))
         out[mk] = res
         if mk == "US" and fx is not None:
             rets = ((1 + rets).mul(1 + fx.reindex(rets.index).fillna(0.0), axis=0) - 1)  # what a TWD investor gets
@@ -1869,6 +1967,24 @@ def portfolio_panel(picks: list[dict], records: list[dict], tframes: dict, frame
     return out
 
 
+def archive_margins() -> int:
+    """Per-stock margin and short balances (lots) of every listed common stock, from the local cache of
+    TWSE's daily margin tables, into the monthly shards history/margin_tw/ (review 2026-11-14d, C3).
+    The cache already holds every day the margin-cost estimate needed: no extra requests."""
+    if not MARGIN_CACHE.exists():
+        return 0
+    have = shard_days("margin_tw")
+    rows = {}
+    for f in sorted(MARGIN_CACHE.glob("*.json")):
+        if f.stem in have:
+            continue
+        t = read_json(f, {})
+        rows[f.stem] = {c: [v.get("margin"), v.get("short")] for c, v in t.items()
+                        if twse.COMMON_STOCK.match(c) and (v.get("margin") or v.get("short"))}
+    shard_put("margin_tw", {d: r for d, r in rows.items() if r})
+    return len(rows)
+
+
 def update_valuation_history(codes: list[str], valuation: dict, today: dt.date, budget: int = 40) -> dict:
     """Month-end P/E and P/B per Taiwan company over five years (review 2026-11-14, fund-3).
 
@@ -1876,11 +1992,15 @@ def update_valuation_history(codes: list[str], valuation: dict, today: dt.date, 
     `budget` companies a run); every later month comes from the exchanges' own valuation tables."""
     path = DATA / "history" / "tw_valuation.json"
     store: dict[str, dict] = read_json(path, {})
+    # Which companies already have their five years (review 2026-11-14d, G8: the month was only
+    # written for back-filled companies, so while FinMind refused, nothing at all was archived).
+    filled = set(store.pop("_filled", []))
     start = dt.date(today.year - 5, today.month, 1).isoformat()
     fails = 0
-    for code in [c for c in codes if c not in store][: 3 if QUICK else budget]:
+    for code in [c for c in codes if c not in filled][: 3 if QUICK else budget]:
         try:
-            store[code] = leading.valuation_history(code, start)
+            store[code] = {**leading.valuation_history(code, start), **store.get(code, {})}
+            filled.add(code)
             fails = 0
         except Exception as e:  # noqa: BLE001 - the free tier refuses when busy: try again next week
             fails += 1
@@ -1890,10 +2010,14 @@ def update_valuation_history(codes: list[str], valuation: dict, today: dt.date, 
     month = today.strftime("%Y-%m")
     for c in codes:
         v = valuation.get(c) or {}
-        if c in store and (v.get("pe") or v.get("pb")):
-            store[c][month] = [v.get("pe"), v.get("pb")]
+        if v.get("pe") or v.get("pb"):
+            store.setdefault(c, {})[month] = [v.get("pe"), v.get("pb")]
+    # The whole market's month, one shard per month (the last run of the month stays): the industry
+    # percentile needs every company, not only the watch list.
+    shard_put("valuation", {month: {c: [v.get("pe"), v.get("pb")] for c, v in valuation.items()
+                                    if twse.COMMON_STOCK.match(c) and (v.get("pe") or v.get("pb"))}}, replace=[month])
     store = {c: {m: store[c][m] for m in sorted(store[c])[-61:]} for c in sorted(store)}
-    write_json(path, store)
+    write_json(path, {**store, "_filled": sorted(filled)})
     return store
 
 
@@ -1910,8 +2034,8 @@ def backfill_history(today: dt.date, trading_days: list[str]) -> dict:
             have = shard_days("stock_flows_tw")
             need = [d for d in trading_days[-250:] if d not in have][::-1][: 5 if QUICK else 40]
             got = twse.fetch_days(need, twse.inst_stocks, "T86 backfill", log)
-            shard_put("stock_flows_tw", {d: {c: [round(v[0] / 1000), round(v[1] / 1000)] for c, v in t.items()
-                                             if twse.tracked(c) and (v[0] or v[1])} for d, t in got.items()})
+            shard_put("stock_flows_tw", {d: {c: flow_lots(v) for c, v in t.items() if twse.tracked(c) and any(v)}
+                                         for d, t in got.items()})
             done["t86"] = len(got)
         else:  # about 2.5 years of daily tables: point-in-time universe and closes
             have = shard_days("pit_closes")
@@ -1924,6 +2048,8 @@ def backfill_history(today: dt.date, trading_days: list[str]) -> dict:
                 pit.setdefault(d, [c for c, _ in vals[:150]])
             write_json(pit_path, {d: pit[d] for d in sorted(pit)[-1300:]})
             shard_put("pit_closes", {d: {c: round(b[3], 2) for c, b in t.items() if twse.COMMON_STOCK.match(c) and b[3]}
+                                     for d, t in got.items()})
+            shard_put("pit_volume", {d: {c: round(b[4] / 1000) for c, b in t.items() if twse.COMMON_STOCK.match(c) and b[4]}
                                      for d, t in got.items()})
             done["days"] = len(got)
     finally:
@@ -1968,17 +2094,142 @@ def backfill_history(today: dt.date, trading_days: list[str]) -> dict:
     return done
 
 
-def preregistered_status() -> list[dict]:
-    """Progress of the data each pre-registered test needs (review 2026-11-14)."""
+def preregistered_status(extra: dict | None = None) -> list[dict]:
+    """Progress of the data each pre-registered test needs (review 2026-11-14; tests added in 2026-11-14d)."""
     derivs = read_json(DATA / "history" / "tw_derivs.json", {})
     t86, closes, rev = shard_days("stock_flows_tw"), shard_days("pit_closes"), shard_days("revenue")
     weeks = len(list((DATA / "history" / "weekly").glob("*.json")))
+    val = read_json(DATA / "history" / "tw_valuation.json", {})
     progress = {"futures_d20": (len(derivs), 730), "chips_weight": (len(t86), 240), "fund_weight": (len(rev), 60),
-                "pit_backtest": (len(closes), 500), "watch_first": (weeks, 52)}
-    return [{**t, "have": progress[t["id"]][0], "need": progress[t["id"]][1]} for t in research.PREREGISTERED]
+                "pit_backtest": (len(closes), 500), "watch_first": (weeks, 52),
+                "rs_high": (len(closes), 510), "chip_divergence": (len(t86), 250), "rev_accel": (len(rev), 60),
+                "industry_flow": (weeks, 104), "exdiv_entry": (weeks, 52),
+                "valuation_pct": (sum(1 for c, v in val.items() if not c.startswith("_") and len(v) >= 36), 80),
+                **(extra or {})}
+    return [{**t, "have": progress.get(t["id"], (0, 1))[0], "need": progress.get(t["id"], (0, 1))[1]}
+            for t in research.PREREGISTERED]
 
 
-def weekly_snapshot(data_date: str, mkt: dict | None, lead: dict, picks: list[dict], records: list[dict]) -> dict:
+def prereg_progress(ev_store: dict, meta: dict, states: pd.Series) -> dict:
+    """Progress that needs this run's data: live podcast events per market since 2026-11-18 (the smaller
+    market counts), and the bear stretches (>= 20 sessions) inside the point-in-time archive."""
+    first: dict[str, str] = {}
+    live = {"TW": 0, "US": 0}
+    for d, _, s in sorted(ev_store.get("rows") or []):
+        new = s not in first or (dt.date.fromisoformat(d) - dt.date.fromisoformat(first[s])).days >= 28
+        first[s] = d
+        if new and d >= "2026-11-18" and s in meta:
+            live[meta[s]["market"]] = live.get(meta[s]["market"], 0) + 1
+    days = shard_days("pit_closes")
+    runs, cur = 0, 0
+    for d, st in states.items():
+        if d.strftime("%Y-%m-%d") not in days:
+            continue
+        cur = cur + 1 if st == "bear" else 0
+        runs += cur == 20
+    return {"podcast_drift": (min(live.values()), 200), "regime_entry": (runs, 3)}
+
+
+def factor_check_all(panels: dict, tframes: dict, imom: dict, frames: dict, by_mkt: dict) -> dict:
+    """因子體檢 (review 2026-11-14d, C7 + C11): every price factor the site shows or could score, graded
+    like the leading cards, per market; plus the point-in-time check of the return factors and the
+    progress of the factors that have no history yet."""
+    labels = {"tech": "排名用技術分數", "t_slow": "慢速技術分數", "hi52": "距 52 週高點", "imom": "純超額強度",
+              "r20": "近 20 日報酬（RS20 的排名相同）", "r60": "近 60 日報酬（RS60）", "r120": "近 120 日報酬（RS120）",
+              "mom_s": "短線區塊（5 日報酬、RSI、MACD）", "rsi": "RSI(14)", "rs_hi250": "相對 0050／SPY 比值線創 250 日新高"}
+    out: dict = {"labels": labels}
+    for mk, syms in by_mkt.items():
+        if mk not in panels or len(syms) < 25:
+            continue
+        cols = [s for s in syms if s in tframes]
+        tf = lambda k: pd.DataFrame({s: tframes[s][k] for s in cols})  # noqa: E731
+        bench = frames.get("0050.TW" if mk == "TW" else "SPY")
+        scores = {"tech": panels[mk], "t_slow": tf("t_slow"), "hi52": tf("hi52"),
+                  "imom": pd.DataFrame({s: imom[s] for s in cols if s in imom and len(imom[s])}),
+                  "r20": tf("r20"), "r60": tf("r60"), "r120": tf("r120"), "mom_s": tf("mom_s"), "rsi": tf("rsi")}
+        if bench is not None:
+            def flag(s: str) -> pd.Series:
+                b = bench["close"].reindex(frames[s].index).ffill()
+                ratio = frames[s]["close"] / b
+                return (ratio >= ratio.rolling(250, min_periods=250).max()).astype(float).where(ratio.rolling(250).count() >= 250)
+            scores["rs_hi250"] = pd.DataFrame({s: flag(s) for s in cols})
+        closes = pd.DataFrame({s: frames[s]["close"] for s in cols})
+        opens = pd.DataFrame({s: frames[s]["open"] for s in cols})
+        out[mk] = research.factor_check(scores, opens, closes, ref=panels[mk])
+    try:
+        pit = shard_get("pit_closes")
+        members = read_json(DATA / "history" / "tw_universe_pit.json", {})
+        pc = pd.DataFrame(pit).T.sort_index()
+        pc.index = pd.to_datetime(pc.index)
+        out["pit"] = research.pit_factor_ic(pc, members)
+    except Exception as e:  # noqa: BLE001 - the archive may still be short
+        log(f"  factor check (point in time): {e}")
+    weeks = len(list((DATA / "history" / "weekly").glob("*.json")))
+    out["pending"] = [{"name": "籌碼分數", "have": len(shard_days("stock_flows_tw")), "need": 240, "unit": "日"},
+                      {"name": "基本面分數", "have": len(shard_days("revenue")), "need": 60, "unit": "個月"},
+                      {"name": "綜合分數（實際排名）", "have": weeks, "need": 24, "unit": "週"}]
+    return out
+
+
+def industry_overview(revenue: dict, index: pd.Series, records: list[dict], picks: list[dict]) -> list[dict]:
+    """The market-wide industry table (review 2026-11-14d, C6) from the last 61 sessions of the cached
+    day tables (listed and OTC, unadjusted closes) and the industries of the monthly revenue tables."""
+    closes: dict[str, dict] = {}
+    values: dict[str, dict] = {}
+    for folder in (DAY_CACHE, OTC_CACHE):
+        for f in sorted(folder.glob("*.json"))[-70:] if folder.exists() else []:
+            t = read_json(f, {})
+            c = closes.setdefault(f.stem, {})
+            v = values.setdefault(f.stem, {})
+            for code, b in t.items():
+                if twse.COMMON_STOCK.match(code) and b[3]:
+                    c[code], v[code] = b[3], b[3] * b[4]
+    if not closes:
+        return []
+    C = pd.DataFrame(closes).T.sort_index()
+    V = pd.DataFrame(values).T.sort_index()
+    C.index, V.index = pd.to_datetime(C.index), pd.to_datetime(V.index)
+    full = C.notna().sum(axis=1) >= 0.8 * C.notna().sum(axis=1).max()  # days with both markets on file
+    C, V = C[full].tail(61), V[full].tail(61)
+    industry = {c: v["industry"] for c, v in revenue.items() if v.get("industry")}
+    names = {c: v.get("name") or c for c, v in revenue.items()}
+    rows = research.industry_table(C, V.fillna(0), industry, index, names)
+    pick_codes = {r["code"] for r in picks if r["market"] == "TW"}
+    for row in rows:
+        mem = [r for r in records if r["market"] == "TW" and industry.get(r["code"]) == row["name"]]
+        row["watch"], row["picks"] = len(mem), sum(r["code"] in pick_codes for r in mem)
+    return rows
+
+
+def tag_divergence(records: list[dict], flow_map: dict, frames: dict, margin_ref: dict) -> None:
+    """The four divergence flags of the pre-registered test chip_divergence, computed every week and
+    archived with the weekly snapshot - never shown or scored before the test (review 2026-11-14d, C3)."""
+    r5s = []
+    days = sorted(DAY_CACHE.glob("*.json"))[-6:] if DAY_CACHE.exists() else []
+    if len(days) == 6:
+        a, b = read_json(days[0], {}), read_json(days[-1], {})
+        r5s = [b[c][3] / a[c][3] - 1 for c in b if c in a and twse.COMMON_STOCK.match(c) and a[c][3] and b[c][3]]
+    med = float(np.median(r5s)) if r5s else None
+    tdcc = read_json(DATA / "history" / "tdcc.json", {})
+    tk = sorted(tdcc)
+    then = tdcc[tk[-5]] if len(tk) >= 5 else {}
+    now = tdcc[tk[-1]] if tk else {}
+    for r in records:
+        if r["market"] != "TW":
+            continue
+        fl, df = flow_map.get(r["code"]), frames.get(r["symbol"])
+        inst5 = [x[0] + x[1] for x in fl[-5:]] if fl and len(fl) >= 5 else None
+        adv = float(df["volume"].tail(20).mean()) if df is not None and len(df) >= 20 else None
+        hi60 = float(df["close"].iloc[-61:-1].max()) if df is not None and len(df) >= 61 else None
+        nw, th = now.get(r["code"]), then.get(r["code"])
+        big = nw[1] - th[1] if nw and th and len(nw) > 3 and len(th) > 3 else None
+        small = nw[3] - th[3] if nw and th and len(nw) > 3 and len(th) > 3 else None
+        r["div"] = leading.divergence_flags(inst5, adv, r.get("chg5d"), med, r.get("close"), hi60, r.get("margin"),
+                                            (margin_ref.get(r["code"]) or {}).get("margin"), big, small)
+
+
+def weekly_snapshot(data_date: str, mkt: dict | None, lead: dict, picks: list[dict], records: list[dict],
+                    industries: list[dict] | None = None, flags: dict | None = None) -> dict:
     """One snapshot per ISO week, history/weekly/<YYYY-Www>.json (review 2026-11-14, product-1).
 
     A re-run inside the week replaces that week's file; earlier weeks are never rewritten, so
@@ -1996,8 +2247,16 @@ def weekly_snapshot(data_date: str, mkt: dict | None, lead: dict, picks: list[di
             "cards": {c["key"]: {"name": c["name"], "value": c["value_text"], "tone": c["tone"],
                                  "grade": (c.get("evidence") or {}).get("grade"), "pct": (c.get("evidence") or {}).get("pct")}
                       for c in lead.get("cards") or []},
-            "picks": [{"symbol": r["symbol"], "name": r["name"], "rank": r.get("rank")} for r in picks],
-            "ranks": {r["symbol"]: r["rank"] for r in records if r.get("rank")}}
+            "picks": [{"symbol": r["symbol"], "name": r["name"], "rank": r.get("rank"),
+                       "exdiv": (((flags or {}).get(r["code"]) or {}).get("exdiv") or {}).get("date")} for r in picks],
+            "ranks": {r["symbol"]: r["rank"] for r in records if r.get("rank")},
+            # archived for the pre-registered tests of review 2026-11-14d, not shown
+            "div": {k: sorted(r["symbol"] for r in records if (r.get("div") or {}).get(k))
+                    for k in ("sell_hold", "buy_below", "holders", "margin_hold")},
+            "grid": {r["symbol"]: r["grid"] for r in records if r.get("grid")},
+            "rs_hi250": sorted(r["symbol"] for r in records if r.get("rs_hi250")),
+            "industries": [{k: x.get(k) for k in ("name", "n", "rel20", "share", "share_chg", "strong")}
+                           for x in industries or []]}
     write_json(folder / f"{key}.json", snap)
     earlier = sorted(p.stem for p in folder.glob("*.json") if p.stem < key)
     if not earlier:
@@ -2028,7 +2287,7 @@ def weekly_snapshot(data_date: str, mkt: dict | None, lead: dict, picks: list[di
         if (r.get("flags") or {}).get("punish"):
             return "處置股"
         rk = r.get("rank")
-        cap = 30 if r["market"] == "TW" else 20
+        cap = CFG["picks"]["keep_tw" if r["market"] == "TW" else "keep_us"]
         return f"排名降到 {rk[0]}／{rk[1]}" if rk and rk[0] > cap else "產業或相關性上限"
 
     out["picks_in"] = [p for p in snap["picks"] if p["symbol"] not in was]
@@ -2733,20 +2992,102 @@ def etf_record(s: str, df: pd.DataFrame, tf: pd.DataFrame, m: dict, flow_map: di
     return rec
 
 
-def hot_view(r: dict, mentions: int) -> str:
-    """One-line reading of a podcast-hot name: does the attention agree with the data?"""
-    o, rsi, wk = r["overall"], r.get("rsi") or 50, r.get("chg5d") or 0
-    if o >= 0.15:
-        txt = "聲量與數據同向偏多"
-        txt += "，但 RSI 過熱，話題性可能已反映在股價，追高風險大" if rsi >= 72 else "，趨勢與籌碼支持，拉回可留意"
-    elif o <= -0.15:
-        txt = "討論度高但數據偏空"
-        txt += "，屬於超跌後的關注，等止穩訊號再說" if rsi <= 32 else "，留意「利多不漲」，反彈宜減碼"
-    else:
-        txt = "市場關注度高、多空訊號混雜，方向未明，觀望為主"
-    if abs(wk) >= 0.08:
-        txt += f"（近一週已{'漲' if wk > 0 else '跌'} {abs(wk):.0%}，波動放大）"
-    return txt
+def hot_facts(r: dict) -> str:
+    """The numbers next to a talked-about name, without a reading (review 2026-11-14d, H): the old
+    one-liner said 偏多 / 拉回可留意 / 反彈宜減碼, which the site does not know."""
+    parts = []
+    if r.get("r20") is not None:
+        parts.append(f"近一月 {r['r20']:+.1%}")
+    rsi = r.get("rsi")
+    if rsi is not None:
+        parts.append(f"RSI {rsi:.0f}" + ("（≥ 70）" if rsi >= 70 else "（≤ 30）" if rsi <= 30 else ""))
+    if r.get("ma60") and r.get("close"):
+        parts.append("季線上" if r["close"] > r["ma60"] else "季線下")
+    if r.get("market") == "TW":
+        if r.get("f5_adv") is not None:
+            parts.append(f"外資 5 日 {r['f5_adv']:+.2f} 日均量")
+        if r.get("margin_chg5") is not None:
+            parts.append(f"融資 5 日 {r['margin_chg5']:+.1%}")
+    return "・".join(parts)
+
+
+def merge_podcast_events(store: dict, pod: dict, today: dt.date) -> dict:
+    """Add this run's matched episodes to history/podcast_events.json:
+    {"shows": [names], "first": {show: oldest episode in its feed}, "until": {show: newest episode
+    matched}, "backfill": date of the first run, "rows": [[date, show index, symbol]], "themes": [[date,
+    show index, word]]}. Rows are de-duplicated, so a re-run of the same week adds nothing."""
+    shows = list(store.get("shows") or [])
+    idx = {n: i for i, n in enumerate(shows)}
+
+    def at(name: str) -> int:
+        if name not in idx:
+            idx[name] = len(shows)
+            shows.append(name)
+        return idx[name]
+    rows = {tuple(x) for x in store.get("rows") or []}
+    rows |= {(d, at(sh), s) for d, sh, s in pod["events"]}
+    themes = {tuple(x) for x in store.get("themes") or []}
+    themes |= {(d, at(sh), t) for d, sh, t in pod["themes"]}
+    first, until = dict(store.get("first") or {}), dict(store.get("until") or {})
+    for sh, (lo, hi) in (pod.get("span") or {}).items():
+        first[sh] = min(lo, first.get(sh, lo))
+        until[sh] = max(hi, until.get(sh, hi))
+    return {"shows": shows, "first": first, "until": until, "backfill": store.get("backfill") or today.isoformat(),
+            "rows": sorted([list(x) for x in rows]), "themes": sorted([list(x) for x in themes])}
+
+
+def mention_timeline(store: dict, sym: str, today: dt.date) -> dict:
+    """streak: ISO weeks in a row with a mention, counting back from this week (or last week when this
+    week has none yet); prior12: weeks with a mention among the 12 before the 14-day window; first12:
+    no mention in those 12 weeks, judged only when at least 10 shows' feeds reach back that far."""
+    dates = [dt.date.fromisoformat(d) for d, _, s in store.get("rows") or [] if s == sym]
+    weeks = {d.isocalendar()[:2] for d in dates if d <= today}
+    wk = today
+    if today.isocalendar()[:2] not in weeks:
+        wk = today - dt.timedelta(days=7)
+    streak = 0
+    while wk.isocalendar()[:2] in weeks:
+        streak += 1
+        wk -= dt.timedelta(days=7)
+    lo, hi = today - dt.timedelta(days=14 + 84), today - dt.timedelta(days=14)
+    prior = {d.isocalendar()[:2] for d in dates if lo <= d < hi}
+    deep = sum(1 for d in (store.get("first") or {}).values() if dt.date.fromisoformat(d) <= lo)
+    return {"streak": max(streak, 1), "prior12": len(prior), "first12": not prior and deep >= 10}
+
+
+def contra(r: dict) -> list[str]:
+    """反方的數據 for one stock (review 2026-11-14d, C8 + G8): the facts in the same record that cut
+    against its rank, in a fixed order, each field once, at most six. Rules only, no verdict."""
+    out: list[str] = []
+    used: set[str] = set()
+
+    def add(text: str | None, key: str) -> None:
+        if text and key not in used and len(out) < 6:
+            used.add(key)
+            out.append(text)
+    for w in r.get("watch_first") or []:
+        add(w, w)
+    fl = r.get("flags") or {}
+    if fl.get("notice"):
+        add("注意股（交易所公告）", "notice")
+    if fl.get("near_punish"):
+        add("處置前哨（再一次注意就可能處置）", "near_punish")
+    for t in r.get("risks") or []:
+        key = next((k for k in ("RSI", "融資", "外資", "本益比", "Podcast", "處置") if k in t), t)
+        add(t, key)
+    if (r.get("pe_pct") or 0) >= 0.8:
+        add(f"本益比在自身 5 年 {r['pe_pct']:.0%} 分位", "本益比")
+    if (r.get("rsi") or 0) >= 70:
+        add(f"RSI {r['rsi']:.0f}（≥ 70）", "RSI")
+    if (r.get("margin_chg5") or 0) >= 0.05:
+        add(f"融資 5 日 {r['margin_chg5']:+.1%}", "融資")
+    if r.get("f5_adv") is not None and r["f5_adv"] <= -0.15:
+        add(f"外資 5 日賣超（{abs(r['f5_adv']):.2f} 日均量）", "外資")
+    if (r.get("mentions") or 0) >= 2:
+        add(f"近兩週 {r['mentions']} 集 Podcast 提及（不計分）", "Podcast")
+    if r.get("market") == "US":
+        add("美股排名沒有可驗證的選股優勢", "US")
+    return out
 
 
 def next_wednesday(d: dt.date) -> dt.date:

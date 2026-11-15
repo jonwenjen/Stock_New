@@ -157,7 +157,15 @@ def revenue_momentum(months: dict[str, float]) -> dict | None:
     if len(vals) < 12 or min(vals[-12:]) <= 0:
         return None
     ratio = (sum(vals[-3:]) / 3) / (sum(vals[-12:]) / 12)
-    out = {"month": keys[-1], "ratio": ratio, "cross_up": False, "cross_down": False, "rising": None}
+    out = {"month": keys[-1], "ratio": ratio, "cross_up": False, "cross_down": False, "rising": None,
+           "yoy3": None, "hi12": None}
+    # Shown only, weight 0 (review 2026-11-14d, C2): the three latest months against the same three
+    # a year earlier, and whether the latest month is the highest of the last twelve.
+    ym = [int(k[:4]) * 12 + int(k[5:7]) for k in keys]
+    if ym[-1] - ym[-12] == 11:
+        out["hi12"] = vals[-1] >= max(vals[-12:-1])
+    if len(vals) >= 15 and ym[-1] - ym[-15] == 14 and min(vals[-15:-12]) > 0:
+        out["yoy3"] = sum(vals[-3:]) / sum(vals[-15:-12]) - 1
     if len(vals) >= 13 and min(vals[-13:-1]) > 0:
         prev = (sum(vals[-4:-1]) / 3) / (sum(vals[-13:-1]) / 12)
         out.update({"prev": prev, "rising": ratio > prev,
@@ -208,15 +216,17 @@ def attention_signal(mentions: int, weeks: int, f5: float | None, margin_chg5: f
     is quiet and the talk is new. Crowded = talk has persisted, retail leverage is
     surging and institutions are selling.
     """
-    if not mentions or f5 is None:
+    # Descriptive since review 2026-11-14d: f5 is the foreign investors' flow only, so the label says
+    # 外資, not 法人; a stock with no margin data (OTC) gets no label instead of a margin change of 0.
+    if not mentions or f5 is None or margin_chg5 is None:
         return None
-    m = margin_chg5 or 0.0
+    m = margin_chg5
     if weeks <= 1 and f5 >= 0.15 and m <= 0.02:
-        return "法人先行：話題剛起，法人買、融資未跟"
+        return "話題第 1 週・外資 5 日買超・融資未增"
     if (weeks >= 2 or mentions >= 3) and f5 <= -0.15 and m >= 0.05:
-        return "過熱警訊：話題延燒，融資追、法人賣"
+        return f"話題第 {max(weeks, 1)} 週・融資 5 日增・外資 5 日賣超"
     if f5 <= -0.15 and m >= 0.05:
-        return "籌碼轉弱：融資增、法人賣"
+        return "融資 5 日增・外資 5 日賣超"
     return None
 
 
@@ -537,7 +547,7 @@ def previous_week_picks(cohorts: list[dict], today: str) -> set[str]:
 # ----------------------------- TDCC shareholder distribution ----------------------------- #
 def parse_tdcc(text: str, codes: set[str] | None = None) -> tuple[str | None, dict[str, list]]:
     """TDCC 集保股權分散表 (CSV) -> (data date, {code: [% held by 1,000+ lot holders,
-    % held by 400+ lot holders, number of holders]}).
+    % held by 400+ lot holders, number of holders, % held by holders of 50 lots or less]}).
 
     Levels 12-15 are 400-600, 600-800, 800-1,000 and over 1,000 lots; 16 is a reconciliation
     line and 17 the total.
@@ -552,12 +562,14 @@ def parse_tdcc(text: str, codes: set[str] | None = None) -> tuple[str | None, di
         if codes is not None and code not in codes:
             continue
         date = date or r[0].strip()
-        cell = out.setdefault(code, [0.0, 0.0, 0])
+        cell = out.setdefault(code, [0.0, 0.0, 0, 0.0])
         pct = num(r[5]) or 0.0
         if lvl == 15:
             cell[0] = pct
         if 12 <= lvl <= 15:
             cell[1] = round(cell[1] + pct, 2)
+        if 1 <= lvl <= 8:  # up to 50 lots: the small holders (review 2026-11-14d, C3)
+            cell[3] = round(cell[3] + pct, 2)
         if lvl == 17:
             cell[2] = int(num(r[3]) or 0)
     if date and len(date) == 8:
@@ -688,14 +700,20 @@ def follow_track(cohorts: list[dict], frames: dict[str, pd.DataFrame], bench: di
                  universe: dict[str, list[str]]) -> dict:
     """What following each week's list would have earned (review 2026-11-14, quant-7 + risk-5).
 
-    Rules, fixed before any result was seen: buy every pick at the open of the session after the
-    list date, equal weight; sell at the open of the session after the next list's date (the last
-    list is marked to the latest close once five sessions have passed). Returns are net of a round
-    trip (TRACK_COST) and compared with the market's index fund and with the median stock of the
-    market's current universe over the same window. Until TRACK_MIN_WEEKS lists have been scored
-    the verdict is "too few weeks"; after that, a mean weekly excess with t < 1 is reported as no
-    edge shown yet."""
+    Rules, fixed before any week was scored (cost rule corrected in review 2026-11-14d, C10j):
+    hold every pick from the open of the session after the list date, equal weight, until the open of
+    the session after the next list's date (the last list is marked to the latest close once five
+    sessions have passed). Names that stay on the list are not traded and cost nothing; each name
+    bought costs a round trip (TRACK_COST), so a list pays TRACK_COST x (names bought / names held).
+    A Taiwan name whose entry open is already limit-up (>= 9.5% above the list-date close) counts as
+    not bought: cash for that week. Returns are compared with the market's index fund and with the
+    median stock of the market's current universe over the same window. Each row also carries fixed
+    horizons for the list as a whole (T+5/T+10/T+20 sessions from the entry open, net of a round trip,
+    minus the index fund) and the share of names that beat it at T+20. Until TRACK_MIN_WEEKS lists have
+    been scored the verdict is "too few weeks"; after that a mean weekly excess with t < 1 is reported
+    as no edge shown yet."""
     rows = []
+    held: dict[str, set] = {}
     for i, c in enumerate(cohorts):
         d0 = pd.Timestamp(c["date"])
         d1 = pd.Timestamp(cohorts[i + 1]["date"]) if i + 1 < len(cohorts) else None
@@ -717,20 +735,42 @@ def follow_track(cohorts: list[dict], frames: dict[str, pd.DataFrame], bench: di
                 win.append((a[0], z[0]))
                 return z[1] / a[1] - 1
 
-            rets = [r for p in c["picks"] if p["market"] == mk and p["symbol"] in frames
-                    for r in [window(frames[p["symbol"]])] if r is not None]
+            prev = held.get(mk, set())
+            now, rets, skipped, bought = set(), [], 0, 0
+            for p in c["picks"]:
+                if p["market"] != mk or p["symbol"] not in frames:
+                    continue
+                f = frames[p["symbol"]]
+                r = window(f)
+                if r is None:
+                    continue
+                new = p["symbol"] not in prev
+                if new and mk == "TW":
+                    a = _open_after(f, d0)
+                    ref = p.get("close") or _close_on(f, d0)
+                    if a is not None and ref and a[1] >= ref * 1.095:
+                        rets.append(0.0)  # limit-up at the open: could not be bought, held as cash
+                        skipped += 1
+                        continue
+                now.add(p["symbol"])
+                bought += new
+                rets.append(r)
+            held[mk] = now
             br = window(b)
             if not rets or br is None:
                 continue
             uni = [r for s in universe.get(mk, []) if s in frames for r in [window(frames[s])] if r is not None]
             med = float(np.median(uni)) if uni else None
-            net = float(np.mean(rets)) - TRACK_COST[mk]
-            rows.append({"date": c["date"], "market": mk, "n": len(rets), "net": round(net, 4),
-                         "bench": round(br, 4), "excess": round(net - br, 4),
-                         "beat_median": round(sum(r > med for r in rets) / len(rets), 3) if med is not None else None,
-                         "median": None if med is None else round(med, 4),
-                         "exit": max(w[1] for w in win).strftime("%Y-%m-%d") if win else None,
-                         "open": d1 is None})
+            net = float(np.mean(rets)) - TRACK_COST[mk] * bought / len(rets)
+            row = {"date": c["date"], "market": mk, "n": len(rets), "new": bought, "limit_skip": skipped,
+                   "net": round(net, 4), "bench": round(br, 4), "excess": round(net - br, 4),
+                   "beat_median": round(sum(r > med for r in rets) / len(rets), 3) if med is not None else None,
+                   "median": None if med is None else round(med, 4),
+                   "exit": max(w[1] for w in win).strftime("%Y-%m-%d") if win else None,
+                   "open": d1 is None}
+            row.update(_fixed_horizons([frames[p["symbol"]] for p in c["picks"]
+                                        if p["market"] == mk and p["symbol"] in frames], b, d0, TRACK_COST[mk]))
+            rows.append(row)
     summary = {}
     for mk in ("TW", "US"):
         done = [r for r in rows if r["market"] == mk and not r["open"]]
@@ -740,10 +780,199 @@ def follow_track(cohorts: list[dict], frames: dict[str, pd.DataFrame], bench: di
         bgrowth = float(np.prod([1 + r["bench"] for r in done]) - 1) if done else None
         verdict = (f"樣本不足（{len(done)}／{TRACK_MIN_WEEKS} 週）" if len(done) < TRACK_MIN_WEEKS else
                    "實際追蹤尚未顯示優勢" if t is None or t < 1 else f"實際追蹤顯示正超額（t = {t:.1f}）")
+        curve = np.cumprod([1 + r["net"] for r in done]) if done else np.array([])
+        t20 = [r["t20"] for r in rows if r["market"] == mk and r.get("t20") is not None]
         summary[mk] = {"weeks": len(done), "mean_excess": round(float(ex.mean()), 4) if len(ex) else None,
                        "t": None if t is None else round(t, 2), "growth": growth, "bench_growth": bgrowth,
-                       "verdict": verdict}
-    return {"rows": rows, "summary": summary, "rules": {"cost": TRACK_COST, "min_weeks": TRACK_MIN_WEEKS}}
+                       "verdict": verdict,
+                       "max_dd": round(float((curve / np.maximum.accumulate(curve) - 1).min()), 4) if len(curve) else None,
+                       "beat_share": round(sum(x > 0 for x in t20) / len(t20), 3) if t20 else None,
+                       "t20_mean": round(float(np.mean(t20)), 4) if t20 else None, "t20_weeks": len(t20)}
+    return {"rows": rows, "summary": summary, "rules": {"cost": TRACK_COST, "min_weeks": TRACK_MIN_WEEKS,
+                                                        "cost_rule": "only names bought", "limit_up": 0.095}}
+
+
+def _close_on(f: pd.DataFrame, day: pd.Timestamp) -> float | None:
+    s = f["close"][f.index <= day]
+    return float(s.iloc[-1]) if len(s) else None
+
+
+def _fixed_horizons(fs: list[pd.DataFrame], bench: pd.DataFrame, d0: pd.Timestamp, cost: float,
+                    horizons: tuple = (5, 10, 20)) -> dict:
+    """The list as a whole held a fixed number of sessions from the entry open: mean return net of a
+    round trip minus the index fund (t5/t10/t20), and at T+20 the share of names that beat the index
+    fund (beat20), the share that gained (win20) and the average gain and loss (avg_win/avg_loss)."""
+    def fwd(f: pd.DataFrame, h: int) -> float | None:
+        a = _open_after(f, d0)
+        if a is None:
+            return None
+        after = f[f.index >= a[0]]
+        return float(after["close"].iloc[h - 1]) / a[1] - 1 if len(after) >= h else None
+    out = {}
+    for h in horizons:
+        b = fwd(bench, h)
+        rs = [r for f in fs for r in [fwd(f, h)] if r is not None]
+        out[f"t{h}"] = round(float(np.mean(rs)) - cost - b, 4) if rs and b is not None else None
+        if h == 20 and rs and b is not None:
+            net = [r - cost for r in rs]
+            wins, losses = [x for x in net if x > 0], [x for x in net if x <= 0]
+            out.update({"beat20": round(sum(r - cost > b for r in rs) / len(rs), 3),
+                        "win20": round(len(wins) / len(net), 3),
+                        "avg_win": round(float(np.mean(wins)), 4) if wins else None,
+                        "avg_loss": round(float(np.mean(losses)), 4) if losses else None})
+    return out
+
+
+def entry_info(cohorts: list[dict], symbol: str) -> dict | None:
+    """Start of the current unbroken run of weekly lists that contain `symbol`: the list date and the
+    close on it (review 2026-11-14d, C10g - shown instead of an "entry price" or a target)."""
+    start = None
+    for c in sorted(cohorts, key=lambda c: c["date"]):
+        hit = next((p for p in c["picks"] if p["symbol"] == symbol), None)
+        if hit is None:
+            start = None
+        elif start is None:
+            start = {"date": c["date"], "close": hit.get("close")}
+    return start
+
+
+# ----------------------------- per-stock flow windows ----------------------------- #
+def flow_windows(series: list[tuple]) -> dict:
+    """10/20-day foreign and trust nets and 5/10/20-day dealer (own account) nets, in lots, from
+    [(foreign, trust, dealer own), ...] in shares, oldest first. A dealer window is None when any of
+    its days was archived before the dealer leg was kept. Shown only (review 2026-11-14d, C10c)."""
+    out: dict = {}
+    for n in (10, 20):
+        if len(series) >= n:
+            out[f"foreign{n}"] = sum(x[0] for x in series[-n:]) / 1000
+            out[f"trust{n}"] = sum(x[1] for x in series[-n:]) / 1000
+    for n in (5, 10, 20):
+        part = series[-n:] if len(series) >= n else []
+        out[f"dealer{n}"] = (sum(x[2] for x in part) / 1000
+                             if part and all(len(x) > 2 and x[2] is not None for x in part) else None)
+    return out
+
+
+def flow_grid(r20: float | None, inst20: float | None) -> str | None:
+    """Which of four cells a stock sits in over the last 20 sessions: price up or down x foreign + trust
+    net buying or selling. A description of what happened, not a stage (accumulation, shakeout and
+    distribution only separate afterwards). Review 2026-11-14d, C10f."""
+    if r20 is None or inst20 is None:
+        return None
+    return ("up_" if r20 >= 0 else "dn_") + ("buy" if inst20 >= 0 else "sell")
+
+
+def divergence_flags(inst5: list[float] | None, adv20: float | None, r5: float | None, r5_median: float | None,
+                     close: float | None, hi60: float | None, margin: float | None, margin5: float | None,
+                     big400_chg4w: float | None = None, small50_chg4w: float | None = None) -> dict:
+    """The four price/flow divergences proposed in review 2026-11-14d (C3), defined before any test and
+    archived weekly, never shown or scored until the pre-registered test `chip_divergence` decides.
+
+    inst5: the last five daily foreign + trust nets (shares); adv20: 20-day average volume (shares).
+    1 sell_hold: institutions sold on each of the last 5 days, at least 0.15 ADV in total, while the
+      5-day return is at or above the market median.
+    2 buy_below: institutions bought on each of the last 5 days, at least 0.15 ADV in total, while the
+      close is below the prior 60-day high.
+    3 holders: TDCC holders of 400+ lots up >= 1 point over 4 weeks while holders of <= 50 lots lose >= 1.
+    4 margin_hold: margin balance down >= 3% over 5 days (from >= 200 lots) while the price is up > 1%."""
+    out: dict = {"sell_hold": None, "buy_below": None, "holders": None, "margin_hold": None}
+    if inst5 and len(inst5) == 5 and adv20:
+        tot = sum(inst5) / adv20
+        if r5 is not None and r5_median is not None:
+            out["sell_hold"] = all(x < 0 for x in inst5) and tot <= -0.15 and r5 >= r5_median
+        if close is not None and hi60 is not None:
+            out["buy_below"] = all(x > 0 for x in inst5) and tot >= 0.15 and close < hi60
+    if big400_chg4w is not None and small50_chg4w is not None:
+        out["holders"] = big400_chg4w >= 1 and small50_chg4w <= -1
+    if margin is not None and margin5 is not None and margin5 >= 200 and r5 is not None:
+        out["margin_hold"] = margin / margin5 - 1 <= -0.03 and r5 > 0.01
+    return out
+
+
+# ----------------------------- after a podcast mention ----------------------------- #
+def mention_drift(events: list[tuple[str, str]], frames: dict[str, pd.DataFrame], market: dict[str, str],
+                  bench: dict[str, str], fresh_days: int = 28, min_n: int = 100,
+                  horizons: tuple = (5, 20)) -> dict:
+    """What happened after a tracked show mentioned a stock (review 2026-11-14d, G4).
+
+    events: (episode date 'YYYY-MM-DD', symbol). An event is a symbol's first mention by any tracked
+    show in `fresh_days` days. Entry is the open of the first session after the episode date, exit the
+    close of the h-th session; the excess is against the market's index fund (0050 / SPY) over the same
+    sessions. Also reported: the excess minus each stock's usual excess (its mean over every Wednesday in
+    the price store, same rule), because today's popular stocks beat the index anyway. t uses month
+    clusters. With fewer than `min_n` events a cell gives only the count."""
+    seen: dict[str, pd.Timestamp] = {}
+    first = []
+    for d, s in sorted(events):
+        ts = pd.Timestamp(d)
+        if s in seen and (ts - seen[s]).days < fresh_days:
+            seen[s] = ts
+            continue
+        seen[s] = ts
+        first.append((ts, s))
+
+    def excess(f: pd.DataFrame, b: pd.DataFrame, ts: pd.Timestamp, h: int) -> float | None:
+        a, ab = _open_after(f, ts), _open_after(b, ts)
+        if a is None or ab is None:
+            return None
+        fa, ba = f[f.index >= a[0]], b[b.index >= ab[0]]
+        if len(fa) < h or len(ba) < h:
+            return None
+        return (float(fa["close"].iloc[h - 1]) / a[1] - 1) - (float(ba["close"].iloc[h - 1]) / ab[1] - 1)
+
+    usual: dict[tuple[str, int], float | None] = {}
+
+    def usual_excess(s: str, h: int) -> float | None:
+        if (s, h) not in usual:  # the same rule from every fifth session, vectorised
+            f, b = frames[s], frames[bench[market[s]]]
+            idx = f.index.intersection(b.index)
+            op = lambda df: df["open"].reindex(idx).where(lambda v: v > 0)  # noqa: E731
+            x = ((f["close"].reindex(idx).shift(-h) / op(f).shift(-1) - 1)
+                 - (b["close"].reindex(idx).shift(-h) / op(b).shift(-1) - 1)).iloc[::5].dropna()
+            usual[(s, h)] = float(x.mean()) if len(x) >= 20 else None
+        return usual[(s, h)]
+
+    out: dict = {"fresh_days": fresh_days, "min_n": min_n, "cells": []}
+    for mk in ("TW", "US"):
+        b = frames.get(bench.get(mk, ""))
+        if b is None:
+            continue
+        for h in horizons:
+            xs, adj, months = [], [], []
+            for ts, s in first:
+                if market.get(s) != mk or s not in frames:
+                    continue
+                x = excess(frames[s], b, ts, h)
+                if x is None:
+                    continue
+                xs.append(x)
+                u = usual_excess(s, h)
+                adj.append(None if u is None else x - u)
+                months.append(ts.strftime("%Y-%m"))
+            cell = {"market": mk, "h": h, "n": len(xs)}
+            if len(xs) >= min_n:
+                a = np.array(xs)
+                adj_ok = [(v, m) for v, m in zip(adj, months) if v is not None]
+                cell.update({"mean": round(float(a.mean()), 4), "median": round(float(np.median(a)), 4),
+                             "pos": round(float((a > 0).mean()), 3), "t": _cluster_t(a, months),
+                             "adj": round(float(np.mean([v for v, _ in adj_ok])), 4) if adj_ok else None,
+                             "adj_t": _cluster_t(np.array([v for v, _ in adj_ok]), [m for _, m in adj_ok]) if adj_ok else None})
+            out["cells"].append(cell)
+    out["events"] = len(first)
+    return out
+
+
+def _cluster_t(x: np.ndarray, groups: list[str]) -> float | None:
+    """t of the mean with standard errors clustered by group (months: events in the same month share
+    the market's moves)."""
+    if len(x) < 3:
+        return None
+    m = float(x.mean())
+    by: dict[str, float] = {}
+    for v, g in zip(x, groups):
+        by[g] = by.get(g, 0.0) + (float(v) - m)
+    se = float(np.sqrt(sum(v * v for v in by.values()))) / len(x)
+    return round(m / se, 2) if se > 0 else None
 
 
 def valuation_history(code: str, start: str) -> dict[str, list]:

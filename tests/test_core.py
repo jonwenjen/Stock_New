@@ -76,7 +76,7 @@ def test_chips_tw_direction_and_margin_warning():
     sell, notes = scoring.chips_tw({"f5": -0.8, "f20": -2.0, "t5": -0.2, "streak": -6,
                                     "margin_chg5": 0.08, "r5": -0.05})
     assert buy > 0.5 and sell < -0.5
-    assert any("融資增" in t for t, _ in notes)
+    assert any("融資 5 日 +8.0%" in t for t, _ in notes)
     assert scoring.chips_tw({})[0] is None
 
 
@@ -192,7 +192,8 @@ def test_feed_parsing_and_mentions():
     since = dt.datetime(2026, 11, 1, tzinfo=dt.timezone.utc)
     eps = media.parse_feed(RSS, since)
     assert len(eps) == 1 and eps[0]["date"] == "2026-11-09"
-    assert "<p>" not in eps[0]["summary"] and "https://" not in eps[0]["summary"]
+    summ = media.summary_text(eps[0], "text", set(eps[0]["_chunks"]))
+    assert "<p>" not in summ and "https://" not in summ and "x.co" not in summ
     m = media.build_matchers({"2330.TW": ["台積電"], "NVDA": ["NVDA", "輝達"], "AMD": ["AMD"],
                               "MU": ["MU"], "MA": ["MA"], "ARM": ["ARM"]})
     found = media.find_mentions(media.episode_texts(eps)[0], m)
@@ -342,12 +343,17 @@ def test_etf_category_and_record():
     assert us["factors"]["chips"] is None and "foreign5" not in us
 
 
-def test_hot_view_reads_attention_against_the_data():
-    from pipeline import build
-    assert "同向偏多" in build.hot_view({"overall": 0.4, "rsi": 55, "chg5d": 0.01}, 3)
-    assert "追高風險" in build.hot_view({"overall": 0.4, "rsi": 80, "chg5d": 0.12}, 3)
-    assert "利多不漲" in build.hot_view({"overall": -0.4, "rsi": 45, "chg5d": -0.01}, 3)
-    assert "方向未明" in build.hot_view({"overall": 0.0, "rsi": None, "chg5d": None}, 1)
+def test_hot_facts_no_direction_words():
+    from pipeline import build, check_ai
+    rows = [{"r20": r20, "rsi": rsi, "close": 100, "ma60": ma, "market": mk, "f5_adv": f5, "margin_chg5": mc}
+            for r20 in (-0.2, 0.0, 0.3) for rsi in (25, 50, 85) for ma in (90, 110) for mk, f5, mc in
+            (("TW", 0.4, -0.05), ("TW", -0.5, 0.12), ("US", None, None))]
+    for r in rows:
+        txt = build.hot_facts(r)
+        assert txt and not any(w in txt for w in check_ai.BANNED)
+    tsmc = build.hot_facts({"r20": -0.056, "rsi": 49, "close": 100, "ma60": 110, "market": "TW",
+                            "f5_adv": -0.44, "margin_chg5": -0.077})
+    assert tsmc == "近一月 -5.6%・RSI 49・季線下・外資 5 日 -0.44 日均量・融資 5 日 -7.7%"
 
 
 def test_check_ai_validation():
@@ -546,9 +552,10 @@ def test_cohort_results_against_benchmark():
 
 def test_attention_signal_and_sbl_moves():
     from pipeline import leading
-    assert "法人先行" in leading.attention_signal(1, 1, 0.4, -0.01)
-    assert "過熱" in leading.attention_signal(4, 3, -0.5, 0.12)
+    assert leading.attention_signal(1, 1, 0.4, -0.01) == "話題第 1 週・外資 5 日買超・融資未增"
+    assert leading.attention_signal(4, 3, -0.5, 0.12) == "話題第 3 週・融資 5 日增・外資 5 日賣超"
     assert leading.attention_signal(1, 1, 0.0, 0.0) is None and leading.attention_signal(2, 1, None, 0.2) is None
+    assert leading.attention_signal(1, 1, 0.3, None) is None   # OTC: no margin data is not a margin change of 0
     now = {"2330": {"name": "台積電", "sbl": 2_000_000, "short": 100_000}, "0050": {"name": "ETF", "sbl": 9e9, "short": 1},
            "1101": {"name": "台泥", "sbl": 1000, "short": 0}}
     ref = {"2330": {"name": "台積電", "sbl": 1_000_000, "short": 100_000}, "0050": {"name": "ETF", "sbl": 1e9, "short": 1},
@@ -901,9 +908,10 @@ def test_one_slow_score_and_the_auxiliary_reads():
     assert tw["tactical"] == 0.8 and tw["structural"] == pytest.approx(-0.5)   # chips, fundamentals
     assert us["tactical"] is None and us["structural"] == pytest.approx(0.7 * -0.5 + 0.3 * 0.8)
     assert scoring.score_stock(tf, 0.8, -0.5, 0.3, tech=0.4)["overall"] == tw["overall"]  # buzz weighs nothing
-    assert scoring.setup_tag(0.3, 0.4) == "基本面與籌碼同步偏多"
-    assert scoring.setup_tag(0.3, 0.4, tactical_prev=0.0) == "基本面佳，籌碼剛轉強"
-    assert scoring.setup_tag(-0.3, 0.4) == "基本面佳但籌碼偏弱"
+    assert scoring.setup_tag(0.3, 0.4) == "基本面與籌碼分數同為正"
+    assert scoring.setup_tag(0.3, 0.4, tactical_prev=0.0) == "基本面分數為正，籌碼分數本週轉正"
+    assert scoring.setup_tag(-0.3, 0.4) == "基本面分數為正、籌碼分數為負"
+    assert not any(w in (scoring.setup_tag(a, b) or "") for a in (-0.5, 0.5) for b in (-0.5, 0.5) for w in ("偏多", "偏空"))
 
 
 def test_tech_panel_ranks_within_the_market():
@@ -991,7 +999,7 @@ def test_tpex_tables():
     assert q == {"6488": (1055.0, 1135.0, 1045.0, 1085.0, 24330000.0)}
     row = ["6488", "環球晶", "1", "1", "741,269", "0", "0", "0", "1", "1", "741,269", "1", "1", "-341,881",
            "1", "1", "-77,499", "1", "1", "-116,695", "1", "1", "-194,194", "205,194"]
-    assert tpex.parse_inst({"data": [row]}) == {"6488": (741269.0, -341881.0, -194194.0)}
+    assert tpex.parse_inst({"data": [row]}) == {"6488": (741269.0, -341881.0, -194194.0, -77499.0, -116695.0)}
     bad = row[:]; bad[23] = "999"
     with pytest.raises(ValueError):
         tpex.parse_inst({"data": [bad]})
@@ -1221,3 +1229,184 @@ def test_colour_tokens_meet_wcag_aa_in_light_and_dark():
             assert _contrast(t[fg], t[bg]) >= 4.5, (name, fg, bg, round(_contrast(t[fg], t[bg]), 2))
         for fg, bg in parts:
             assert _contrast(t[fg], t[bg]) >= 3.0, (name, fg, bg, round(_contrast(t[fg], t[bg]), 2))
+
+
+
+# ---------------- review 2026-11-14d: outside suggestions ----------------
+def test_relative_strength_and_rs_high():
+    idx = pd.bdate_range("2025-01-01", periods=300)
+    b = pd.Series(np.linspace(100, 130, 300), index=idx)
+    c = b * 1.0
+    c.iloc[-21:] = c.iloc[-21:] * np.linspace(1.0, 1.1, 21)      # 10% better than the benchmark over 20 days
+    rs = scoring.relative_strength(c, b)
+    assert rs["rs20"] == pytest.approx(0.10 * b.iloc[-1] / b.iloc[-21], abs=1e-6)
+    assert scoring.rs_high(c, b) is True and scoring.rs_high(c.tail(100), b) is None
+    plan = scoring.trade_plan(pd.Series({"close": 100.0, "atr": 2.0, "ma20": 95.0, "ma60": 90.0, "rsi": 80}),
+                              {"high": 110.0}, 0.6)
+    assert "rr" not in plan and "stance" not in plan and plan["target"] == 110.0
+
+
+def test_factor_check_grades_and_nw_mean_t():
+    from pipeline import research
+    rng = np.random.default_rng(1)
+    idx = pd.bdate_range("2021-01-01", periods=900)
+    cols = [f"S{i}" for i in range(40)]
+    rets = pd.DataFrame(rng.normal(0, 0.02, (900, 40)), index=idx, columns=cols)
+    closes = (1 + rets).cumprod() * 100
+    opens = closes.shift(1).fillna(100.0)
+    fut = closes.shift(-20) / opens.shift(-1) - 1 + rng.normal(0, 0.02, (900, 40))   # knows the future: grade A
+    noise = pd.DataFrame(rng.normal(size=(900, 40)), index=idx, columns=cols)
+    out = research.factor_check({"oracle": fut, "noise": noise}, opens, closes, ref=fut, lookback=900)
+    assert out["oracle"]["grade"] == "A" and out["oracle"]["ic"][20] > 0.5 and out["oracle"]["corr_tech"] == 1.0
+    assert out["noise"]["grade"] in ("C", "B") and abs(out["noise"]["ic"][20]) < 0.05
+    short = research.factor_check({"x": fut}, opens.tail(100), closes.tail(100), lookback=100)
+    assert short["x"]["grade"] == "D"
+    x = rng.normal(0.1, 1, 500)
+    plain = x.mean() / (x.std(ddof=1) / np.sqrt(len(x)))
+    assert research.nw_mean_t(x, 0) == pytest.approx(plain, rel=1e-6)
+
+
+def test_follow_track_charges_only_names_bought_and_skips_limit_up_opens():
+    from pipeline import leading
+    idx = pd.bdate_range("2026-01-05", periods=40)
+    flat = pd.DataFrame({"open": 100.0, "close": 100.0}, index=idx)
+    jump = flat.copy()
+    jump.loc[idx[1]:, ["open", "close"]] = 110.0              # opens +10% the session after the list date
+    frames = {"A.TW": flat, "B.TW": jump, "0050.TW": flat}
+    cohorts = [{"date": "2026-01-05", "picks": [{"symbol": "A.TW", "market": "TW", "close": 100.0}]},
+               {"date": "2026-01-12", "picks": [{"symbol": "A.TW", "market": "TW", "close": 100.0}]},
+               {"date": "2026-01-19", "picks": [{"symbol": "A.TW", "market": "TW", "close": 100.0}]}]
+    rows = leading.follow_track(cohorts, frames, {"TW": "0050.TW"}, {"TW": ["A.TW"]})["rows"]
+    assert rows[0]["net"] == pytest.approx(-leading.TRACK_COST["TW"], abs=1e-4) and rows[0]["new"] == 1
+    assert rows[1]["net"] == pytest.approx(0.0) and rows[1]["new"] == 0          # kept: no trade, no cost
+    lim = [{"date": "2026-01-05", "picks": [{"symbol": "B.TW", "market": "TW", "close": 100.0},
+                                            {"symbol": "A.TW", "market": "TW", "close": 100.0}]},
+           {"date": "2026-01-12", "picks": [{"symbol": "A.TW", "market": "TW", "close": 100.0}]}]
+    r0 = leading.follow_track(lim, frames, {"TW": "0050.TW"}, {"TW": ["A.TW"]})["rows"][0]
+    assert r0["limit_skip"] == 1 and r0["new"] == 1
+    assert r0["net"] == pytest.approx(-leading.TRACK_COST["TW"] / 2, abs=1e-4)   # B counts as cash, A pays a round trip
+    assert {"t5", "t10", "t20", "beat20", "win20"} <= set(rows[0])
+
+
+def test_entry_flow_windows_grid_and_divergence():
+    from pipeline import leading
+    c = [{"date": "2026-11-04", "picks": [{"symbol": "X", "close": 10}]},
+         {"date": "2026-11-11", "picks": [{"symbol": "Y", "close": 5}]},
+         {"date": "2026-11-18", "picks": [{"symbol": "X", "close": 12}]},
+         {"date": "2026-11-25", "picks": [{"symbol": "X", "close": 13}]}]
+    assert leading.entry_info(c, "X") == {"date": "2026-11-18", "close": 12}
+    assert leading.entry_info(c, "Z") is None
+    series = [(1000, 2000, None)] * 15 + [(1000, 2000, 3000)] * 5
+    w = leading.flow_windows(series)
+    assert w["foreign10"] == 10 and w["trust20"] == 40 and w["dealer5"] == 15
+    assert w["dealer10"] is None and w["dealer20"] is None        # archived before the dealer leg was kept
+    assert leading.flow_grid(0.05, 100) == "up_buy" and leading.flow_grid(0.0, -1) == "up_sell"
+    assert leading.flow_grid(-0.1, 5) == "dn_buy" and leading.flow_grid(None, 5) is None
+    f = leading.divergence_flags([-100] * 5, 2000, 0.03, 0.02, 10, 12, 900, 1000)
+    assert f["sell_hold"] is True and f["buy_below"] is False and f["margin_hold"] is True and f["holders"] is None
+    assert leading.divergence_flags([-100, 50, -100, -100, -100], 2000, 0.03, 0.02, 10, 12, None, None)["sell_hold"] is False
+    assert leading.divergence_flags([-50] * 5, 2000, 0.03, 0.02, 10, 12, None, None)["sell_hold"] is False  # only -0.125 ADV
+    assert leading.divergence_flags([100] * 5, 2000, 0.0, 0.0, 12, 12, 900, 150)["buy_below"] is False      # at the high
+    assert leading.divergence_flags(None, None, 0.02, 0.0, 1, 1, 900, 150)["margin_hold"] is None           # too small a base
+    assert leading.revenue_momentum({f"2025-{m:02d}": 100.0 for m in range(1, 13)} | {"2026-01": 130.0,
+                                     "2026-02": 130.0, "2026-03": 130.0})["yoy3"] == pytest.approx(0.30)
+
+
+def test_mention_drift_counts_first_mentions_only():
+    from pipeline import leading
+    idx = pd.bdate_range("2024-01-01", periods=400)
+    bench = pd.DataFrame({"open": 100.0, "close": 100.0}, index=idx)
+    stock = bench.copy()
+    stock.loc[idx[201]:, ["open", "close"]] = 105.0      # opens the session after the mention 5% higher...
+    stock.loc[idx[202]:, "close"] = 110.25               # ...and closes another 5% up from there
+    frames = {"S": stock, "B": bench}
+    d = idx[200].strftime("%Y-%m-%d")
+    again = idx[205].strftime("%Y-%m-%d")                 # a repeat within 28 days does not count
+    out = leading.mention_drift([(d, "S"), (again, "S")], frames, {"S": "TW"}, {"TW": "B"}, min_n=1)
+    cell = next(c for c in out["cells"] if c["h"] == 5)
+    assert out["events"] == 1 and cell["n"] == 1 and cell["mean"] == pytest.approx(0.05, abs=1e-6)
+    few = leading.mention_drift([(d, "S")], frames, {"S": "TW"}, {"TW": "B"}, min_n=100)
+    assert "mean" not in few["cells"][0]
+
+
+def test_mention_timeline_contra_and_concentration():
+    from pipeline import build, research
+    today = dt.date(2026, 11, 18)
+    store = {"first": {f"S{i}": "2020-01-01" for i in range(10)},
+             "rows": [["2026-11-17", 0, "X"], ["2026-11-10", 0, "X"], ["2026-11-03", 0, "X"], ["2026-08-20", 0, "Y"],
+                      ["2026-11-16", 0, "Y"], ["2026-11-17", 0, "Z"]]}
+    assert build.mention_timeline(store, "X", today)["streak"] == 3
+    y = build.mention_timeline(store, "Y", today)
+    assert y["prior12"] == 1 and not y["first12"]
+    assert build.mention_timeline(store, "Z", today)["first12"] is True
+    assert build.mention_timeline({**store, "first": {"S0": "2026-10-01"}}, "Z", today)["first12"] is False
+    r = {"watch_first": ["停損距離 34%"], "risks": ["RSI 82（≥ 80）", "股價跌破季線"], "rsi": 82, "pe_pct": 0.9,
+         "margin_chg5": 0.06, "f5_adv": -0.3, "mentions": 3, "market": "US", "flags": {}}
+    got = build.contra(r)
+    assert got[0] == "停損距離 34%" and len(got) == 6 and sum("RSI" in t for t in got) == 1
+    assert all(not any(w in t for w in ("看多", "看空", "觀望")) for t in got)
+    rets = pd.DataFrame({"a": [0.01, -0.02, 0.03, 0.0] * 20, "b": [0.01, -0.02, 0.03, 0.001] * 20,
+                         "c": [0.0, 0.01, -0.01, 0.02] * 20})
+    cc = research.concentration(["金融", "金融", "電子"], ["A", "B", "C"], np.array([0.3, 0.2, 0.5]), rets)
+    assert cc["industries"][0] == ["金融", 0.5, 2] and cc["top_pair"][:2] == ["A", "B"]
+
+
+def test_regime_spread_and_industry_table():
+    from pipeline import research
+    rng = np.random.default_rng(3)
+    idx = pd.bdate_range("2023-01-02", periods=200)
+    cols = [f"S{i}" for i in range(30)]
+    closes = pd.DataFrame(np.exp(np.cumsum(rng.normal(0, 0.01, (200, 30)), axis=0)) * 100, index=idx, columns=cols)
+    fwd = closes.shift(-20) / closes - 1
+    states = pd.Series(["bull"] * 100 + ["bear"] * 100, index=idx)
+    panel = fwd.where(states.eq("bull"), pd.DataFrame(rng.normal(size=(200, 30)), index=idx, columns=cols), axis=0)
+    out = research.regime_spread(panel, closes, states)
+    assert out["bull"]["ic"] > 0.95 and abs(out["bear"]["ic"]) < 0.5 and out["bull"]["segments"] == 1
+    vals = closes * 1e6
+    ind = {c: ("甲" if i < 10 else "乙" if i < 25 else "丙") for i, c in enumerate(cols)}
+    rows = research.industry_table(closes.tail(61), vals.tail(61), ind, closes.mean(axis=1), min_n=6)
+    assert {r["name"] for r in rows} == {"甲", "乙"}                     # 丙 has only 5 members
+    assert sum(r["share"] for r in rows) == pytest.approx(25 / 25, rel=0.3) and all(r["best"] for r in rows)
+
+
+def test_podcast_chapters_platform_labels_and_summary_modes():
+    raw = ("<p>本集業配：某某課程優惠碼 ABC</p><p>06:54 解析台積電重訊買 OpenAI 事件</p>"
+           "<p>(12:30) 業配時間</p><p>收聽：Apple Podcasts、Spotify</p>")
+    ep = {"title": "EP577 台積電", "_raw": raw, "_chunks": media.chunks(raw)}
+    assert media.chapters(raw)[0] == ("06:54", "解析台積電重訊買 OpenAI 事件")
+    assert media.summary_text(ep, "chapters", set(ep["_chunks"])) == "06:54 解析台積電重訊買 OpenAI 事件"
+    assert media.summary_text(ep, "title", set(ep["_chunks"])) == ""
+    m = media.build_matchers({"AAPL": ["Apple", "蘋果"], "2330.TW": ["台積電"]})
+    text = media.episode_texts([ep])[0]
+    assert "AAPL" not in media.find_mentions(text, m)                 # "Apple Podcasts" is a link label
+    assert media.locate(m["2330.TW"], {**ep, "title": "EP577"}, set(ep["_chunks"]))["at"] == "06:54"
+    rows = media.mention_rows([{**ep, "date": "2026-11-10"}], m)
+    assert rows == [("2026-11-10", "2330.TW")]
+
+
+def test_new_preregistered_tests_have_progress():
+    from pipeline import build, research
+    ids = {t["id"] for t in research.PREREGISTERED}
+    assert {"rs_high", "podcast_drift", "regime_entry", "chip_divergence", "rev_accel", "industry_flow",
+            "valuation_pct", "exdiv_entry"} <= ids
+    st = build.preregistered_status({"podcast_drift": (3, 200), "regime_entry": (0, 3)})
+    assert all(t["need"] > 0 for t in st) and next(t for t in st if t["id"] == "podcast_drift")["have"] == 3
+
+
+
+def test_check_ai_flags_stale_numbers_banned_words_and_digest():
+    from pipeline import check_ai
+    amd = {"chg5d": 0.19, "pe": 116.1, "rsi": 61.0, "mentions": 3}
+    note = "超微近一週大漲 44.4%，本益比 127 倍，RSI 61，近兩週 3 集提及。"
+    errs = check_ai.stale_numbers(note, amd)
+    assert any("近一週大漲 44.4" in e for e in errs) and any("本益比" in e for e in errs) and len(errs) == 2
+    assert check_ai.stale_numbers("近一週上漲 19.0%，本益比 116 倍，3 集", amd) == []
+    good = {"data_date": "2026-11-10", "digest_sha": "abc",
+            "market": "".join(f"### 段落{i}\n" + "內容" * 40 + "\n" for i in range(4)),
+            "podcast": {"overview": "概況" * 40, "stocks": {"NVDA": "分析" * 30}}, "etf": "ETF" * 60}
+    assert check_ai.validate(good, "2026-11-10", ["NVDA"], digest_sha="abc") == []
+    assert any("digest_sha" in e for e in check_ai.validate(good, "2026-11-10", ["NVDA"], digest_sha="new"))
+    bad = {**good, "etf": "ETF 拉回可分批布局" + "ETF" * 60}
+    assert any("布局" in e for e in check_ai.validate(bad, "2026-11-10", ["NVDA"]))
+    ok = {**good, "etf": "以上不構成投資建議。" + "ETF" * 60}
+    assert check_ai.validate(ok, "2026-11-10", ["NVDA"]) == []

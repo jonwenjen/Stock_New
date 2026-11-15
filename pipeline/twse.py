@@ -124,6 +124,7 @@ def monthly_revenue() -> dict[str, dict]:
         ym = str(r.get("資料年月", ""))
         out[r["公司代號"].strip()] = {
             "industry": (r.get("產業別") or "").strip(),
+            "name": (r.get("公司名稱") or "").strip(),
             "month": f"{int(ym[:-2]) + 1911}-{ym[-2:]}" if len(ym) >= 4 else None,
             "revenue": num(r.get("營業收入-當月營收")),  # thousand TWD
             "rev_mom": num(r.get("營業收入-上月比較增減(%)")),
@@ -268,14 +269,25 @@ def maint_status(ratio: float | None) -> str:
     return "斷頭壓力大"
 
 
-def inst_stocks(date: str) -> dict[str, tuple[float, float, float]]:
-    """Per-stock net shares (foreign, trust, dealer) on a given date."""
+def inst_stocks(date: str) -> dict[str, tuple[float, ...]]:
+    """Per-stock net shares (foreign, trust, dealer, dealer own account, dealer hedging) on a date.
+
+    Dealers trade for their own account and to hedge the warrants they issue; the hedging leg is
+    mechanical (54% of dealer volume in listed stocks on 2026-11-13), so only the own-account part
+    is shown per stock (review 2026-11-14d, C10c)."""
     j = _rwd("fund/T86", date=date.replace("-", ""), selectType="ALLBUT0999")
     f = j["fields"]
     i_f, i_fd = f.index("外陸資買賣超股數(不含外資自營商)"), f.index("外資自營商買賣超股數")
     i_t, i_d = f.index("投信買賣超股數"), f.index("自營商買賣超股數")
-    return {r[0].strip(): ((num(r[i_f]) or 0) + (num(r[i_fd]) or 0), num(r[i_t]) or 0, num(r[i_d]) or 0)
-            for r in j["data"]}
+    i_do = f.index("自營商買賣超股數(自行買賣)") if "自營商買賣超股數(自行買賣)" in f else None
+    i_dh = f.index("自營商買賣超股數(避險)") if "自營商買賣超股數(避險)" in f else None
+    out = {}
+    for r in j["data"]:
+        row = ((num(r[i_f]) or 0) + (num(r[i_fd]) or 0), num(r[i_t]) or 0, num(r[i_d]) or 0)
+        if i_do is not None and i_dh is not None:
+            row += (num(r[i_do]) or 0, num(r[i_dh]) or 0)
+        out[r[0].strip()] = row
+    return out
 
 
 def day_quotes(date: str) -> dict[str, tuple]:

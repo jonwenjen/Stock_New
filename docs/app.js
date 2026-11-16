@@ -1945,7 +1945,7 @@
           h("p", { class: "small" }, "報酬、對比指數報酬、同類平均與同類排名採用鉅亨網基金頁提供的晨星資料（含配息）；年化波動、最大回檔、Sharpe、正報酬月份比例由本站用每日淨值自行計算。評分把五個面向各換算成 0–100 分再加權：同類排名 35%（近 1／3／5 年贏過同類的比例，3 年權重最高）、3 年年化報酬勝過同類平均 20%（±5 個百分點對應 0／100 分；同類平均和排名矛盾時改用對比指數）、Sharpe 20%、抗跌 15%、穩定度 10%（6 個月到 5 年各期間贏過一半同類的比例）；管理費超過 1% 每 0.5 個百分點扣 5 分。"),
           h("p", { class: "small muted" }, "限制：淨值不含配息還原，配息級別的回檔會被高估，所以名單優先選累積級別；Sharpe 的無風險利率依計價幣別取固定值；過去績效不代表未來。")),
         h("div", { class: "panel stack" }, h("h3", {}, "更新方式與 AI 觀點"),
-          h("p", { class: "small" }, "每週三由 Claude 排程自動執行：抓取資料、計算分數、撰寫觀點，然後直接推送到 GitHub。「AI 觀點」「Podcast 話題解讀」「ETF 觀察」「基金觀察」四段文字由當次執行的 Claude 只根據本頁同一批數據撰寫，並經過程式檢查資料日期一致才會發布；其餘數字與判讀全部由固定規則計算。")),
+          h("p", { class: "small" }, "每週一、三、五清晨約 5 點（台北時間）由 Claude 排程自動執行：抓取資料、計算分數、撰寫觀點，然後直接推送到 GitHub。「AI 觀點」「Podcast 話題解讀」「ETF 觀察」「基金觀察」四段文字由當次執行的 Claude 只根據本頁同一批數據撰寫，並經過程式檢查資料日期一致才會發布；其餘數字與判讀全部由固定規則計算。")),
         tools.length ? h("div", { class: "panel" }, h("h3", {}, "參考的開源投資與 AI 工具（GitHub 星數排序）"), table([
           { key: "n", label: "專案", left: true, cell: (r) => h("a", { href: r.url, target: "_blank", rel: "noopener noreferrer" }, r.name) },
           { key: "s", label: "星數", cell: (r) => h("span", { class: "num" }, nf(0).format(r.stars)) },
@@ -2052,7 +2052,7 @@
     document.getElementById("stamp").replaceChildren(
       h("span", {}, "資料日 ", h("b", { class: "num" }, S.data_date)),
       h("span", {}, "更新於 ", h("b", { class: "num" }, S.generated_at.slice(0, 16).replace("T", " "))),
-      h("span", {}, "下次更新 ", h("b", { class: "num" }, S.next_update + "（三）")),
+      h("span", {}, "下次更新 ", h("b", { class: "num" }, S.next_update + "（" + "日一二三四五六"[new Date(S.next_update + "T00:00:00").getDay()] + "）")),
       (() => {
         const bad = S.sources.filter((x) => !x.ok);
         const fixed = Object.keys((S.quality || {}).cleaned || {}).length;

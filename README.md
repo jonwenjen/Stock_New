@@ -1,6 +1,6 @@
 # 週三選股雷達
 
-每週三由 Claude 自動更新的台股＋美股研究儀表板：外資與融資動向、名人／議員／董監持股、財報指標、
+每週一、三、五清晨由 Claude 自動更新的台股＋美股研究儀表板：外資與融資動向、名人／議員／董監持股、財報指標、
 ETF、基金績效評估、Podcast 熱議與分析、未來一週／一月／一季趨勢預測，以及精選 20 檔個股。純靜態網站，放在
 GitHub Pages 即可，不需要伺服器，也不使用付費 API。
 
@@ -35,14 +35,14 @@ GitHub Pages 即可，不需要伺服器，也不使用付費 API。
 
 ## 更新方式
 
-每週三由 Claude 的排程工作在雲端執行，使用 Claude 訂閱額度，不經 GitHub Actions、不呼叫付費 API：
+每週一、三、五由 Claude 的排程工作在雲端執行，使用 Claude 訂閱額度，不經 GitHub Actions、不呼叫付費 API：
 
 1. 依 `WEEKLY_UPDATE.md` 抓取資料並計算分數（`python -m pipeline.build`）
 2. 由當次執行的 Claude 根據同一批數據撰寫「AI 觀點」「Podcast 話題解讀」「ETF 觀察」「基金觀察」，
    寫入 `docs/data/ai.json`，並以 `python -m pipeline.check_ai` 檢查資料日期與結構
 3. 直接提交並推送到 `main`
 
-排程每週三台北時間 21:37 喚醒一個已掛載本 repo 的專用工作階段「週三選股雷達 每週更新」。
+排程每週一、三、五台北時間 04:47 喚醒一個已掛載本 repo 的專用工作階段「選股雷達 一三五更新」（約 05:15 完成）。
 可在 Claude Code（claude.ai/code）查看每次執行的過程與回報，並在排程工作清單中暫停或手動觸發。
 要改更新內容或撰寫規則，編輯 `WEEKLY_UPDATE.md` 即可，下次執行就會生效。
 

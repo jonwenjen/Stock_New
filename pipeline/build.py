@@ -1926,7 +1926,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     write_json(DATA / "summary.json", {
         "generated_at": now.isoformat(timespec="seconds"), "data_date": trading_days[-1],
         "calendar": calendar, "quality": quality,
-        "next_update": next_wednesday(today).isoformat(), "quick": QUICK,
+        "next_update": next_update(today).isoformat(), "quick": QUICK,
         "indices": indices_out, "tw_flow": tw_flow, "narrative": narrative,
         "picks": [slim(r) for r in picks],
         "bullish": [slim(r) for r in bullish], "bearish": [slim(r) for r in bearish],
@@ -3119,8 +3119,12 @@ def contra(r: dict) -> list[str]:
     return out
 
 
-def next_wednesday(d: dt.date) -> dt.date:
-    return d + dt.timedelta(days=(2 - d.weekday()) % 7 or 7)
+UPDATE_DAYS = (0, 2, 4)  # the scheduled run: Monday, Wednesday and Friday at about 05:00 Taipei
+
+
+def next_update(d: dt.date) -> dt.date:
+    """The next scheduled run after day d."""
+    return next(d + dt.timedelta(days=k) for k in range(1, 8) if (d + dt.timedelta(days=k)).weekday() in UPDATE_DAYS)
 
 
 def half_up(x: float, nd: int = 0, scale: int = 1) -> int | float:

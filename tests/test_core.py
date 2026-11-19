@@ -1442,3 +1442,24 @@ def test_check_ai_flags_stale_numbers_banned_words_and_digest():
     assert any("布局" in e for e in check_ai.validate(bad, "2026-11-10", ["NVDA"]))
     ok = {**good, "etf": "以上不構成投資建議。" + "ETF" * 60}
     assert check_ai.validate(ok, "2026-11-10", ["NVDA"]) == []
+
+
+def test_alert_events_categories(tmp_path, monkeypatch):
+    import json
+    from pipeline import build
+    monkeypatch.setattr(build, "DATA", tmp_path)
+    (tmp_path / "history" / "weekly").mkdir(parents=True)
+    (tmp_path / "history" / "weekly" / "2026-W46.json").write_text(json.dumps(
+        {"ranks": {"A": [40, 119], "B": [10, 119]}, "alerts": {"A": ["up"]}}), encoding="utf-8")
+    idx = pd.bdate_range("2026-08-03", periods=80)
+    c = np.r_[np.full(76, 100.0), [90.0, 95.0, 105.0, 130.0]]                 # back above the 60-day line, far above MA20
+    df = pd.DataFrame({"open": c - 1, "high": c + 1, "low": c - 2, "close": c, "volume": np.r_[np.full(79, 1e6), 3e6]}, index=idx)
+    df.loc[idx[-1], ["open", "low"]] = [100.0, 99.0]
+    tf = scoring.tech_frame(df)
+    recs = [{"symbol": "A", "market": "TW", "rank": [12, 119], "factors": {"fund": 0.6, "chips": -0.5}},
+            {"symbol": "B", "market": "TW", "rank": [45, 119], "factors": {}}]
+    build.tag_alert_events(recs, {"A": df, "B": df}, {"A": tf, "B": tf}, "2026-11-18")
+    a, b = recs[0]["alerts"], recs[1]["alerts"]
+    assert {"up", "hot", "div"} <= set(a["cats"]) and a["weeks"]["up"] == 2 and a["rank_chg"] == 28
+    assert "dn" in b["cats"] and b["rank_chg"] == -35
+    assert any("長紅" in t for t in a["items"])

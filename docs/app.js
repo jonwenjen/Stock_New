@@ -1685,22 +1685,54 @@
     },
 
     async alerts() {
-      const list = (rows, kind) => table([
-        { key: "n", label: "個股", left: true, cell: (r) => h("span", {}, nameCell(r), " ", mkChip(r.market, r.symbol)) },
-        { key: "c", label: "收盤", cell: (r) => h("span", { class: "num" }, px(r.close)) },
-        { key: "w", label: "週漲跌", cell: (r) => numEl(pct(r.chg5d), r.chg5d) },
+      // Event alerts (2026-11-19): what changed, each category shown with what the back-test found.
+      const CATS = [
+        ["up", "剛轉強／站上季線", "台股：排名一週上升 20 名以上（美股 10 名）的股票，之後 20 日平均比同日中位數多約 1.9%（t 2.0），但回檔也較深；剛站上季線則沒有可測的差異。美股都沒有證據。"],
+        ["dn", "剛轉弱／跌破季線", "排名一週大跌之後，和中位數沒有可測的差異；剛跌破季線的台股之後略弱（約 −0.7%，t −1.0），不顯著。這裡是讓你重新檢查，不是賣出訊號。"],
+        ["hot", "波動與乖離", "台股高於月線 3 倍 ATR 以上的股票，之後 20 日平均反而多約 2.9%（t 2.9），但回檔較深；低於月線 3 倍 ATR 的少約 3.6%（t −3.2）。爆量長紅之後多約 3.6%（t 2.5）。美股都沒有可測差異。乖離大代表波動大，不代表一定會跌。"],
+        ["div", "基本面與籌碼背離", "基本面分 ≥ 0.5 而籌碼分 ≤ −0.4（或相反）。個股籌碼資料只有約 100 個交易日，還無法檢驗之後的表現，只描述。"]];
+      const p = parseHash().p;
+      const state = { m: p.get("m") || "ALL", c: CATS.some(([k]) => k === p.get("c")) ? p.get("c") : "up" };
+      const keep = () => { const q = new URLSearchParams(); if (state.m !== "ALL") q.set("m", state.m); if (state.c !== "up") q.set("c", state.c);
+        history.replaceState(null, "", "#alerts" + (q.toString() ? "?" + q : "")); };
+      const rows = U.filter((r) => r.kind !== "etf" && r.alerts && r.alerts.cats.length);
+      const inMk = (r) => state.m === "ALL" || r.market === state.m;
+      const evCell = (r, cat) => h("div", { class: "stack", style: "gap:3px" },
+        h("span", {}, r.alerts.items.join("；")),
+        cat && (r.alerts.weeks || {})[cat] > 1 ? h("span", { class: "small muted" }, `連續 ${r.alerts.weeks[cat]} 週在這一類`) : null);
+      const cols = (cat) => [
+        { key: "n", label: "個股", left: true, cell: (r) => h("span", {}, star(r.symbol), " ", nameCell(r), " ", mkChip(r.market, r.symbol)) },
+        { key: "c", label: "收盤", val: (r) => r.close, cell: (r) => h("span", { class: "num" }, px(r.close)) },
+        { key: "w", label: "週漲跌", val: (r) => r.chg5d, cell: (r) => numEl(pct(r.chg5d), r.chg5d) },
         rankCol,
-        { key: "t", label: "籌碼分", tip: "外資、投信、融資（只有台股）", val: (r) => r.tactical, cell: (r) => h("span", { class: "num" }, ok(r.tactical) ? signed(r.tactical, 2) : "–") },
-        { key: "s", label: "基本面分", tip: "財報與申報持股", val: (r) => r.structural, cell: (r) => h("span", { class: "num" }, ok(r.structural) ? signed(r.structural, 2) : "–") },
-        { key: "a", label: "ATR%", tip: "近 14 日平均每日波動幅度", val: (r) => r.plan.atr_pct, cell: (r) => h("span", { class: "num" }, ok(r.plan.atr_pct) ? num(r.plan.atr_pct * 100, 1) + "%" : "–") },
-        { key: "p", label: "部位上限", tip: "願意承擔 1% 資金虧損時的最大部位", val: (r) => r.plan.size, cell: (r) => h("span", { class: "num" }, ok(r.plan.size) ? num(r.plan.size * 100, 0) + "%" : "–") },
-        { key: "y", label: kind === "up" ? "主要理由" : "主要風險", left: true, wrap: true, cell: (r) => h("span", {}, (kind === "up" ? r.reasons : r.risks).slice(0, 2).join("；") || "–",
-          r.setup ? h("span", { class: "chip", style: "margin-left:6px" }, r.setup) : null) }],
-      rows, { onRow: (r) => openDrawer(r.symbol) });
+        { key: "e", label: "發生了什麼", left: true, wrap: true, cell: (r) => evCell(r, cat) },
+        { key: "g", label: "距季線", tip: "收盤相對 60 日均線", val: (r) => r.alerts.ma60_gap, cell: (r) => numEl(ok(r.alerts.ma60_gap) ? pct(r.alerts.ma60_gap) : "–", r.alerts.ma60_gap) },
+        { key: "s", label: "停損參考", tip: "現價 − 2.5 倍 ATR 與支撐 − 0.5 倍 ATR 取低者；控制虧損用，不是預測", val: (r) => r.plan && r.plan.stop, cell: (r) => h("span", { class: "num" }, r.plan && ok(r.plan.stop) ? px(r.plan.stop) : "–") }];
+      const box = h("div", { class: "stack" });
+      const mine = () => rows.filter((r) => WATCH.has(r.symbol) && inMk(r));
+      const watchBox = h("div");
+      const tabs = h("div", { class: "seg", role: "group", "aria-label": "警報類別" });
+      const draw = () => {
+        keep();
+        tabs.replaceChildren(...CATS.map(([k, t]) => h("button", { type: "button", "aria-pressed": String(k === state.c), onclick: () => { state.c = k; draw(); } },
+          `${t}（${rows.filter((r) => inMk(r) && r.alerts.cats.includes(k)).length}）`)));
+        const [, title, note] = CATS.find(([k]) => k === state.c);
+        const list = rows.filter((r) => inMk(r) && r.alerts.cats.includes(state.c)).sort((a, b) => a.rank[0] / a.rank[1] - b.rank[0] / b.rank[1]);
+        box.replaceChildren(h("h3", {}, title), list.length ? table(cols(state.c), list, { onRow: (r) => openDrawer(r.symbol) }) : h("div", { class: "empty" }, "這一類本週沒有個股"),
+          h("p", { class: "chart-note" }, "過去 3 年回測：" + note));
+        const w = mine();
+        watchBox.replaceChildren(w.length ? h("div", { class: "panel stack" }, h("h3", {}, "★ 自選股的警報"),
+          table(cols(null), w, { onRow: (r) => openDrawer(r.symbol) })) : null);
+      };
+      const seg = h("div", { class: "seg", role: "group", "aria-label": "市場" }, [["ALL", "全部"], ["TW", "台股"], ["US", "美股"]].map(([k, t]) =>
+        h("button", { type: "button", "aria-pressed": String(k === state.m), onclick: (e) => {
+          state.m = k; seg.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b === e.currentTarget))); draw(); } }, t)));
+      draw();
       return [
-        head("漲跌預警", "依同市場排名，列出目前相對最強與最弱的個股。排名反映的是相對強弱，不是保證。ATR% 越高的股票波動越大，同樣的風險預算下部位要越小。"),
-        h("div", { class: "panel" }, h("h3", {}, "相對最強：同市場排名最前的 12 檔"), list(S.bullish, "up")),
-        h("div", { class: "panel" }, h("h3", {}, "相對最弱：同市場排名最後的 12 檔"), list(S.bearish, "down")),
+        h("div", { class: "sec-head" }, head("漲跌預警", "這週發生了什麼：排名大幅變動、站上或跌破季線、乖離或爆量、基本面與籌碼方向相反。全部是描述，不計分；每一類下方附過去 3 年的回測結果。"), seg),
+        watchBox,
+        h("div", { class: "panel stack" }, tabs, box),
+        h("p", { class: "small muted" }, "回測用今天的名單、2023–2026 年每週一期，數字只是上限；兩個市場共 24 個檢定，即使全部無效也預期有約 1 個 |t| ≥ 2。月線交叉與 MACD 翻正、翻負也測過，之後的表現沒有差異，所以不列為警報。排名變化和上一個週次的快照比較；網站每週一、三、五更新，同一週內的變化在下一週才會算進來。"),
       ];
     },
 
@@ -2058,7 +2090,7 @@
         const fixed = Object.keys((S.quality || {}).cleaned || {}).length;
         return h("a", { class: "health" + (bad.length ? " warn" : ""), href: "#method", title: bad.length ? "未取得：" + bad.map((x) => x.name).join("、") : "本次更新所有資料來源都成功取得" },
           (bad.length ? `資料來源 ${S.sources.length - bad.length}/${S.sources.length}，${bad.length} 項沿用舊資料` : `資料來源 ${S.sources.length} 項正常`) +
-          (fixed ? `・${fixed} 檔價格經清理還原` : ""));
+          (fixed ? `・${fixed} 檔價格已清理異常並還原除權息` : ""));
       })());
     if (!booted) window.addEventListener("hashchange", route);
     booted = true;

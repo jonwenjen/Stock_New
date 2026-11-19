@@ -1700,6 +1700,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         ev_list, frames, {s_: m_["market"] for s_, m_ in meta.items()}, {"TW": "0050.TW", "US": "SPY"}), None)
     safe("個股融資存檔", archive_margins, 0)
     tag_divergence(records, flow_map, frames, margin_ref)
+    safe("漲跌預警事件（排名變化、季線、乖離、爆量、背離）", lambda: tag_alert_events(records, frames, tframes, trading_days[-1]), None)
     prereg_extra = prereg_progress(ev_store, meta, states)
     weekly = safe("每週快照與本週變化", lambda: weekly_snapshot(trading_days[-1], mkt, lead, picks, records,
                                                                  industries, flags), None)
@@ -2250,6 +2251,73 @@ def tag_divergence(records: list[dict], flow_map: dict, frames: dict, margin_ref
                                             (margin_ref.get(r["code"]) or {}).get("margin"), big, small)
 
 
+ALERT_RANK = {"TW": 20, "US": 10}  # a jump of this many places in a week (about a sixth of each list)
+
+
+def tag_alert_events(records: list[dict], frames: dict, tframes: dict, data_date: str) -> None:
+    """Event alerts for the 漲跌預警 page (review of 2026-11-19, tested on three years of prices first):
+
+    up  剛轉強: rank up ALERT_RANK places since the last snapshot of an earlier week, or newly in the top 15;
+                 or the close crossed above the 60-day average within the last 3 sessions.
+    dn  剛轉弱: the mirror (down that many places, or out of the top 30; crossed below the 60-day average).
+    hot 波動與乖離: (close - MA20) / ATR at least 3 either way, or volume at least twice its 20-day average
+                 with a long candle (body >= 60% of the range).
+    div 背離: fundamental score >= 0.5 with chip score <= -0.4, or the reverse.
+    Weight 0 everywhere; the page says what the back-test found. Moving-average-20 and MACD flips were
+    tested too and showed nothing, so they are not alerts. `weeks` counts consecutive snapshots with the
+    same category, this one included."""
+    folder = DATA / "history" / "weekly"
+    y, w, _ = dt.date.fromisoformat(data_date).isocalendar()
+    key = f"{y}-W{w:02d}"
+    snaps = [read_json(p, {}) for p in sorted(folder.glob("*.json")) if p.stem < key]
+    prev_ranks = (snaps[-1].get("ranks") or {}) if snaps else {}
+    for r in records:
+        tf, df = tframes.get(r["symbol"]), frames.get(r["symbol"])
+        if tf is None or df is None or len(df) < 61:
+            continue
+        cats, items = [], []
+        rk, pr = r.get("rank"), prev_ranks.get(r["symbol"])
+        chg = (pr[0] - rk[0]) if rk and pr else None
+        lim = ALERT_RANK.get(r["market"], 20)
+        if chg is not None:
+            if chg >= lim or (rk[0] <= 15 < pr[0]):
+                cats.append("up"); items.append(f"排名 {pr[0]} → {rk[0]}（一週 {chg:+d} 名）")
+            elif -chg >= lim or (pr[0] <= 30 < rk[0]):
+                cats.append("dn"); items.append(f"排名 {pr[0]} → {rk[0]}（一週 {chg:+d} 名）")
+        c, ma60 = tf["close"], tf["ma60"]
+        above = (c > ma60).tail(4).tolist()
+        if len(above) == 4 and above[-1] and not above[0]:
+            cats.append("up"); items.append("3 個交易日內站上季線")
+        elif len(above) == 4 and above[0] and not above[-1]:
+            cats.append("dn"); items.append("3 個交易日內跌破季線")
+        last = tf.iloc[-1]
+        dev = (last["close"] - last["ma20"]) / last["atr"] if last["atr"] and not pd.isna(last["ma20"]) else None
+        if dev is not None and abs(dev) >= 3:
+            cats.append("hot"); items.append(f"距月線 {dev:+.1f} 倍 ATR")
+        v = df["volume"].astype(float)
+        rvol = float(v.iloc[-1] / v.iloc[-21:-1].mean()) if v.iloc[-21:-1].mean() > 0 else None
+        o_, h_, l_, c_ = (float(df[k].iloc[-1]) for k in ("open", "high", "low", "close"))
+        body = (c_ - o_) / (h_ - l_) if h_ > l_ else 0.0
+        if rvol is not None and rvol >= 2 and abs(body) >= 0.6:
+            cats.append("hot"); items.append(f"量比 {rvol:.1f} 倍、{'長紅' if body > 0 else '長黑'}")
+        fa, ch = (r.get("factors") or {}).get("fund"), (r.get("factors") or {}).get("chips")
+        if fa is not None and ch is not None and ((fa >= 0.5 and ch <= -0.4) or (ch >= 0.5 and fa <= -0.4)):
+            cats.append("div"); items.append(f"基本面 {fa:+.2f}、籌碼 {ch:+.2f}")
+        cats = list(dict.fromkeys(cats))
+        weeks = {}
+        for cat in cats:
+            n_ = 1
+            for sn in reversed(snaps):
+                if cat in ((sn.get("alerts") or {}).get(r["symbol"]) or []):
+                    n_ += 1
+                else:
+                    break
+            weeks[cat] = n_
+        r["alerts"] = {"cats": cats, "items": items, "weeks": weeks, "rank_chg": chg,
+                       "atr_dev": None if dev is None else round(float(dev), 2), "rvol": None if rvol is None else round(rvol, 2),
+                       "ma60_gap": round(float(last["close"] / last["ma60"] - 1), 4) if last["ma60"] else None}
+
+
 def weekly_snapshot(data_date: str, mkt: dict | None, lead: dict, picks: list[dict], records: list[dict],
                     industries: list[dict] | None = None, flags: dict | None = None) -> dict:
     """One snapshot per ISO week, history/weekly/<YYYY-Www>.json (review 2026-11-14, product-1).
@@ -2272,6 +2340,7 @@ def weekly_snapshot(data_date: str, mkt: dict | None, lead: dict, picks: list[di
             "picks": [{"symbol": r["symbol"], "name": r["name"], "rank": r.get("rank"),
                        "exdiv": (((flags or {}).get(r["code"]) or {}).get("exdiv") or {}).get("date")} for r in picks],
             "ranks": {r["symbol"]: r["rank"] for r in records if r.get("rank")},
+            "alerts": {r["symbol"]: r["alerts"]["cats"] for r in records if (r.get("alerts") or {}).get("cats")},
             # archived for the pre-registered tests of review 2026-11-14d, not shown
             "div": {k: sorted(r["symbol"] for r in records if (r.get("div") or {}).get(k))
                     for k in ("sell_hold", "buy_below", "holders", "margin_hold")},

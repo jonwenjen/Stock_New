@@ -1034,7 +1034,21 @@
         })(),
         (S.picks_diff || {}).ref_date ? h("p", { class: "small" }, `與 ${S.picks_diff.ref_date} 的名單相比：新進 ${S.picks_diff.new} 檔（標示 NEW）` +
           (S.picks_diff.dropped.length ? `；移出 ${S.picks_diff.dropped.map((x) => x.name).join("、")}。` : "；沒有移出。") + "↑↓ 是名次變化，「連續 n 週」是連續上榜的週數。") : null,
-        grid, h("div", { id: "picks-risk" }, portfolioPanel()), budgetPanel(), track];
+        grid, h("div", { id: "picks-risk" }, portfolioPanel()), budgetPanel(), track,
+        (() => {  // the first version's "past picks so far", back as a rough, immediate view (2026-11-19)
+          const rows = [...(S.picks_track || [])].reverse().flatMap((c) => ["TW", "US"].filter((m) => c[m]).map((m) => ({ date: c.date, m, ...c[m] })));
+          if (!rows.length) return null;
+          return h("div", { class: "panel stack" }, h("h3", {}, "各週名單至今（粗略）"),
+            table([{ key: "d", label: "名單日", left: true, cell: (r) => h("span", { class: "num" }, r.date) },
+              { key: "m", label: "市場", left: true, cell: (r) => mkChip(r.m) },
+              { key: "n", label: "檔數", cell: (r) => h("span", { class: "num" }, r.n) },
+              { key: "t", label: "經過交易日", cell: (r) => h("span", { class: "num" }, r.days) },
+              { key: "r", label: "名單平均", cell: (r) => numEl(pct(r.ret, 2), r.ret) },
+              { key: "b", label: "同期指數", tip: "台股對加權指數，美股對 S&P 500（價格指數，不含股利）", cell: (r) => numEl(pct(r.bench, 2), r.bench) },
+              { key: "x", label: "相差", cell: (r) => numEl(pct(r.excess, 2), r.excess) },
+              { key: "w", label: "贏過指數的檔數比例", cell: (r) => h("span", { class: "num" }, ok(r.win) ? num(r.win * 100, 0) + "%" : "–") }], rows, { csv: "picks_so_far" }),
+            h("p", { class: "chart-note" }, "每份名單從名單日收盤到最新收盤的等權平均，和同期的加權指數或 S&P 500 比較。不扣交易成本、指數不含股利、不管後來有沒有移出名單，所以只是粗略的即時參考；正式的成績看上面「照著精選操作的實際結果」（隔日開盤進出、扣成本、滿 26 週才下結論）。名單才經過幾天時，差異幾乎都是雜訊。"));
+        })()];
     },
 
     async compare() {
@@ -1706,6 +1720,7 @@
         { key: "w", label: "週漲跌", val: (r) => r.chg5d, cell: (r) => numEl(pct(r.chg5d), r.chg5d) },
         rankCol,
         { key: "e", label: "發生了什麼", left: true, wrap: true, cell: (r) => evCell(r, cat) },
+        { key: "a", label: "ATR%", tip: "近 14 日平均每日波動幅度。乖離大但 ATR% 也高的股票，本來就波動大", val: (r) => r.plan && r.plan.atr_pct, cell: (r) => h("span", { class: "num" }, r.plan && ok(r.plan.atr_pct) ? num(r.plan.atr_pct * 100, 1) + "%" : "–") },
         { key: "g", label: "距季線", tip: "收盤相對 60 日均線", val: (r) => r.alerts.ma60_gap, cell: (r) => numEl(ok(r.alerts.ma60_gap) ? pct(r.alerts.ma60_gap) : "–", r.alerts.ma60_gap) },
         { key: "s", label: "停損參考", tip: "現價 − 2.5 倍 ATR 與支撐 − 0.5 倍 ATR 取低者；控制虧損用，不是預測", val: (r) => r.plan && r.plan.stop, cell: (r) => h("span", { class: "num" }, r.plan && ok(r.plan.stop) ? px(r.plan.stop) : "–") }];
       const box = h("div", { class: "stack" });

@@ -679,7 +679,7 @@
       const pctv = (v, d = 1) => (ok(v) ? pct(v, d) : "–");
       const KV = r.kind === "etf"
         ? [["關鍵數據", [["類別", r.industry], ["近一月", pct(r.r20)], ["近一季", pct(r.r60)], ["今年以來", pct(r.ytd)], ["近一年" + (r.market === "TW" ? "（含息）" : "（不含息）"), pct(r.r250)],
-          ["近 12 月配息率", ok(r.dist12) ? num(r.dist12 * 100, 1) + "%" : "–"], ["折溢價", ok(r.prem) ? signed(r.prem, 2) + "%" + (r.nav_time ? `（${r.nav_time.slice(0, 5)}）` : "") : "–"],
+          ["近 12 月配息率", ok(r.dist12) ? num(r.dist12 * 100, 1) + "%" : "–"], ["折溢價", ok(r.prem) ? signed(r.prem, 2) + "%" + (r.nav_date ? `（沿用 ${r.nav_date.slice(5)}）` : r.nav_time ? `（${r.nav_time.slice(0, 5)}）` : "") : "–"],
           ["規模", ok(r.aum) ? nf(0).format(r.aum / 1e8) + " 億" : "–"], ["單日申購贖回", ok(r.flow_day) ? signed(r.flow_day / 1e8, 1) + " 億" : "–"],
           ["一年最大回檔", pct(r.mdd)], ["年化波動", ok(r.vol_ann) ? num(r.vol_ann * 100, 0) + "%" : "–"], ["RSI(14)", num(r.rsi, 0)],
           ["外資 5 日", ok(r.foreign5) ? signed(r.foreign5, 0) + " 張" : "–"], ["投信 5 日", ok(r.trust5) ? signed(r.trust5, 0) + " 張" : "–"]]]]
@@ -705,7 +705,7 @@
             ["外資持股比例", ok(r.qfii) ? num(r.qfii, 1) + "%" : "–"], ["外資持股 20 日", ok(r.qfii_chg20) ? signed(r.qfii_chg20, 2) + " pp" : "–"],
             ["外資尚可投資", ok(r.qfii_room) ? num(r.qfii_room, 1) + "%" : "–"],
             ["董監質押比", ok(r.insider_pledge) ? pct(r.insider_pledge).replace("+", "") : "–"],
-            ["當沖比率（最新一日）", ok(r.daytrade) ? num(r.daytrade * 100, 0) + "%" : "–"]]],
+            ["當沖比率（最新一日）", ok(r.daytrade) ? num(r.daytrade * 100, 0) + "%" + (r.daytrade_date ? `（${r.daytrade_date.slice(5)}）` : "") : "–"]]],
           ["技術", [["RSI(14)", num(r.rsi, 0)], ["純超額強度", ok(r.imom) ? signed(r.imom, 1) : "–"], ["距 52 週高點", ok(r.hi52) ? pct(r.hi52 - 1) : "–"]]]]
         : [["基本面", [["本益比 (TTM)", num(r.pe, 1)], ["EPS (TTM)", num(r.eps_ttm, 2)], ["EPS 年增", pctRaw(r.eps_yoy, 0)], ["營收年增", pctRaw(r.rev_yoy, 0)]]],
           ["申報持股", [["議員買 / 賣", `${r.congress_buys ?? 0} / ${r.congress_sells ?? 0}`], ["名人基金淨加碼", signed(r.guru_net, 0)],
@@ -1831,7 +1831,7 @@
         { key: "y", label: "今年", val: (r) => r.ytd, cell: (r) => numEl(pct(r.ytd), r.ytd) },
         { key: "1y", label: "一年", tip: "台股 ETF 含配息還原；美股 ETF 是價格報酬（不含配息），兩者不宜直接比", val: (r) => r.r250, cell: (r) => numEl(pct(r.r250), r.r250) },
         { key: "dv", label: "近 12 月配息率", tip: "僅台股 ETF：由除息參考價推算", val: (r) => r.dist12, cell: (r) => h("span", { class: "num" }, ok(r.dist12) ? num(r.dist12 * 100, 1) + "%" : "–") },
-        { key: "pm", label: "折溢價", tip: "市價相對預估淨值；溢價 1% 以上等於多付錢", val: (r) => r.prem, cell: (r) => h("span", { class: "num" + (ok(r.prem) && Math.abs(r.prem) >= 1 ? " warn-text" : "") }, ok(r.prem) ? signed(r.prem, 2) + "%" : "–") },
+        { key: "pm", label: "折溢價", tip: "市價相對預估淨值；溢價 1% 以上等於多付錢", val: (r) => r.prem, cell: (r) => h("span", { class: "num" + (r.nav_date ? " muted" : ok(r.prem) && Math.abs(r.prem) >= 1 ? " warn-text" : ""), title: r.nav_date ? `本次未取得，沿用 ${r.nav_date} 的折溢價` : null }, ok(r.prem) ? signed(r.prem, 2) + "%" : "–") },
         { key: "au", label: "規模（億）", val: (r) => r.aum, cell: (r) => h("span", { class: "num" }, ok(r.aum) ? nf(0).format(r.aum / 1e8) : "–") },
         { key: "d", label: "一年最大回檔", val: (r) => r.mdd, cell: (r) => numEl(pct(r.mdd), r.mdd) },
         { key: "v", label: "年化波動", val: (r) => r.vol_ann, cell: (r) => h("span", { class: "num" }, ok(r.vol_ann) ? num(r.vol_ann * 100, 0) + "%" : "–") },
@@ -1986,7 +1986,7 @@
             ...["TW", "US"].filter((mk) => (S.quality.behind || {})[mk] && S.quality.behind[mk].length).map((mk) =>
               h("p", { class: "small" }, `${mk === "TW" ? "台股" : "美股"}最後一根 K 棒比同市場晚的標的：${S.quality.behind[mk].join("、")}（照常評分，週漲跌可能差一天）。`)))) : null,
         h("div", { class: "panel" }, h("h3", {}, "本週資料來源狀態"), h("div", { class: "src" }, S.sources.map((s) => [
-          h("span", { class: "dot " + (s.ok ? "ok" : "bad") }, s.ok ? "✓ 成功" : "✕ 未取得"),
+          h("span", { class: "dot " + (s.ok ? "ok" : "bad") }, s.ok ? (s.fb ? "↺ 備援取得" : "✓ 成功") : "✕ 未取得"),
           h("span", {}, s.url ? h("a", { href: s.url, target: "_blank", rel: "noopener noreferrer" }, s.name) : s.name, s.note ? h("span", { class: "muted" }, "　" + s.note) : null)]))),
         h("div", { class: "panel stack" }, h("h3", {}, "基金績效怎麼評"),
           h("p", { class: "small" }, "報酬、對比指數報酬、同類平均與同類排名採用鉅亨網基金頁提供的晨星資料（含配息）；年化波動、最大回檔、Sharpe、正報酬月份比例由本站用每日淨值自行計算。評分把五個面向各換算成 0–100 分再加權：同類排名 35%（近 1／3／5 年贏過同類的比例，3 年權重最高）、3 年年化報酬勝過同類平均 20%（±5 個百分點對應 0／100 分；同類平均和排名矛盾時改用對比指數）、Sharpe 20%、抗跌 15%、穩定度 10%（6 個月到 5 年各期間贏過一半同類的比例）；管理費超過 1% 每 0.5 個百分點扣 5 分。"),
@@ -2105,6 +2105,7 @@
         const fixed = Object.keys((S.quality || {}).cleaned || {}).length;
         return h("a", { class: "health" + (bad.length ? " warn" : ""), href: "#method", title: bad.length ? "未取得：" + bad.map((x) => x.name).join("、") : "本次更新所有資料來源都成功取得" },
           (bad.length ? `資料來源 ${S.sources.length - bad.length}/${S.sources.length}，${bad.length} 項沿用舊資料` : `資料來源 ${S.sources.length} 項正常`) +
+          (S.sources.some((x) => x.fb) ? `（${S.sources.filter((x) => x.fb).length} 項改用備援）` : "") +
           (fixed ? `・${fixed} 檔價格已清理異常並還原除權息` : ""));
       })());
     if (!booted) window.addEventListener("hashchange", route);

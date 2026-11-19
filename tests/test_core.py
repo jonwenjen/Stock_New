@@ -1463,3 +1463,35 @@ def test_alert_events_categories(tmp_path, monkeypatch):
     assert {"up", "hot", "div"} <= set(a["cats"]) and a["weeks"]["up"] == 2 and a["rank_chg"] == 28
     assert "dn" in b["cats"] and b["rank_chg"] == -35
     assert any("長紅" in t for t in a["items"])
+
+
+# ---------------- source fallbacks (2026-11-20 audit) ----------------
+def test_get_json_retries_an_empty_200_body(monkeypatch):
+    from pipeline import http
+
+    class R:
+        def __init__(self, body):
+            self.content = body
+
+        def json(self):
+            import json as _j
+            return _j.loads(self.content)
+
+    replies = [R(b""), R(b"[1, 2]")]
+    monkeypatch.setattr(http, "request", lambda *a, **k: replies.pop(0))
+    monkeypatch.setattr(http.time, "sleep", lambda s: None)
+    assert http.get_json("https://openapi.taifex.com.tw/v1/x") == [1, 2]
+    monkeypatch.setattr(http, "request", lambda *a, **k: R(b"<html>"))
+    with pytest.raises(RuntimeError, match="non-JSON"):
+        http.get_json("https://openapi.taifex.com.tw/v1/x", retries=1)
+
+
+def test_source_fallback_labels(monkeypatch):
+    from pipeline import build
+    monkeypatch.setattr(build, "SOURCES", [{"name": "A", "ok": False, "url": "", "note": "HTTP 502"},
+                                           {"name": "B", "ok": False, "url": "", "note": "Expecting value"}])
+    build.carried("A", "沿用 2026-11-17 的資料")
+    build.covered("B", "改用期交所 CSV 下載")
+    a, b = build.SOURCES
+    assert not a["ok"] and a["note"] == "HTTP 502；沿用 2026-11-17 的資料"
+    assert b["ok"] and b["fb"] and "Expecting value" in b["note"]

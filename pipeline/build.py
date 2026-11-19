@@ -56,6 +56,23 @@ def safe(name: str, fn, default=None, url: str = ""):
         return default
 
 
+def covered(name: str, how: str) -> None:
+    """The named source failed but an alternative supplied the same data: shown as a fallback, not a gap."""
+    for s in reversed(SOURCES):
+        if s["name"] == name:
+            why = s["note"][:80]
+            s.update({"ok": True, "fb": how, "note": how + (f"（原來源：{why}）" if why else "")})
+            return
+
+
+def carried(name: str, how: str) -> None:
+    """The named source failed and older data is shown instead: still a gap, but say what is on screen."""
+    for s in reversed(SOURCES):
+        if s["name"] == name:
+            s["note"] = f"{s['note'][:100]}；{how}"
+            return
+
+
 def retry(fn, attempts: int = 3, wait: float = 8.0):
     """For endpoints that occasionally answer 200 with an empty or truncated body."""
     for i in range(attempts):
@@ -956,7 +973,27 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
             if c not in fresh and any(v is not None for v in old_vals.values()):
                 fresh[c] = old_vals
     insiders = safe("證交所 董監持股", lambda: retry(twse.insiders), {}, tw_api)
-    daytrade = safe("證交所 個股當日沖銷", lambda: twse.day_trading(trading_days[-1]), {}, "https://www.twse.com.tw")
+    # TWTB4U is a dated rwd query: when TWSE throttles it answers 307, so wait and ask once more
+    # (fetch_days) before giving up; the OpenAPI copy of TWTB4U lists eligible stocks only, no volume.
+    def day_trading():
+        got = twse.fetch_days([trading_days[-1]], twse.day_trading, "daytrade", log, cooldown=60)
+        if not got.get(trading_days[-1]):
+            raise RuntimeError("TWSE throttled TWTB4U twice (HTTP 307)")
+        return got[trading_days[-1]]
+    daytrade = safe("證交所 個股當日沖銷", day_trading, {}, "https://www.twse.com.tw")
+    # share of each stock's volume that was day-traded; the last good day is kept on file and shown
+    # (dated) when TWSE refuses, since the ratio moves slowly from day to day
+    dt_path = DATA / "history" / "tw_daytrade.json"
+    dt_ratio = {c: round(min(1.0, v / quotes[c]["volume"]), 3) for c, v in daytrade.items()
+                if (quotes.get(c) or {}).get("volume")}
+    dt_date = trading_days[-1]
+    if dt_ratio:
+        write_json(dt_path, {"date": dt_date, "ratio": dt_ratio})
+    else:
+        old_dt = read_json(dt_path, {})
+        if old_dt.get("ratio") and (today - dt.date.fromisoformat(old_dt["date"])).days <= 10:
+            dt_ratio, dt_date = old_dt["ratio"], old_dt["date"]
+            carried("證交所 個股當日沖銷", f"當沖比率沿用 {dt_date} 的資料")
     margins = safe("證交所 營益分析（毛利率、營益率）", lambda: retry(twse.margins), {}, tw_api)
     # OTC companies file the same table at TPEx (review 2026-11-14d, C10a; +1 request)
     margins.update(safe("櫃買中心 營益分析（毛利率、營益率）", tpex.margins, {}, "https://www.tpex.org.tw") or {})
@@ -967,7 +1004,15 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
             if v.get("period"):
                 mh.setdefault(v["period"], {})[c] = [v["gm"], v["om"], v["nm"], v["rev_m"]]
         write_json(mpath, {k: mh[k] for k in sorted(mh)[-12:]})
-    etf_nav = safe("證交所 ETF 淨值與折溢價", twse.etf_nav, {}, "https://mis.twse.com.tw")
+    nav_path = DATA / "history" / "tw_etf_nav.json"
+    etf_nav = safe("證交所 ETF 淨值與折溢價", lambda: retry(twse.etf_nav, attempts=2, wait=30), {}, "https://mis.twse.com.tw")
+    if etf_nav:
+        write_json(nav_path, {"date": trading_days[-1], "nav": etf_nav})
+    else:  # the MIS host sometimes answers 502 "for security reasons": show the last snapshot, dated
+        old_nav = read_json(nav_path, {})
+        if old_nav.get("nav") and (today - dt.date.fromisoformat(old_nav["date"])).days <= 7:
+            etf_nav = {c: {**v, "stale": old_nav["date"]} for c, v in old_nav["nav"].items()}
+            carried("證交所 ETF 淨值與折溢價", f"折溢價沿用 {old_nav['date']} 的資料")
     flags_path = DATA / "history" / "tw_flags.json"
     flags = safe("證交所 處置／注意股與除權息預告", lambda: retry(twse.trading_flags), None, tw_api)
     if flags:
@@ -976,6 +1021,15 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         flags = twse.carry_flags(read_json(flags_path, {}).get("flags", {}), today.isoformat())
         log(f"  trading flags: feed unavailable, reusing {len(flags)} unexpired flags from the last run")
     futures = safe("期交所 外資台指期未平倉", twse.foreign_futures, None, "https://openapi.taifex.com.tw")
+    if futures is None:  # same figures from TAIFEX's CSV download on www (a different server)
+        try:
+            fh_ = market.futures_history((dt.date.fromisoformat(trading_days[-1]) - dt.timedelta(days=10)).isoformat(),
+                                         trading_days[-1])
+            d_ = max(fh_)
+            futures = {"date": d_, "net_oi": fh_[d_]["net_oi"], "net_trade": fh_[d_].get("net_trade")}
+            covered("期交所 外資台指期未平倉", f"改用期交所 CSV 下載（{d_}）")
+        except Exception as e:  # noqa: BLE001
+            log(f"  foreign futures CSV fallback: {e}")
 
     # ETFs: a fixed core list plus whatever is trading most actively right now.
     etf_cfg = CFG.get("etfs", {})
@@ -1336,9 +1390,10 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                 rec.update({"margin_cost": cost, "maint_est": me})
                 if me < 1.40:
                     cn.append((f"估算融資維持率 {me:.0%}（追繳線 130%）", -0.12))
-            vol = (quotes.get(code) or {}).get("volume")
-            if daytrade.get(code) is not None and vol:
-                rec["daytrade"] = round(min(1.0, daytrade[code] / vol), 3)
+            if dt_ratio.get(code) is not None:
+                rec["daytrade"] = dt_ratio[code]
+                if dt_date != trading_days[-1]:
+                    rec["daytrade_date"] = dt_date
             fund_in = {**valuation.get(code, {}), **revenue.get(code, {}), **eps.get(code, {})}
             rm = leading.revenue_momentum({ym: t[code] for ym, t in rev_hist.items() if t.get(code)})
             if rm and rev_hist and rm["month"] < max(rev_hist):
@@ -1500,7 +1555,8 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         if m["market"] == "TW":
             nv = etf_nav.get(m.get("code") or s.split(".")[0])
             if nv:
-                er.update({"prem": nv["prem"], "aum": nv["aum"], "flow_day": nv["flow"], "nav_time": nv["time"]})
+                er.update({"prem": nv["prem"], "aum": nv["aum"], "flow_day": nv["flow"], "nav_time": nv["time"],
+                           **({"nav_date": nv["stale"]} if nv.get("stale") else {})})
             # cash paid over the last 12 months, from the ex-dividend factors (price basis: 1 / product - 1)
             ev = {d: f for d, f in (actions.get(m.get("code") or s.split(".")[0]) or {}).items()
                   if frames[s].index[-1] - pd.Timedelta(days=365) < pd.Timestamp(d) <= frames[s].index[-1]}
@@ -2690,6 +2746,7 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
     Each indicator is built on its own, so one failing source costs one card."""
     cards, series, extra = [], {}, {"sbl": None, "options": None, "regime": None, "liq_full": None}
     dv = derivs or {}
+    fb_used: dict[str, str] = {}  # source name -> alternative that covered it
     ev: dict[str, tuple[pd.Series, int]] = {}  # card key -> (daily history of what it shows, +1 if higher reads bullish)
 
     def dseries(key: str) -> pd.Series:
@@ -2758,7 +2815,17 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
                            read, 1 if a60 > 0.6 else -1 if a60 < 0.4 else 0, b["above20"].tail(60)))
 
     def retail():
-        fp = leading.futures_positions()
+        try:
+            fp = leading.futures_positions()
+        except Exception as e:  # noqa: BLE001 - OpenAPI down: the CSV history computes the same mini-TX ratio
+            s_ = dseries("retail_mtx")
+            if not len(s_) or (pd.Timestamp(today) - s_.index[-1]).days > 7:
+                raise
+            d_ = s_.index[-1].strftime("%Y-%m-%d")
+            fp = {"date": d_, "mtx": {"ratio": float(s_.iloc[-1])}, "tmf": None}
+            fb_used["領先指標：期交所 散戶小台／微台部位"] = (f"改用期交所 CSV 下載的小台資料（{d_}，無微台）"
+                                                    f"（原來源：{str(e)[:60]}）")
+            log(f"  retail OpenAPI failed ({str(e)[:80]}); using the CSV history for {d_}")
         mtx, tmf = fp["mtx"], fp.get("tmf")
         if fp["date"] in by_date:
             by_date[fp["date"]].update({"retail_mtx": round(mtx["ratio"], 4),
@@ -3005,6 +3072,8 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
                           ("期交所 選擇權未平倉分布", options, "https://openapi.taifex.com.tw"),
                           ("證交所 借券賣出餘額", sbl, "https://www.twse.com.tw")):
         safe(f"領先指標：{name}", fn, None, url)
+    for name, how in fb_used.items():
+        covered(name, how)
     if extra["sbl"] is None:  # keep last run's tables on screen, marked as old, rather than an empty panel
         prev = read_json(DATA / "flows.json", {}).get("sbl")
         if prev:

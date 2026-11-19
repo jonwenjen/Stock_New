@@ -70,8 +70,17 @@ def request(method: str, url: str, *, retries: int = 3, backoff: float = 4.0,
     raise last or RuntimeError(f"request failed: {url}")
 
 
-def get_json(url: str, **kw):
-    return request("GET", url, **kw).json()
+def get_json(url: str, *, retries: int = 3, backoff: float = 4.0, **kw):
+    """A 200 with an empty or non-JSON body (TAIFEX's OpenAPI does this while it republishes a
+    dataset) is retried like a network error instead of failing the source outright."""
+    for attempt in range(retries + 1):
+        r = request("GET", url, retries=retries, backoff=backoff, **kw)
+        try:
+            return r.json()
+        except ValueError:
+            if attempt >= retries:
+                raise RuntimeError(f"empty or non-JSON reply ({len(r.content)} bytes) from {url}") from None
+            time.sleep(backoff * (2 ** attempt))
 
 
 def get_text(url: str, **kw) -> str:

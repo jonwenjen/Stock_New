@@ -1495,3 +1495,22 @@ def test_source_fallback_labels(monkeypatch):
     a, b = build.SOURCES
     assert not a["ok"] and a["note"] == "HTTP 502；沿用 2026-11-17 的資料"
     assert b["ok"] and b["fb"] and "Expecting value" in b["note"]
+
+
+def test_last_dividend_rebuilds_cash_per_share():
+    from pipeline import build
+    idx = pd.bdate_range("2026-01-05", periods=200)
+    raw = pd.Series(100.0, index=idx)
+    ex1, ex2 = idx[60], idx[150]
+    raw[idx >= ex1] -= 3.0   # NT$3 cash on ex1: factor 97/100
+    raw[idx >= ex2] -= 2.0   # NT$2 cash on ex2: factor 95/97
+    ev = {ex1.strftime("%Y-%m-%d"): 0.97, ex2.strftime("%Y-%m-%d"): 95 / 97}
+    adj = raw.copy()
+    for d, f in ev.items():  # the price store scales everything before an ex-date by its factor
+        adj[adj.index < pd.Timestamp(d)] *= f
+    df = pd.DataFrame({"close": adj})
+    out = build.last_dividend(df, ev)
+    assert out["date"] == ex2.strftime("%Y-%m-%d") and abs(out["cash"] - 2.0) < 1e-3 and out["n12"] == 2
+    ev[idx[100].strftime("%Y-%m-%d")] = 0.5  # a split is not a dividend
+    assert build.last_dividend(df, ev)["date"] == ex2.strftime("%Y-%m-%d")
+    assert build.last_dividend(df, None) is None

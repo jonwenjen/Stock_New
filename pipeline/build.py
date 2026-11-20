@@ -56,6 +56,29 @@ def safe(name: str, fn, default=None, url: str = ""):
         return default
 
 
+NHI_RATE, NHI_MIN = 0.0211, 20000  # supplementary NHI premium on one dividend payment of NT$20,000 or more
+
+
+def last_dividend(df: pd.DataFrame, events: dict | None) -> dict | None:
+    """Latest payout per share (TWD), rebuilt from TWSE's ex-dividend factors and the adjusted price store:
+    raw close before the ex-date = adjusted close / product of the factors applied after it. Factors below
+    0.78 are splits or capital reductions. Includes any stock dividend, so it is an estimate."""
+    if not events or df is None or df.empty:
+        return None
+    end = df.index[-1]
+    ev = {pd.Timestamp(d): f for d, f in events.items() if f and pd.Timestamp(d) <= end}
+    divs = sorted(d for d, f in ev.items() if 0.78 <= f < 1)
+    if not divs or (end - divs[-1]).days > 400:
+        return None
+    d = divs[-1]
+    prev = df["close"][df.index < d]
+    if prev.empty:
+        return None
+    raw = float(prev.iloc[-1]) / math.prod(f for x, f in ev.items() if x > prev.index[-1])
+    return {"cash": round(raw * (1 - ev[d]), 3), "date": d.strftime("%Y-%m-%d"),
+            "n12": sum(1 for x in divs if x > end - pd.Timedelta(days=365))}
+
+
 def covered(name: str, how: str) -> None:
     """The named source failed but an alternative supplied the same data: shown as a fallback, not a gap."""
     for s in reversed(SOURCES):
@@ -1390,6 +1413,9 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                 rec.update({"margin_cost": cost, "maint_est": me})
                 if me < 1.40:
                     cn.append((f"估算融資維持率 {me:.0%}（追繳線 130%）", -0.12))
+            dl = last_dividend(df, actions.get(code))
+            if dl:
+                rec["div_last"] = dl
             if dt_ratio.get(code) is not None:
                 rec["daytrade"] = dt_ratio[code]
                 if dt_date != trading_days[-1]:
@@ -1564,6 +1590,9 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                 # each payout as a share of the price before it, added up; factors below 0.78 are splits or
                 # capital reductions, not dividends (review 2026-11-15, fund F-9)
                 er["dist12"] = round(sum(1 - f for f in ev.values() if f >= 0.78), 4) or None
+            dl = last_dividend(frames[s], actions.get(m.get("code") or s.split(".")[0]))
+            if dl:
+                er["div_last"] = dl
         etf_records.append(er)
     etf_records.sort(key=lambda r: -r["overall"])
     by_sym = {r["symbol"]: r for r in records + etf_records}

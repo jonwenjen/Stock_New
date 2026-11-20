@@ -80,6 +80,16 @@
   let FUNDS = []; // funds.json
   let LEAD = { cards: [], series: {} }; // leading.json
   // "?" link from a number to its entry in the knowledge page
+  // Supplementary NHI premium (二代健保): 2.11% of one dividend payment of NT$20,000 or more, the whole payment.
+  const NHI = { rate: 0.0211, min: 20000 };
+  const sharesLabel = (n) => (n >= 1000 ? `${Math.floor(n / 1000)} 張` + (n % 1000 ? ` ${n % 1000} 股` : "") : `${n} 股`);
+  const divRows = (r) => {
+    const d = r.div_last;
+    if (!d || !ok(d.cash) || d.cash <= 0) return [["最近一次配息（估）", "–"]];
+    const need = Math.ceil(NHI.min / d.cash);
+    return [["最近一次配息（估）", `每股 ${num(d.cash, 2)} 元（${d.date.slice(2).replace(/-/g, "/")}，近一年 ${d.n12} 次）`],
+      ["單次股利達 2 萬元的持股", h("span", {}, `約 ${sharesLabel(need)}`, help("nhi", "二代健保補充保費"))]];
+  };
   const help = (id, label) => h("a", { class: "help", href: "#learn?k=" + id, title: "看這個指標的解說",
     "aria-label": (label || "") + "解說", onclick: (e) => e.stopPropagation() }, "?");
   const CARD_KB = { vixts: "vix", breadth_tw: "breadth", breadth_us: "breadth" };
@@ -679,7 +689,7 @@
       const pctv = (v, d = 1) => (ok(v) ? pct(v, d) : "–");
       const KV = r.kind === "etf"
         ? [["關鍵數據", [["類別", r.industry], ["近一月", pct(r.r20)], ["近一季", pct(r.r60)], ["今年以來", pct(r.ytd)], ["近一年" + (r.market === "TW" ? "（含息）" : "（不含息）"), pct(r.r250)],
-          ["近 12 月配息率", ok(r.dist12) ? num(r.dist12 * 100, 1) + "%" : "–"], ["折溢價", ok(r.prem) ? signed(r.prem, 2) + "%" + (r.nav_date ? `（沿用 ${r.nav_date.slice(5)}）` : r.nav_time ? `（${r.nav_time.slice(0, 5)}）` : "") : "–"],
+          ["近 12 月配息率", ok(r.dist12) ? num(r.dist12 * 100, 1) + "%" : "–"], ...(r.market === "TW" ? divRows(r) : []), ["折溢價", ok(r.prem) ? signed(r.prem, 2) + "%" + (r.nav_date ? `（沿用 ${r.nav_date.slice(5)}）` : r.nav_time ? `（${r.nav_time.slice(0, 5)}）` : "") : "–"],
           ["規模", ok(r.aum) ? nf(0).format(r.aum / 1e8) + " 億" : "–"], ["單日申購贖回", ok(r.flow_day) ? signed(r.flow_day / 1e8, 1) + " 億" : "–"],
           ["一年最大回檔", pct(r.mdd)], ["年化波動", ok(r.vol_ann) ? num(r.vol_ann * 100, 0) + "%" : "–"], ["RSI(14)", num(r.rsi, 0)],
           ["外資 5 日", ok(r.foreign5) ? signed(r.foreign5, 0) + " 張" : "–"], ["投信 5 日", ok(r.trust5) ? signed(r.trust5, 0) + " 張" : "–"]]]]
@@ -687,6 +697,7 @@
         ? [["基本面", [["本益比", num(r.pe, 1)], ["股價淨值比", num(r.pb, 2)],
             ["ROE（近四季，淨值比 ÷ 本益比推算）", ok(r.roe) ? num(r.roe * 100, 1) + "%" : "–"],
             ["殖利率", ok(r.yield) ? num(r.yield, 2) + "%" + (r.yield_odd ? "（異常，疑似一次性配發，不計分）" : "") : "–"],
+            ...divRows(r),
             ["月營收年增", pctRaw(r.rev_yoy)], ["近 3 月營收年增", pctv(r.rev_yoy3)], ["累計營收年增", pctRaw(r.rev_cum_yoy)],
             ["3 月／12 月營收", ok(r.rev_ratio) ? pct(r.rev_ratio - 1, 0) : "–"],
             ["單月營收為近 12 個月最高", r.rev_hi12 == null ? "–" : r.rev_hi12 ? "是" : "否"],
@@ -924,6 +935,7 @@
         const share = field("budget_share", ex, { min: 0, max: 100, step: 5, style: "width:4.5em" }, "股票比例（%）");
         const tw = field("budget_tw", 60, { min: 0, max: 100, step: 10, style: "width:4.5em" }, "股票中台股的比例（%）");
         const out = h("div", { class: "stack", style: "gap:6px" });
+        const divOf = (x) => (x.r.market === "TW" && x.r.div_last && ok(x.r.div_last.cash) && x.shares ? x.shares * x.r.div_last.cash : null);
         const lots = (n) => (n >= 1000 ? `${Math.floor(n / 1000)} 張` + (n % 1000 ? ` ${n % 1000} 股` : "") : `${n} 股（零股）`);
         const draw = () => {
           const A = Math.max(0, +cash.value || 0), B = Math.min(100, Math.max(0, +share.value || 0)) / 100, T = Math.min(100, Math.max(0, +tw.value || 0)) / 100;
@@ -945,9 +957,12 @@
             table([{ key: "n", label: "精選", left: true, cell: (x) => h("span", {}, x.r.name, " ", mkChip(x.r.market, x.r.symbol)) },
               { key: "s", label: "停損距離", val: (x) => x.r.plan && x.r.plan.stop_pct, cell: (x) => h("span", { class: "num" }, x.r.plan && ok(x.r.plan.stop_pct) ? num(x.r.plan.stop_pct * 100, 1) + "%" : "–") },
               { key: "a", label: "試算金額（台幣）", val: (x) => x.amt, cell: (x) => h("span", { class: "num" }, nf(0).format(x.amt)) },
-              { key: "q", label: "約當股數", val: (x) => x.shares, cell: (x) => h("span", { class: "num" }, x.r.market === "TW" ? (x.shares ? lots(x.shares) : "不足 1 股") : (x.shares ? `${x.shares} 股` : "不足 1 股（可買零碎股）")) }],
+              { key: "q", label: "約當股數", val: (x) => x.shares, cell: (x) => h("span", { class: "num" }, x.r.market === "TW" ? (x.shares ? lots(x.shares) : "不足 1 股") : (x.shares ? `${x.shares} 股` : "不足 1 股（可買零碎股）")) },
+              { key: "dv", label: "單次股利（估）", tip: "最近一次每股配息 × 約當股數；單次 2 萬元以上全額扣 2.11% 二代健保補充保費", val: (x) => divOf(x),
+                cell: (x) => { const v = divOf(x); return v == null ? h("span", { class: "muted" }, "–") : h("span", { class: "num" + (v >= NHI.min ? " warn-text" : "") }, nf(0).format(v) + (v >= NHI.min ? `（補充保費約 ${nf(0).format(Math.min(v, 1e7) * NHI.rate)}）` : "")); } }],
               rows, { csv: "budget", sort: "a" }),
-            small ? h("p", { class: "chart-note" }, `有 ${small} 檔台股單筆金額低於約 2.34 萬元：多數券商最低手續費 20 元，實際費率會比牌告高。`) : null);
+            small ? h("p", { class: "chart-note" }, `有 ${small} 檔台股單筆金額低於約 2.34 萬元：多數券商最低手續費 20 元，實際費率會比牌告高。`) : null,
+            rows.some((x) => (divOf(x) || 0) >= NHI.min) ? h("p", { class: "chart-note" }, "標示的幾檔，照最近一次的配息估算，單次股利會達 2 萬元，發放時會全額扣 2.11% 二代健保補充保費。這是發放金額的估計，下次配息可能不同；ETF 配息中屬於收益平準金或資本利得的部分不扣，實際會比這裡少。", help("nhi", "二代健保補充保費")) : null);
         };
         draw();
         return h("div", { class: "panel stack" }, h("div", { class: "row", style: "flex-wrap:wrap;gap:8px" }, h("b", {}, "部位預算"), "總資金", cash, "元・股票比例", share, "%・其中台股", tw, "%"), out,

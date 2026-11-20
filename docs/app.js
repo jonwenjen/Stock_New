@@ -1466,6 +1466,12 @@
     },
 
     async watch() {
+      // #watch?add=NXPI,2330.TW adds symbols from a link (a name not tracked yet waits for the next update)
+      const adds = (parseHash().p.get("add") || "").split(",").map((x) => x.trim().toUpperCase()).filter((x) => /^[A-Z0-9.^-]{1,15}$/.test(x));
+      if (adds.length) {
+        adds.forEach((x) => { if (!WATCH.has(x)) toggleWatch(x); });
+        history.replaceState(null, "", "#watch");  // a reload must not re-add a name removed later
+      }
       const issues = (r) => [r.overall <= -0.15 ? "綜合評分偏空" : null, ok(r.tactical) && r.tactical <= -0.3 ? "籌碼明顯轉弱" : null,
         ok(r.rsi) && r.rsi >= 75 ? "RSI 過熱" : null, ok(r.maint_est) && r.maint_est < 1.4 ? "融資維持率偏低" : null,
         ...(r.tags || []).filter(([, tone]) => tone < 0).map(([t]) => t)].filter(Boolean);
@@ -1529,8 +1535,8 @@
             { key: "i", label: "需要留意", left: true, wrap: true, cell: (r) => { const x = fundIssues(r); return x.length ? x.map((t) => h("span", { class: "chip cut", style: "margin:0 4px 2px 0" }, t)) : h("span", { class: "muted" }, "沒有警訊"); } },
             { key: "xx", label: "", cell: rm }], funds, { sort: "s", csv: "watchlist-funds", onRow: (r) => openDrawer(r.symbol) }),
             h("p", { class: "chart-note" }, "基金看的是「還值不值得持有」：評等偏弱或落後、3 年同類排名在後段、長期落後對比指數、回檔過深都會列出。淨值趨勢只看最近的方向，與績效評等是兩回事。")) : null,
-          gone.length ? h("div", { class: "panel stack" }, h("h3", {}, "已不在本週資料中"),
-            h("p", { class: "small" }, "這些標的本週沒有資料（台股觀察名單取成交金額前段，會隨成交量進出；基金若來源暫時取不到也會出現在這裡）。"),
+          gone.length ? h("div", { class: "panel stack" }, h("h3", {}, "本週沒有資料"),
+            h("p", { class: "small" }, "這些標的本週沒有資料：剛加入觀察名單的股票要等下一次更新才有數字；台股觀察名單取成交金額前段，會隨成交量進出；基金若來源暫時取不到也會出現在這裡。"),
             h("div", { class: "row" }, gone.map((r) => h("span", { class: "chip" }, r.symbol, " ", rm(r))))) : null].filter(Boolean));
       };
       draw();

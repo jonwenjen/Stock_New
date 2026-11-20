@@ -1627,6 +1627,8 @@
           h("div", { class: "panel stack" }, h("div", { class: "sec-head" }, h("h3", {}, "市場週期", help("cycle", "市場週期判斷")), h("span", { class: "pill " + (G.state === "bull" ? "s1" : G.state === "bear" ? "s-2" : G.state === "range" ? "s0" : "s-1") }, G.name)),
             h("div", { class: "kv" }, [["加權指數", px(G.close)], ["季線（60 日）", px(G.ma60)], ["年線（200 日）", px(G.ma200)], ["距一年高點", pct(G.drawdown)]].map(([k, v]) =>
               h("div", {}, h("div", { class: "k" }, k), h("div", { class: "v num" }, v)))),
+            ok(G.drawdown) && G.drawdown <= -0.1 ? h("p", { class: "small" }, `指數距一年高點 ${pct(G.drawdown)}。過去每一次跌破 −20% 之後發生了什麼、跌深時最常見的幾種錯誤：`,
+              h("a", { href: "#learn?k=disc_crash" }, "投資方法與紀律"), "。") : null,
             table([{ key: "s", label: "階段", left: true, cell: (r) => h("span", {}, r.name, r.cur ? h("span", { class: "chip mk", style: "margin-left:6px" }, "目前") : null) },
               { key: "sh", label: "占比", cell: (r) => h("span", { class: "num" }, num(r.share * 100, 0) + "%") }, ...fwdCols],
             ["bull", "range", "pullback", "rebound", "bear"].filter((k) => G.stats[k]).map((k) => ({ name: { bull: "多頭趨勢", range: "高檔盤整", pullback: "多頭回檔", rebound: "空頭反彈", bear: "空頭趨勢" }[k], cur: k === G.state, ...G.stats[k] }))),

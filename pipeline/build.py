@@ -383,6 +383,7 @@ def stock_flows(trading_days: list[str]) -> tuple[list[str], dict[str, list[tupl
 SOURCE_URL = {"cboe": "https://www.cboe.com", "fred": "https://fred.stlouisfed.org",
               "twse": "https://www.twse.com.tw"}
 DEEP: dict[str, bool] = {}  # symbols whose pre-TWSE history was filled from Yahoo this run
+US_SOURCE: dict[str, str] = {}  # US symbol -> the price source that answered this run (prices.us_daily)
 
 
 def load_store(symbol: str) -> tuple[pd.DataFrame, dict]:
@@ -427,13 +428,13 @@ def _fetch_index(ix: dict, intraday: dict) -> pd.DataFrame:
     if ix["source"] == "fred":
         return prices.fred_daily(ix["code"])
     if ix["source"] == "cboe":
-        raw = []
-        try:
-            raw = prices.cboe_intraday_raw(ix["code"])
-        except Exception:  # noqa: BLE001 - intraday is optional
-            pass
+        # Cboe first; when it refuses, Yahoo or FRED (see prices.us_daily). Codes without an
+        # index mapping (SOXX, GLD) are ETFs and fall back to stockanalysis.com and Yahoo.
+        kind = "index" if ix["code"] in prices.INDEX_ALT else "etf"
+        df, raw, src = prices.us_daily(ix["code"], kind, scale, old=load_store(sym)[0])
+        US_SOURCE[sym] = src
         intraday[sym] = prices.intraday_5m(raw, scale)
-        return prices.append_session(prices.cboe_daily(ix["code"], scale), raw, scale)
+        return df
     # TAIEX: stored history + official monthly OHLC tables for the months since the last bar.
     old, payload = load_store(sym)
     today = dt.datetime.now(TPE).date()
@@ -954,9 +955,12 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     for ix in CFG["indices"]:
         sym = ix["symbol"]
         # One more try after a pause: the quote hosts answer 429 to short bursts and recover quickly.
-        df = safe(f"{ix['source'].upper()} 指數 {ix['name']}",
+        label = "美股指數" if ix["source"] == "cboe" else f"{ix['source'].upper()} 指數"
+        df = safe(f"{label} {ix['name']}",
                   lambda i=ix: retry(lambda: fetch_index(i, intraday), attempts=2, wait=40),
                   url=SOURCE_URL[ix["source"]])
+        if sym in US_SOURCE and SOURCES[-1]["ok"]:
+            SOURCES[-1]["note"] = "來源：" + prices.SOURCE_LABEL[US_SOURCE[sym]]
         if df is None or len(df) < 120:
             df, _ = load_store(sym)  # keep last week's history rather than dropping the series
             if len(df):
@@ -1184,15 +1188,13 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         meta[sym] = {"name": (otc_margin.get(code) or {}).get("name") or load_store(sym)[1].get("name") or code,
                      "market": "TW", "exchange": "OTC", "kind": "stock", "code": code, "scored": True,
                      "industry": revenue.get(code, {}).get("industry") or industry_fallback(code)}
+    etf_set = {t for t, _, _ in us_etfs}
+
     def us_prices(tkr: str) -> pd.DataFrame:
-        raw = []
-        try:
-            raw = prices.cboe_intraday_raw(tkr)
-        except Exception:  # noqa: BLE001 - intraday is optional
-            pass
-        df = clean(tkr, prices.append_session(prices.cboe_daily(tkr), raw), "US")
+        df, raw, src = prices.us_daily(tkr, "etf" if tkr in etf_set else "stock", old=load_store(tkr)[0])
+        US_SOURCE[tkr] = src
         intraday[tkr] = prices.intraday_5m(raw)
-        return df
+        return clean(tkr, df, "US")
 
     us_frames: dict[str, pd.DataFrame] = {}
     later: list[str] = []
@@ -1235,8 +1237,16 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     behind = [s for s, m in meta.items() if m["kind"] == "stock" and m["scored"] and not fresh(s)]
     if behind:
         SOURCES.append({"name": "股價過期未評分", "ok": False, "url": "", "note": "、".join(behind)[:160]})
-    SOURCES.append({"name": "Cboe 美股每日行情", "ok": fails < len(us_list), "url": "https://www.cboe.com",
-                    "note": f"{len(us_list) - fails} 檔成功，{fails} 檔失敗"})
+    us_all = [t for t, _, _ in us_list + us_etfs]
+    used = {}
+    for t in us_all:
+        if t in US_SOURCE:
+            used[US_SOURCE[t]] = used.get(US_SOURCE[t], 0) + 1
+    SOURCES.append({"name": "美股每日行情（Cboe → stockanalysis.com → Yahoo）", "ok": fails < len(us_all),
+                    "url": "https://www.cboe.com",
+                    "note": "、".join(f"{prices.SOURCE_LABEL[k]} {v} 檔" for k, v in used.items())
+                    + f"；{fails} 檔全部來源失敗" + ("；停用：" + "、".join(prices.SOURCE_LABEL[k] for k in sorted(prices.BREAKER.off))
+                                              if prices.BREAKER.off else "")})
     if stale:
         SOURCES.append({"name": "沿用上週股價", "ok": False, "url": "", "note": "、".join(stale)[:160]})
     log(f"prices: {len(stocks)} scored stocks, {len(frames)} series")
@@ -2818,7 +2828,7 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
                            -1 if chg > 0.05 else 1 if chg < -0.05 else 0, ry.tail(60)))
 
     def vix_term():
-        ts = leading.term_structure(frames["VIX"]["close"], prices.cboe_daily("_VIX3M")["close"])
+        ts = leading.term_structure(frames["VIX"]["close"], prices.us_daily("_VIX3M", "index")[0]["close"])
         now = float(ts.iloc[-1])
         series["vix_term"] = dated(ts)
         ev["vixts"] = (ts, -1)
@@ -3090,7 +3100,7 @@ def build_leading(frames: dict, tframes: dict, stocks: list[str], meta: dict, fl
                           ("FRED 美國 10 年期實質殖利率", real_yield, "https://fred.stlouisfed.org"),
                           ("FRED 美債殖利率曲線", curve, "https://fred.stlouisfed.org"),
                           ("FRED 高收益債利差與半導體相對強弱", credit, "https://fred.stlouisfed.org"),
-                          ("Cboe VIX3M 期限結構", vix_term, "https://www.cboe.com"),
+                          ("VIX3M 期限結構（Cboe → Yahoo → FRED）", vix_term, "https://www.cboe.com"),
                           ("台股廣度", lambda: breadth_of("TW", "台股"), ""), ("美股廣度", lambda: breadth_of("US", "美股"), ""),
                           ("全市場漲跌家數", ad, ""),
                           ("期交所 散戶小台／微台部位", retail, "https://openapi.taifex.com.tw"),

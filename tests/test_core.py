@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 from pipeline import indicators as ind
-from pipeline import market, media, scoring, twse, us_data
+from pipeline import market, media, prices, scoring, twse, us_data
 
 
 def make_df(prices):
@@ -1514,3 +1514,57 @@ def test_last_dividend_rebuilds_cash_per_share():
     ev[idx[100].strftime("%Y-%m-%d")] = 0.5  # a split is not a dividend
     assert build.last_dividend(df, ev)["date"] == ex2.strftime("%Y-%m-%d")
     assert build.last_dividend(df, None) is None
+
+
+# ---------------- US prices: several sources tried in order ----------------
+def _bars(start, closes):
+    c = pd.Series(closes, index=pd.bdate_range(start, periods=len(closes)), dtype=float)
+    return pd.DataFrame({"open": c, "high": c, "low": c, "close": c, "volume": 1.0})
+
+
+def test_us_daily_falls_through_and_breaker_switches_a_dead_source_off():
+    calls = []
+
+    def dead():
+        calls.append("cboe")
+        raise RuntimeError("HTTP 403")
+    good = _bars("2024-01-01", [10.0] * 30)
+    br = prices.Breaker(limit=3)
+    f = {"cboe": dead, "stockanalysis": lambda: (good, []), "yahoo": lambda: (_ for _ in ()).throw(AssertionError)}
+    for _ in range(5):
+        df, raw, src = prices.us_daily("AAPL", "stock", breaker=br, fetchers=f)
+        assert src == "stockanalysis" and len(df) == 30 and raw == []
+    assert calls == ["cboe"] * 3 and not br.ok("cboe")  # three refusals, then no more requests
+
+
+def test_us_daily_indices_use_yahoo_then_fred_and_never_stockanalysis():
+    br = prices.Breaker()
+    fail = lambda: (_ for _ in ()).throw(RuntimeError("down"))  # noqa: E731
+    fred = _bars("2024-01-01", [5000.0] * 10)
+    f = {"cboe": fail, "yahoo": fail, "stockanalysis": lambda: (_ for _ in ()).throw(AssertionError), "fred": lambda: (fred, [])}
+    df, _, src = prices.us_daily("_SPX", "index", breaker=br, fetchers=f)
+    assert src == "fred" and len(df) == 10
+    with pytest.raises(RuntimeError, match="all US price sources failed"):
+        prices.us_daily("SOXX", "etf", breaker=prices.Breaker(), fetchers={"cboe": fail, "stockanalysis": fail, "yahoo": fail})
+
+
+def test_splice_keeps_depth_rescales_a_split_and_fred_only_appends():
+    old = _bars("2024-01-01", [100.0] * 40)
+    old["high"] = 105.0
+    new = _bars("2024-02-05", [50.0] * 20)   # same days overlap, but the new source applied a 2:1 split
+    out = prices.splice(old, new)
+    assert len(out) == len(old.index.union(new.index))
+    assert out["close"].iloc[0] == pytest.approx(50.0) and out["close"].iloc[-1] == 50.0
+    fred = _bars("2024-02-05", [99.0] * 20)
+    kept = prices.splice(old, fred, append_only=True)
+    assert (kept.loc[old.index, "high"] == 105.0).all()          # stored OHLC untouched
+    assert kept.index[-1] == fred.index[-1] and kept["close"].iloc[-1] == 99.0
+
+
+def test_stockanalysis_parsing_and_paths():
+    j = {"data": [{"t": "2026-11-24", "o": 348.06, "h": 354.4, "l": 345.88, "c": 354.07, "a": 353.0, "v": 41202897},
+                  {"t": "2026-11-23", "o": 347.87, "h": 352.6, "l": 345.44, "c": 349.08, "a": 348.0, "v": 58588703}]}
+    df = prices.parse_stockanalysis(j)
+    assert list(df.index.strftime("%Y-%m-%d")) == ["2026-11-23", "2026-11-24"] and df["close"].iloc[-1] == 354.07
+    assert prices.stockanalysis_path("BRK-B", "stock") == "s/brk.b" and prices.stockanalysis_path("SOXX", "etf") == "e/soxx"
+    assert prices.INDEX_ALT["_DJX"]["fred"] == "DJIA" and prices.INDEX_ALT["_VIX3M"]["yahoo"] == "^VIX3M"

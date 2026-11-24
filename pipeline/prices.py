@@ -1,7 +1,9 @@
 """Price history.
 
 Primary sources are official / openly published feeds:
-  * Cboe delayed-quotes CDN  - US stocks, ETFs and Cboe-disseminated indices (daily + 1-min intraday)
+  * Cboe delayed-quotes CDN  - US stocks, ETFs and Cboe-disseminated indices (daily + 1-min intraday).
+    When Cboe refuses, us_daily() falls through to stockanalysis.com (stocks, ETFs), Yahoo
+    and FRED (indices, close only); none of them needs a key.
   * FRED (St. Louis Fed) CSV - macro series (yields, FX, oil, bitcoin, Nasdaq Composite)
   * TWSE                     - Taiwan stocks / TAIEX (see twse.py; merged into the on-disk store)
 Yahoo Finance is only an optional enrichment (deep Taiwan history + Taiwan intraday).
@@ -163,6 +165,146 @@ class Yahoo:
         off = int(res["meta"].get("gmtoffset") or 0)
         return [[int(t + off), _r(o), _r(h), _r(l), _r(c), int(v or 0)]
                 for t, o, h, l, c, v in df[["ts"] + COLS].itertuples(index=False)]
+
+
+# ----------------------------- US daily bars: several free sources, tried in order ----------------------------- #
+# Cboe is the primary feed. When it refuses (it answered 403 to every request from
+# 2026-11-20), each symbol falls through to the next source instead of keeping last
+# week's prices. None of them needs a key. A source that fails three times in a row
+# is switched off for the rest of the run, so a dead source costs a few requests,
+# not one per ticker.
+http.HOST_INTERVAL.setdefault("stockanalysis.com", 1.0)
+
+# Cboe index codes -> the same series elsewhere. Cboe's _DJX is the Dow / 100 (build scales
+# it by 100); the alternates publish the full index level, so they are never rescaled.
+INDEX_ALT = {"_SPX": {"yahoo": "^GSPC", "fred": "SP500"},
+             "_DJX": {"yahoo": "^DJI", "fred": "DJIA"},
+             "_VIX": {"yahoo": "^VIX", "fred": "VIXCLS"},
+             "_VIX3M": {"yahoo": "^VIX3M", "fred": "VXVCLS"}}
+SOURCE_LABEL = {"cboe": "Cboe", "stockanalysis": "stockanalysis.com", "yahoo": "Yahoo", "fred": "FRED"}
+
+
+class Breaker:
+    """Per-source failure counter: `limit` consecutive failures disable the source for the run."""
+
+    def __init__(self, limit: int = 3):
+        self.limit, self.fails, self.off = limit, {}, set()
+
+    def ok(self, name: str) -> bool:
+        return name not in self.off
+
+    def success(self, name: str) -> None:
+        self.fails[name] = 0
+
+    def failure(self, name: str) -> None:
+        self.fails[name] = self.fails.get(name, 0) + 1
+        if self.fails[name] >= self.limit:
+            self.off.add(name)
+
+
+BREAKER = Breaker()
+
+
+def stockanalysis_path(ticker: str, kind: str) -> str:
+    """'stock' -> /s/, 'etf' -> /e/; share classes use a dot (BRK-B -> brk.b)."""
+    return f"{'e' if kind == 'etf' else 's'}/{ticker.lower().replace('-', '.')}"
+
+
+def parse_stockanalysis(j: dict) -> pd.DataFrame:
+    """{'data': [{'t': date, 'o','h','l','c','v'}, ...]} (newest first) -> daily frame.
+
+    Uses the unadjusted-for-dividends close 'c' (split-adjusted), like Cboe, not 'a'.
+    """
+    rows = j.get("data") or []
+    if not rows:
+        raise RuntimeError("stockanalysis returned no rows")
+    df = pd.DataFrame(rows).rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
+    df = df.set_index(pd.to_datetime(df["t"]))
+    df[COLS] = df[COLS].apply(pd.to_numeric, errors="coerce")
+    return _finish(df)
+
+
+def stockanalysis_daily(ticker: str, kind: str, years: int = 5) -> pd.DataFrame:
+    j = http.get_json(f"https://stockanalysis.com/api/symbol/{stockanalysis_path(ticker, kind)}/history",
+                      params={"period": "daily", "range": f"{years}Y"}, retries=1, timeout=30)
+    return parse_stockanalysis(j)
+
+
+def yahoo_daily_us(symbol: str) -> pd.DataFrame:
+    """US daily bars from Yahoo's chart API; dates are the New York session date."""
+    df = Yahoo.daily(symbol)
+    if df is None:
+        raise RuntimeError("Yahoo unavailable or throttled")
+    return df
+
+
+def splice(old: pd.DataFrame | None, new: pd.DataFrame, append_only: bool = False) -> pd.DataFrame:
+    """Join a fresh download onto the stored history.
+
+    `new` wins where they overlap. If the two disagree by a steady factor on the overlap
+    (a split applied by one source but not yet in the store), the older stored bars are
+    rescaled by that factor so the series stays continuous. `append_only` (close-only
+    sources such as FRED) keeps every stored bar and adds only the dates after it, so
+    real open/high/low values are never flattened.
+    """
+    if old is None or not len(old):
+        return new
+    if append_only:
+        return merge(old, new[new.index > old.index[-1]])
+    both = old.index.intersection(new.index)
+    if len(both) >= 5:
+        ratio = (new.loc[both, "close"] / old.loc[both, "close"]).median()
+        if abs(ratio - 1) > 0.02:
+            old = old.copy()
+            old[["open", "high", "low", "close"]] *= ratio
+    return merge(old, new)
+
+
+def us_daily(ticker: str, kind: str = "stock", scale: float = 1.0, old: pd.DataFrame | None = None,
+             breaker: Breaker = BREAKER, fetchers: dict | None = None) -> tuple[pd.DataFrame, list, str]:
+    """Daily history for a US stock, ETF or Cboe index code, trying each source in turn.
+
+    Returns (frame, cboe_intraday_raw, source_name). Stocks and ETFs: Cboe -> stockanalysis.com
+    -> Yahoo. Indices (codes starting with '_'): Cboe -> Yahoo -> FRED (close only). Fallback
+    downloads are spliced onto `old` (the stored history) so a short download keeps the depth.
+    `fetchers` replaces the network calls in tests.
+    """
+    alt = INDEX_ALT.get(ticker, {})
+    is_index = ticker.startswith("_")
+    f = fetchers or {
+        "cboe": lambda: _cboe_with_session(ticker, scale),
+        "stockanalysis": lambda: (stockanalysis_daily(ticker, kind, 1 if old is not None and len(old) >= 250 else 5), []),
+        "yahoo": lambda: (yahoo_daily_us(alt.get("yahoo", ticker)), []),
+        "fred": lambda: (fred_daily(alt["fred"]), []),
+    }
+    order = ["cboe", "yahoo", "fred"] if is_index else ["cboe", "stockanalysis", "yahoo"]
+    order = [s for s in order if s != "fred" or "fred" in alt]
+    errors = []
+    for name in order:
+        if not breaker.ok(name):
+            errors.append(f"{name}: off")
+            continue
+        try:
+            df, raw = f[name]()
+            if df is None or len(df) < 5:
+                raise RuntimeError("too few rows")
+        except Exception as e:  # noqa: BLE001 - try the next source
+            breaker.failure(name)
+            errors.append(f"{name}: {str(e)[:60]}")
+            continue
+        breaker.success(name)
+        return (df if name == "cboe" else splice(old, df, append_only=name == "fred")), raw, name
+    raise RuntimeError("all US price sources failed (" + "; ".join(errors) + ")")
+
+
+def _cboe_with_session(ticker: str, scale: float) -> tuple[pd.DataFrame, list]:
+    df = cboe_daily(ticker, scale)  # raises when Cboe refuses: the chain moves on
+    raw = []
+    try:
+        raw = cboe_intraday_raw(ticker)
+    except Exception:  # noqa: BLE001 - intraday is optional
+        pass
+    return append_session(df, raw, scale), raw
 
 
 def is_daily(df: pd.DataFrame) -> bool:

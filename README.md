@@ -81,7 +81,7 @@ pipeline/
   http.py              所有對外請求：每個網站各自的節流間隔與重試
   twse.py              證交所／期交所：行情、三大法人、融資、本益比、營收、EPS、董監持股、外資持股、處置注意股、除權息
   tpex.py              櫃買中心：上櫃每日行情、三大法人、融資、本益比、營收、EPS、外資持股、處置注意股、除權息
-  prices.py            股價：Cboe（美股）、FRED（總經）、Yahoo（選用的長期歷史）
+  prices.py            股價：美股依序嘗試 Cboe → stockanalysis.com → Yahoo（指數：Cboe → Yahoo → FRED）、FRED（總經）
   us_data.py           國會議員交易、SEC 13F、SEC XBRL 財報
   funds.py             基金：淨值、同類排名、對比指數，以及風險指標與績效評分
   leading.py           領先指標：期貨與選擇權部位、借券、ADR 溢價、廣度、信用利差、投信首買、
@@ -146,7 +146,7 @@ tests/                 純函式與解析器的單元測試
 | 台股行情、三大法人、融資融券、本益比、月營收、EPS、董監持股 | 臺灣證券交易所（OpenAPI 與公開報表） |
 | 外資台指期未平倉 | 臺灣期貨交易所 OpenAPI；歷史走勢取自期交所三大法人下載專區 |
 | 全球金融壓力指數 | 美國財政部金融研究辦公室（OFR Financial Stress Index，33 個市場變數） |
-| 美股與指數行情 | Cboe 公開延遲行情 |
+| 美股與指數行情 | Cboe 公開延遲行情；Cboe 拒絕時，個股與 ETF 改用 stockanalysis.com，再不行用 Yahoo Finance；指數改用 Yahoo，再不行用 FRED（只有收盤價、晚一天）。連續失敗 3 次的來源當次停用，網站「方法與來源」分頁會列出每個來源實際提供幾檔 |
 | 殖利率、匯率、油價、比特幣、那斯達克綜合指數 | FRED（聖路易聯邦準備銀行） |
 | 美股 EPS 與營收 | SEC EDGAR XBRL |
 | 名人基金持股 | SEC EDGAR 13F-HR 季報，CUSIP 以 OpenFIGI 對應代號 |

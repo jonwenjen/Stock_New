@@ -167,21 +167,27 @@ class Yahoo:
                 for t, o, h, l, c, v in df[["ts"] + COLS].itertuples(index=False)]
 
 
-# ----------------------------- US daily bars: several free sources, tried in order ----------------------------- #
-# Cboe is the primary feed. When it refuses (it answered 403 to every request from
-# 2026-11-20), each symbol falls through to the next source instead of keeping last
-# week's prices. None of them needs a key. A source that fails three times in a row
-# is switched off for the rest of the run, so a dead source costs a few requests,
-# not one per ticker.
+# ----------------------------- several free sources, tried in order ----------------------------- #
+# Every price series has a primary source and, where one exists, keyless alternates. When the
+# primary refuses (Cboe answered 403 to every request from 2026-11-20) the series falls through
+# to the next source instead of keeping last week's prices. A source that fails three times in
+# a row is switched off for the rest of the run, so a dead source costs a few requests, not one
+# per ticker. A primary that answers but lags (FRED publishes some series days late) is topped
+# up with newer dates from the alternates.
 http.HOST_INTERVAL.setdefault("stockanalysis.com", 1.0)
+http.HOST_INTERVAL.setdefault("rate.bot.com.tw", 1.0)
+http.HOST_INTERVAL.setdefault("home.treasury.gov", 1.0)
+http.HOST_INTERVAL.setdefault("api.exchange.coinbase.com", 0.5)
 
-# Cboe index codes -> the same series elsewhere. Cboe's _DJX is the Dow / 100 (build scales
-# it by 100); the alternates publish the full index level, so they are never rescaled.
+# Cboe index codes -> the same series elsewhere (used for US stocks' chain and VIX3M). Cboe's _DJX
+# is the Dow / 100 (build scales it by 100); the alternates publish the full level, never rescaled.
 INDEX_ALT = {"_SPX": {"yahoo": "^GSPC", "fred": "SP500"},
              "_DJX": {"yahoo": "^DJI", "fred": "DJIA"},
              "_VIX": {"yahoo": "^VIX", "fred": "VIXCLS"},
              "_VIX3M": {"yahoo": "^VIX3M", "fred": "VXVCLS"}}
-SOURCE_LABEL = {"cboe": "Cboe", "stockanalysis": "stockanalysis.com", "yahoo": "Yahoo", "fred": "FRED"}
+SOURCE_LABEL = {"cboe": "Cboe", "stockanalysis": "stockanalysis.com", "yahoo": "Yahoo", "fred": "FRED",
+                "twse": "證交所", "treasury": "美國財政部", "bot": "臺灣銀行", "coinbase": "Coinbase"}
+STALE_DAYS = 3  # a primary whose last bar is older than this (calendar days) is topped up from alternates
 
 
 class Breaker:
@@ -213,7 +219,7 @@ def stockanalysis_path(ticker: str, kind: str) -> str:
 def parse_stockanalysis(j: dict) -> pd.DataFrame:
     """{'data': [{'t': date, 'o','h','l','c','v'}, ...]} (newest first) -> daily frame.
 
-    Uses the unadjusted-for-dividends close 'c' (split-adjusted), like Cboe, not 'a'.
+    Uses the close 'c' (split-adjusted, not dividend-adjusted), like Cboe, not 'a'.
     """
     rows = j.get("data") or []
     if not rows:
@@ -230,12 +236,91 @@ def stockanalysis_daily(ticker: str, kind: str, years: int = 5) -> pd.DataFrame:
     return parse_stockanalysis(j)
 
 
-def yahoo_daily_us(symbol: str) -> pd.DataFrame:
-    """US daily bars from Yahoo's chart API; dates are the New York session date."""
+def yahoo_series(symbol: str) -> pd.DataFrame:
+    """Daily bars from Yahoo's chart API (dates in the exchange's own time zone)."""
     df = Yahoo.daily(symbol)
     if df is None:
         raise RuntimeError("Yahoo unavailable or throttled")
     return df
+
+
+yahoo_daily_us = yahoo_series  # earlier name
+
+
+def _close_only(dates, values) -> pd.DataFrame:
+    df = pd.DataFrame({"close": pd.to_numeric(pd.Series(values, dtype="object"), errors="coerce").values},
+                      index=pd.to_datetime(dates))
+    for c in ("open", "high", "low"):
+        df[c] = df["close"]
+    df["volume"] = 0.0
+    return _finish(df)
+
+
+def parse_treasury(text: str, column: str = "10 Yr") -> pd.DataFrame:
+    """Treasury daily par yield curve CSV (one file per year) -> one maturity as a close-only series."""
+    df = pd.read_csv(io.StringIO(text))
+    return _close_only(pd.to_datetime(df["Date"], format="%m/%d/%Y"), df[column])
+
+
+def treasury_yield(column: str = "10 Yr", today: dt.date | None = None) -> pd.DataFrame:
+    """U.S. Treasury's own daily yield curve (the source FRED's DGS series copy), this year and last."""
+    year = (today or dt.date.today()).year
+    parts = []
+    for y in (year - 1, year):
+        txt = http.get_text(f"https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
+                            f"daily-treasury-rates.csv/{y}/all",
+                            params={"type": "daily_treasury_yield_curve", "field_tdr_date_value": y,
+                                    "_format": "csv"}, retries=1)
+        parts.append(parse_treasury(txt, column))
+    return merge(*parts)
+
+
+def parse_bot_rates(text: str, today: dt.date | None = None) -> pd.DataFrame:
+    """Bank of Taiwan rate history CSV -> USD/TWD as the mid of its spot buying and selling rates.
+
+    Columns: date, currency, then ten 'buy' columns (rate label, cash, spot, forwards...) and ten
+    'sell' columns in the same order, so spot buy is column 4 and spot sell column 14. Today's
+    row (Taipei) is still being revised during the day and is dropped.
+    """
+    today = today or dt.datetime.now(ZoneInfo("Asia/Taipei")).date()
+    rows = []
+    for line in text.lstrip("\ufeff").split("\n")[1:]:  # not splitlines(): it also breaks on \x85
+        c = [x.strip() for x in line.split(",")]
+        if len(c) < 15 or not c[0].isdigit():
+            continue
+        try:
+            buy, sell = float(c[4]), float(c[14])
+        except ValueError:
+            continue
+        if buy > 0 and sell > 0 and pd.Timestamp(c[0]).date() < today:
+            rows.append((pd.Timestamp(c[0]), (buy + sell) / 2))
+    if not rows:
+        raise RuntimeError("Bank of Taiwan returned no rates")
+    return _close_only([d for d, _ in rows], [v for _, v in rows])
+
+
+def bot_rate(currency: str = "USD") -> pd.DataFrame:
+    # The reply declares no charset (requests would assume Latin-1); the file is UTF-8 with a BOM.
+    r = http.request("GET", f"https://rate.bot.com.tw/xrt/flcsv/0/L3M/{currency}", retries=1)
+    return parse_bot_rates(r.content.decode("utf-8-sig"))
+
+
+def parse_coinbase(rows: list[list], today: dt.date | None = None) -> pd.DataFrame:
+    """Coinbase Exchange daily candles [[epoch, low, high, open, close, volume], ...] (newest first).
+
+    Candles are UTC days; today's is still forming and is dropped.
+    """
+    if not rows:
+        raise RuntimeError("Coinbase returned no candles")
+    df = pd.DataFrame(rows, columns=["t", "low", "high", "open", "close", "volume"])
+    df.index = pd.to_datetime(df["t"], unit="s").dt.normalize()
+    today = today or dt.datetime.now(dt.timezone.utc).date()
+    return _finish(df[df.index.date < today])
+
+
+def coinbase_daily(product: str = "BTC-USD") -> pd.DataFrame:
+    return parse_coinbase(http.get_json(f"https://api.exchange.coinbase.com/products/{product}/candles",
+                                        params={"granularity": 86400}, retries=1))
 
 
 def splice(old: pd.DataFrame | None, new: pd.DataFrame, append_only: bool = False) -> pd.DataFrame:
@@ -243,9 +328,9 @@ def splice(old: pd.DataFrame | None, new: pd.DataFrame, append_only: bool = Fals
 
     `new` wins where they overlap. If the two disagree by a steady factor on the overlap
     (a split applied by one source but not yet in the store), the older stored bars are
-    rescaled by that factor so the series stays continuous. `append_only` (close-only
-    sources such as FRED) keeps every stored bar and adds only the dates after it, so
-    real open/high/low values are never flattened.
+    rescaled by that factor so the series stays continuous. `append_only` (close-only or
+    look-alike sources: FRED, Treasury, Bank of Taiwan, futures for spot) keeps every stored
+    bar and adds only the dates after it.
     """
     if old is None or not len(old):
         return new
@@ -260,41 +345,86 @@ def splice(old: pd.DataFrame | None, new: pd.DataFrame, append_only: bool = Fals
     return merge(old, new)
 
 
-def us_daily(ticker: str, kind: str = "stock", scale: float = 1.0, old: pd.DataFrame | None = None,
-             breaker: Breaker = BREAKER, fetchers: dict | None = None) -> tuple[pd.DataFrame, list, str]:
-    """Daily history for a US stock, ETF or Cboe index code, trying each source in turn.
+def run_chain(steps: list[tuple], old: pd.DataFrame | None = None, breaker: Breaker = BREAKER,
+              today: dt.date | None = None, stale_days: int = STALE_DAYS) -> tuple[pd.DataFrame, list, str]:
+    """Try `steps` = [(source, fetch, mode), ...] in order; `fetch()` returns (frame, intraday_raw).
 
-    Returns (frame, cboe_intraday_raw, source_name). Stocks and ETFs: Cboe -> stockanalysis.com
-    -> Yahoo. Indices (codes starting with '_'): Cboe -> Yahoo -> FRED (close only). Fallback
-    downloads are spliced onto `old` (the stored history) so a short download keeps the depth.
-    `fetchers` replaces the network calls in tests.
+    mode "full": the download is the whole history (used as is). "splice": joined onto `old`, new
+    wins. "append": only dates after the stored history are added. The first source that answers
+    is the result; if its last bar is more than `stale_days` old, later sources add newer dates
+    (append only). Index and macro series use 1 (FRED often lags a day or two); the many US
+    stocks keep the looser default so a fresh primary never triggers extra requests. Returns (frame, raw, label) where label names every source that contributed.
     """
-    alt = INDEX_ALT.get(ticker, {})
-    is_index = ticker.startswith("_")
-    f = fetchers or {
-        "cboe": lambda: _cboe_with_session(ticker, scale),
-        "stockanalysis": lambda: (stockanalysis_daily(ticker, kind, 1 if old is not None and len(old) >= 250 else 5), []),
-        "yahoo": lambda: (yahoo_daily_us(alt.get("yahoo", ticker)), []),
-        "fred": lambda: (fred_daily(alt["fred"]), []),
-    }
-    order = ["cboe", "yahoo", "fred"] if is_index else ["cboe", "stockanalysis", "yahoo"]
-    order = [s for s in order if s != "fred" or "fred" in alt]
-    errors = []
-    for name in order:
+    today = today or dt.date.today()
+    df, raw, used, errors = None, [], [], []
+    for name, fetch, mode in steps:
+        if df is not None and (today - df.index[-1].date()).days <= stale_days:
+            break
         if not breaker.ok(name):
             errors.append(f"{name}: off")
             continue
         try:
-            df, raw = f[name]()
-            if df is None or len(df) < 5:
+            got, r = fetch()
+            if got is None or len(got) < 5:
                 raise RuntimeError("too few rows")
         except Exception as e:  # noqa: BLE001 - try the next source
             breaker.failure(name)
             errors.append(f"{name}: {str(e)[:60]}")
             continue
         breaker.success(name)
-        return (df if name == "cboe" else splice(old, df, append_only=name == "fred")), raw, name
-    raise RuntimeError("all US price sources failed (" + "; ".join(errors) + ")")
+        if df is None:
+            df, raw = (got if mode == "full" else splice(old, got, append_only=mode == "append")), r
+            used.append(name)
+        elif got.index[-1] > df.index[-1]:  # a fresher alternate tops up a lagging primary
+            df = splice(df, got, append_only=True)
+            used.append(name)
+    if df is None:
+        raise RuntimeError("all sources failed (" + "; ".join(errors) + ")")
+    return df, raw, "+".join(used)
+
+
+def source_label(used: str) -> str:
+    return " + ".join(SOURCE_LABEL.get(u, u) for u in used.split("+"))
+
+
+FETCH = {  # source name -> callable(code, kind, scale, old) -> (frame, intraday_raw)
+    "cboe": lambda code, kind, scale, old: _cboe_with_session(code, scale),
+    "stockanalysis": lambda code, kind, scale, old: (
+        stockanalysis_daily(code, kind, 1 if old is not None and len(old) >= 250 else 5), []),
+    "yahoo": lambda code, kind, scale, old: (yahoo_series(code), []),
+    "fred": lambda code, kind, scale, old: (fred_daily(code), []),
+    "treasury": lambda code, kind, scale, old: (treasury_yield(code), []),
+    "bot": lambda code, kind, scale, old: (bot_rate(code), []),
+    "coinbase": lambda code, kind, scale, old: (coinbase_daily(code), []),
+}
+MODE = {"cboe": "full", "stockanalysis": "splice", "yahoo": "splice", "fred": "append",
+        "treasury": "append", "bot": "append", "coinbase": "append"}
+
+
+def series_steps(chain: list[dict], kind: str = "index", scale: float = 1.0,
+                 old: pd.DataFrame | None = None) -> list[tuple]:
+    """Config chain [{"source": .., "code": .., "mode"?: ..}, ...] -> run_chain steps."""
+    return [(c["source"], (lambda c=c: FETCH[c["source"]](c["code"], c.get("kind", kind), scale, old)),
+             c.get("mode") or MODE[c["source"]]) for c in chain]
+
+
+def us_daily(ticker: str, kind: str = "stock", scale: float = 1.0, old: pd.DataFrame | None = None,
+             breaker: Breaker = BREAKER, fetchers: dict | None = None) -> tuple[pd.DataFrame, list, str]:
+    """Daily history for a US stock, ETF or Cboe index code, trying each source in turn.
+
+    Stocks and ETFs: Cboe -> stockanalysis.com -> Yahoo. Cboe index codes ('_SPX'...): Cboe ->
+    Yahoo -> FRED (close only). `fetchers` ({source: () -> (frame, raw)}) replaces the network in tests.
+    """
+    alt = INDEX_ALT.get(ticker, {})
+    if ticker.startswith("_"):
+        chain = [{"source": "cboe", "code": ticker}, {"source": "yahoo", "code": alt.get("yahoo", ticker)}]
+        chain += [{"source": "fred", "code": alt["fred"]}] if "fred" in alt else []
+    else:
+        chain = [{"source": s, "code": ticker} for s in ("cboe", "stockanalysis", "yahoo")]
+    steps = series_steps(chain, kind, scale, old)
+    if fetchers:
+        steps = [(n, fetchers[n], m) for n, _, m in steps]
+    return run_chain(steps, old, breaker)
 
 
 def _cboe_with_session(ticker: str, scale: float) -> tuple[pd.DataFrame, list]:

@@ -154,6 +154,17 @@ def shard_get(folder: str) -> dict[str, dict]:
     return out
 
 
+def shard_recent(folder: str, months: int = 2) -> dict[str, dict]:
+    """The last `months` monthly shards of an archive as {date: {code: value}}."""
+    out: dict[str, dict] = {}
+    for path in sorted((DATA / "history" / folder).glob("*.json"))[-months:]:
+        sh = read_json(path, {})
+        codes = sh.get("codes") or []
+        for d, row in (sh.get("rows") or {}).items():
+            out[d] = {c: v for c, v in zip(codes, row) if v is not None}
+    return out
+
+
 def shard_days(folder: str) -> set[str]:
     return {d for path in (DATA / "history" / folder).glob("*.json") for d in (read_json(path, {}).get("rows") or {})}
 
@@ -383,7 +394,7 @@ def stock_flows(trading_days: list[str]) -> tuple[list[str], dict[str, list[tupl
 SOURCE_URL = {"cboe": "https://www.cboe.com", "fred": "https://fred.stlouisfed.org",
               "twse": "https://www.twse.com.tw"}
 DEEP: dict[str, bool] = {}  # symbols whose pre-TWSE history was filled from Yahoo this run
-US_SOURCE: dict[str, str] = {}  # US symbol -> the price source that answered this run (prices.us_daily)
+US_SOURCE: dict[str, str] = {}  # symbol -> the price source(s) that answered this run ("fred+bot")
 
 
 def load_store(symbol: str) -> tuple[pd.DataFrame, dict]:
@@ -423,18 +434,43 @@ def fetch_index(ix: dict, intraday: dict) -> pd.DataFrame:
     return clean(ix["symbol"], df, market, spike_limit=SPIKE.get(ix["symbol"], 0.35))
 
 
+# Alternates for each index and macro series, tried in order after the configured primary
+# (prices.run_chain). A primary that lags is topped up with newer dates from these. The Fed's
+# broad dollar index (DTWEXBGS) has no free equivalent - ICE's DXY is a different index - so it
+# keeps FRED alone rather than splicing another series in.
+SERIES_FALLBACK = {
+    "SPX": [{"source": "yahoo", "code": "^GSPC"}, {"source": "fred", "code": "SP500"}],
+    "DJI": [{"source": "yahoo", "code": "^DJI"}, {"source": "fred", "code": "DJIA"}],
+    "SOXX": [{"source": "stockanalysis", "code": "SOXX", "kind": "etf"}, {"source": "yahoo", "code": "SOXX"}],
+    "VIX": [{"source": "yahoo", "code": "^VIX"}, {"source": "fred", "code": "VIXCLS"}],
+    "GLD": [{"source": "stockanalysis", "code": "GLD", "kind": "etf"}, {"source": "yahoo", "code": "GLD"}],
+    "NDQ": [{"source": "yahoo", "code": "^IXIC", "mode": "append"}],
+    "US10Y": [{"source": "treasury", "code": "10 Yr"}],
+    "USDTWD": [{"source": "bot", "code": "USD"}, {"source": "yahoo", "code": "TWD=X", "mode": "append"}],
+    "WTI": [{"source": "yahoo", "code": "CL=F", "mode": "append"}],  # front-month futures for the spot price
+    "BTC": [{"source": "coinbase", "code": "BTC-USD"}, {"source": "yahoo", "code": "BTC-USD", "mode": "append"}],
+    "TWII": [{"source": "yahoo", "code": "^TWII", "mode": "append"}],
+}
+
+
 def _fetch_index(ix: dict, intraday: dict) -> pd.DataFrame:
     sym, scale = ix["symbol"], ix.get("scale", 1)
-    if ix["source"] == "fred":
-        return prices.fred_daily(ix["code"])
+    old = load_store(sym)[0]
+    if ix["source"] == "twse":
+        primary = [("twse", lambda: (_fetch_taiex(ix), []), "full")]
+    else:
+        primary = prices.series_steps([{"source": ix["source"], "code": ix["code"]}], "index", scale, old)
+    # Alternates never take the Cboe scale (_DJX is the Dow / 100; they publish the full level).
+    steps = primary + prices.series_steps(SERIES_FALLBACK.get(sym, []), "index", 1.0, old)
+    df, raw, src = prices.run_chain(steps, old if len(old) else None, stale_days=1)
+    US_SOURCE[sym] = src
     if ix["source"] == "cboe":
-        # Cboe first; when it refuses, Yahoo or FRED (see prices.us_daily). Codes without an
-        # index mapping (SOXX, GLD) are ETFs and fall back to stockanalysis.com and Yahoo.
-        kind = "index" if ix["code"] in prices.INDEX_ALT else "etf"
-        df, raw, src = prices.us_daily(ix["code"], kind, scale, old=load_store(sym)[0])
-        US_SOURCE[sym] = src
         intraday[sym] = prices.intraday_5m(raw, scale)
-        return df
+    return df
+
+
+def _fetch_taiex(ix: dict) -> pd.DataFrame:
+    sym = ix["symbol"]
     # TAIEX: stored history + official monthly OHLC tables for the months since the last bar.
     old, payload = load_store(sym)
     today = dt.datetime.now(TPE).date()
@@ -955,12 +991,11 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     for ix in CFG["indices"]:
         sym = ix["symbol"]
         # One more try after a pause: the quote hosts answer 429 to short bursts and recover quickly.
-        label = "美股指數" if ix["source"] == "cboe" else f"{ix['source'].upper()} 指數"
-        df = safe(f"{label} {ix['name']}",
+        df = safe(f"指數 {ix['name']}",
                   lambda i=ix: retry(lambda: fetch_index(i, intraday), attempts=2, wait=40),
                   url=SOURCE_URL[ix["source"]])
         if sym in US_SOURCE and SOURCES[-1]["ok"]:
-            SOURCES[-1]["note"] = "來源：" + prices.SOURCE_LABEL[US_SOURCE[sym]]
+            SOURCES[-1]["note"] = "來源：" + prices.source_label(US_SOURCE[sym])
         if df is None or len(df) < 120:
             df, _ = load_store(sym)  # keep last week's history rather than dropping the series
             if len(df):
@@ -1089,8 +1124,12 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
 
     # ---- 3. universes -------------------------------------------------------
     forced = [k for k in CFG["aliases"] if k.isdigit()]
+    # Rank by the 20-session average traded value, not one day's: a single heavy session (a sharp
+    # rally or sell-off) used to swap a third of the universe in one run. The daily closes and
+    # volumes are already archived (history/pit_closes, pit_volume): no extra requests.
+    turnover = twse.avg_turnover(quotes, shard_recent("pit_closes"), shard_recent("pit_volume"))
     ranked = sorted((c for c in quotes if twse.COMMON_STOCK.match(c) and quotes[c]["value"]),
-                    key=lambda c: -quotes[c]["value"])
+                    key=lambda c: -turnover.get(c, 0.0))
     n_tw = 12 if QUICK else CFG["tw_universe_size"]
     tw_codes = list(dict.fromkeys(ranked[:n_tw] + [c for c in forced if c in quotes]))
     if not tw_codes:  # TWSE snapshot down -> fall back to the well-known names
@@ -1241,10 +1280,11 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     used = {}
     for t in us_all:
         if t in US_SOURCE:
-            used[US_SOURCE[t]] = used.get(US_SOURCE[t], 0) + 1
+            k = prices.source_label(US_SOURCE[t])
+            used[k] = used.get(k, 0) + 1
     SOURCES.append({"name": "美股每日行情（Cboe → stockanalysis.com → Yahoo）", "ok": fails < len(us_all),
                     "url": "https://www.cboe.com",
-                    "note": "、".join(f"{prices.SOURCE_LABEL[k]} {v} 檔" for k, v in used.items())
+                    "note": "、".join(f"{k} {v} 檔" for k, v in used.items())
                     + f"；{fails} 檔全部來源失敗" + ("；停用：" + "、".join(prices.SOURCE_LABEL[k] for k in sorted(prices.BREAKER.off))
                                               if prices.BREAKER.off else "")})
     if stale:

@@ -1544,7 +1544,7 @@ def test_us_daily_indices_use_yahoo_then_fred_and_never_stockanalysis():
     f = {"cboe": fail, "yahoo": fail, "stockanalysis": lambda: (_ for _ in ()).throw(AssertionError), "fred": lambda: (fred, [])}
     df, _, src = prices.us_daily("_SPX", "index", breaker=br, fetchers=f)
     assert src == "fred" and len(df) == 10
-    with pytest.raises(RuntimeError, match="all US price sources failed"):
+    with pytest.raises(RuntimeError, match="all sources failed"):
         prices.us_daily("SOXX", "etf", breaker=prices.Breaker(), fetchers={"cboe": fail, "stockanalysis": fail, "yahoo": fail})
 
 
@@ -1568,3 +1568,47 @@ def test_stockanalysis_parsing_and_paths():
     assert list(df.index.strftime("%Y-%m-%d")) == ["2026-11-23", "2026-11-24"] and df["close"].iloc[-1] == 354.07
     assert prices.stockanalysis_path("BRK-B", "stock") == "s/brk.b" and prices.stockanalysis_path("SOXX", "etf") == "e/soxx"
     assert prices.INDEX_ALT["_DJX"]["fred"] == "DJIA" and prices.INDEX_ALT["_VIX3M"]["yahoo"] == "^VIX3M"
+
+
+def test_run_chain_tops_up_a_lagging_primary_and_labels_every_source():
+    today = dt.date(2024, 3, 1)
+    stale = _bars("2024-01-01", [1.0] * 40)                     # ends 2024-02-23: a week old
+    fresh = _bars("2024-01-01", [2.0] * 45)                     # ends 2024-03-01
+    steps = [("fred", lambda: (stale, []), "append"), ("bot", lambda: (fresh, []), "append")]
+    df, _, used = prices.run_chain(steps, None, prices.Breaker(), today=today, stale_days=1)
+    assert used == "fred+bot" and df.index[-1] == fresh.index[-1]
+    assert (df.loc[stale.index, "close"] == 1.0).all()        # the primary's own bars are kept
+    assert prices.source_label(used) == "FRED + 臺灣銀行"
+    calls = []
+    current = _bars("2024-01-01", [1.0] * 44)                  # ends 2024-02-29: within a day
+    prices.run_chain([("fred", lambda: (current, []), "append"),
+                      ("bot", lambda: calls.append(1) or (fresh, []), "append")],
+                     None, prices.Breaker(), today=today, stale_days=1)
+    assert calls == []                                          # a fresh primary asks nobody else
+
+
+def test_bot_treasury_and_coinbase_parsers():
+    head = "資料日期,幣別," + ",".join(["x"] * 20) + "\r\n"
+    row = lambda d: f"{d},USD,本行買入,32.7,33.0,1,1,1,1,1,1,1,本行賣出,33.4,33.2,1,1,1,1,1,1,1\r\n"  # noqa: E731
+    text = "﻿" + head + row("20261124") + row("20261125") + "".join(row(f"202611{d:02d}") for d in range(1, 6))
+    df = prices.parse_bot_rates(text, today=dt.date(2026, 11, 25))
+    assert df.index[-1] == pd.Timestamp("2026-11-24") and df["close"].iloc[-1] == pytest.approx(33.1)
+    tr = prices.parse_treasury('Date,"1 Mo","10 Yr"\n11/24/2026,4.21,4.91\n11/23/2026,4.20,4.92\n')
+    assert list(tr["close"]) == [4.92, 4.91] and tr.index[-1] == pd.Timestamp("2026-11-24")
+    day = 86400
+    t0 = int(pd.Timestamp("2026-11-24").timestamp())
+    cb = prices.parse_coinbase([[t0 + day, 1, 3, 2, 2.5, 9], [t0, 1, 3, 2, 2.4, 9]], today=dt.date(2026, 11, 25))
+    assert list(cb.index) == [pd.Timestamp("2026-11-24")] and cb["close"].iloc[0] == 2.4   # today's candle dropped
+
+
+def test_avg_turnover_ranks_on_the_month_not_one_day():
+    days = [f"2026-11-{d:02d}" for d in range(3, 23)]
+    lots = {d: {"A": 10000, "B": 10} for d in days}            # A: 1e8 a day all month, B barely
+    closes = {d: {"A": 10.0, "B": 10.0} for d in days}
+    quotes = {"A": {"value": 1e8, "date": "2026-11-24"}, "B": {"value": 5e8, "date": "2026-11-24"},
+              "C": {"value": 9e8, "date": "2026-11-24"}}        # C: one huge day, no history
+    t = twse.avg_turnover(quotes, closes, lots)
+    assert t["A"] > t["B"] and t["A"] > t["C"]                  # one heavy session does not win
+    assert t["C"] == pytest.approx(9e8 / 20)
+    same_day = {"A": {"value": 1e7, "date": days[-1]}}         # the snapshot's own day is not counted twice
+    assert twse.avg_turnover(same_day, closes, lots)["A"] == pytest.approx((1e7 + 19 * 1e8) / 20)

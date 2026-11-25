@@ -112,6 +112,29 @@ def quotes() -> dict[str, dict]:
     return out
 
 
+def avg_turnover(quotes: dict[str, dict], closes: dict[str, dict], lots: dict[str, dict],
+                 n: int = 20) -> dict[str, float]:
+    """Average daily traded value (TWD) over the last `n` sessions, per code.
+
+    quotes: today's snapshot {code: {"value", "date"}}; closes / lots: archived days
+    {date: {code: close}} and {date: {code: volume in lots}}. Value on an archived day is
+    close x lots x 1000. Days without a trade count as zero, so a stock that only just started
+    trading heavily ranks below one that has been active the whole month. The snapshot's own
+    date is never counted twice.
+    """
+    today = max((q.get("date") or "" for q in quotes.values()), default="")
+    days = sorted(d for d in lots if d < today)[-(n - 1):] if today else []
+    out = {}
+    for code, q in quotes.items():
+        total = q.get("value") or 0.0
+        for d in days:
+            v, p = (lots.get(d) or {}).get(code), (closes.get(d) or {}).get(code)
+            if v and p:
+                total += v * 1000 * p
+        out[code] = total / (len(days) + 1)
+    return out
+
+
 def valuation() -> dict[str, dict]:
     return {r["Code"].strip(): {"pe": num(r["PEratio"]), "yield": num(r["DividendYield"]),
                                 "pb": num(r["PBratio"])}

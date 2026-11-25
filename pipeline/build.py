@@ -28,6 +28,7 @@ DATA = ROOT / "docs" / "data"
 CHARTS = DATA / "charts"
 CFG = json.loads((ROOT / "config" / "settings.json").read_text(encoding="utf-8"))
 CUSIP_CACHE = ROOT / "config" / "cusip_cache.json"
+FT_IDS = ROOT / "config" / "ft_ids.json"  # ticker -> Financial Times id (one search per new ticker)
 QUICK = os.environ.get("QUICK") == "1"
 # SEC asks automated clients to say who they are ("name contact"); the owner's contact is in the config.
 http.SEC_UA = os.environ.get("SEC_USER_AGENT") or CFG.get("sec_contact") or http.SEC_UA
@@ -439,17 +440,25 @@ def fetch_index(ix: dict, intraday: dict) -> pd.DataFrame:
 # broad dollar index (DTWEXBGS) has no free equivalent - ICE's DXY is a different index - so it
 # keeps FRED alone rather than splicing another series in.
 SERIES_FALLBACK = {
-    "SPX": [{"source": "yahoo", "code": "^GSPC"}, {"source": "fred", "code": "SP500"}],
-    "DJI": [{"source": "yahoo", "code": "^DJI"}, {"source": "fred", "code": "DJIA"}],
-    "SOXX": [{"source": "stockanalysis", "code": "SOXX", "kind": "etf"}, {"source": "yahoo", "code": "SOXX"}],
-    "VIX": [{"source": "yahoo", "code": "^VIX"}, {"source": "fred", "code": "VIXCLS"}],
-    "GLD": [{"source": "stockanalysis", "code": "GLD", "kind": "etf"}, {"source": "yahoo", "code": "GLD"}],
-    "NDQ": [{"source": "yahoo", "code": "^IXIC", "mode": "append"}],
-    "US10Y": [{"source": "treasury", "code": "10 Yr"}],
-    "USDTWD": [{"source": "bot", "code": "USD"}, {"source": "yahoo", "code": "TWD=X", "mode": "append"}],
-    "WTI": [{"source": "yahoo", "code": "CL=F", "mode": "append"}],  # front-month futures for the spot price
-    "BTC": [{"source": "coinbase", "code": "BTC-USD"}, {"source": "yahoo", "code": "BTC-USD", "mode": "append"}],
-    "TWII": [{"source": "yahoo", "code": "^TWII", "mode": "append"}],
+    "SPX": [{"source": "yahoo", "code": "^GSPC"}, {"source": "ft", "code": "575769"},
+            {"source": "fred", "code": "SP500"}],
+    "DJI": [{"source": "yahoo", "code": "^DJI"}, {"source": "ft", "code": "599362"},
+            {"source": "fred", "code": "DJIA"}],
+    "SOXX": [{"source": "stockanalysis", "code": "SOXX", "kind": "etf"}, {"source": "ft", "code": "SOXX"},
+             {"source": "yahoo", "code": "SOXX"}],
+    "VIX": [{"source": "yahoo", "code": "^VIX"}, {"source": "fred", "code": "VIXCLS"}],  # FT does not carry the VIX
+    "GLD": [{"source": "stockanalysis", "code": "GLD", "kind": "etf"}, {"source": "ft", "code": "GLD"},
+            {"source": "yahoo", "code": "GLD"}],
+    "NDQ": [{"source": "ft", "code": "579435", "mode": "append"}, {"source": "yahoo", "code": "^IXIC", "mode": "append"}],
+    "US10Y": [{"source": "treasury", "code": "10 Yr"}, {"source": "ft", "code": "11523680", "mode": "append"}],
+    "USDTWD": [{"source": "bot", "code": "USD"}, {"source": "ft", "code": "612220", "kind": "fx", "mode": "append"},
+               {"source": "yahoo", "code": "TWD=X", "mode": "append"}],
+    "WTI": [{"source": "eia", "code": "RWTC"},  # the spot price itself; FRED copies it from EIA
+            {"source": "ft", "code": "1070572", "kind": "future", "mode": "append"},  # front-month futures
+            {"source": "yahoo", "code": "CL=F", "mode": "append"}],
+    "BTC": [{"source": "coinbase", "code": "BTC-USD"}, {"source": "coingecko", "code": "bitcoin"},
+            {"source": "yahoo", "code": "BTC-USD", "mode": "append"}],
+    "TWII": [{"source": "twse_open", "code": "TAIEX"}, {"source": "yahoo", "code": "^TWII", "mode": "append"}],
 }
 
 
@@ -983,6 +992,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
     prev_smart = read_json(DATA / "smart_money.json", {})
     prev_pod = read_json(DATA / "podcasts.json", {})
 
+    prices.FT_IDS.update(read_json(FT_IDS, {}))
     # ---- 1. indices (official sources; stored history is the fallback) -------
     frames: dict[str, pd.DataFrame] = {}
     meta: dict[str, dict] = {}
@@ -1282,7 +1292,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
         if t in US_SOURCE:
             k = prices.source_label(US_SOURCE[t])
             used[k] = used.get(k, 0) + 1
-    SOURCES.append({"name": "美股每日行情（Cboe → stockanalysis.com → Yahoo）", "ok": fails < len(us_all),
+    SOURCES.append({"name": "美股每日行情（Cboe → stockanalysis.com → FT → Yahoo）", "ok": fails < len(us_all),
                     "url": "https://www.cboe.com",
                     "note": "、".join(f"{k} {v} 檔" for k, v in used.items())
                     + f"；{fails} 檔全部來源失敗" + ("；停用：" + "、".join(prices.SOURCE_LABEL[k] for k in sorted(prices.BREAKER.off))
@@ -2076,6 +2086,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915 - a linear pipeline reads bes
                    "us": sum(r["market"] == "US" for r in records), "etf": len(etf_records),
                    "fund": len(fund_records)}})
     safe("訂閱檔（行事曆 iCal、本週變化 Atom）", feeds.write_feeds, None)
+    write_json(FT_IDS, dict(sorted(prices.FT_IDS.items())))
     bad = [s["name"] for s in SOURCES if not s["ok"]]
     log(f"done: {len(records)} stocks, {len(etf_records)} ETFs, {len(fund_records)} funds, {len(picks)} picks, "
         f"{len(hot)} podcast-hot, "

@@ -1530,7 +1530,8 @@ def test_us_daily_falls_through_and_breaker_switches_a_dead_source_off():
         raise RuntimeError("HTTP 403")
     good = _bars("2024-01-01", [10.0] * 30)
     br = prices.Breaker(limit=3)
-    f = {"cboe": dead, "stockanalysis": lambda: (good, []), "yahoo": lambda: (_ for _ in ()).throw(AssertionError)}
+    f = {"cboe": dead, "stockanalysis": lambda: (good, []), "ft": lambda: (good, []),
+         "yahoo": lambda: (_ for _ in ()).throw(AssertionError)}
     for _ in range(5):
         df, raw, src = prices.us_daily("AAPL", "stock", breaker=br, fetchers=f)
         assert src == "stockanalysis" and len(df) == 30 and raw == []
@@ -1545,7 +1546,8 @@ def test_us_daily_indices_use_yahoo_then_fred_and_never_stockanalysis():
     df, _, src = prices.us_daily("_SPX", "index", breaker=br, fetchers=f)
     assert src == "fred" and len(df) == 10
     with pytest.raises(RuntimeError, match="all sources failed"):
-        prices.us_daily("SOXX", "etf", breaker=prices.Breaker(), fetchers={"cboe": fail, "stockanalysis": fail, "yahoo": fail})
+        prices.us_daily("SOXX", "etf", breaker=prices.Breaker(),
+                        fetchers={"cboe": fail, "stockanalysis": fail, "ft": fail, "yahoo": fail})
 
 
 def test_splice_keeps_depth_rescales_a_split_and_fred_only_appends():
@@ -1622,3 +1624,42 @@ def test_drop_unfinished_keeps_only_closed_sessions():
     assert prices.drop_unfinished(df, now=after).index[-1] == pd.Timestamp("2026-11-25")
     next_morning = dt.datetime(2026, 11, 26, 9, 0)              # yesterday's bar is final
     assert len(prices.drop_unfinished(df, now=next_morning)) == 3
+
+
+def test_ft_symbol_matching_and_chart_parsing():
+    found = [{"symbol": "BRK A:NYQ", "xid": "65806"}, {"symbol": "BRK B:NYQ", "xid": "65816"},
+             {"symbol": "SOXX:MEX:MXN", "xid": "1"}, {"symbol": "SOXX:NMQ:USD", "xid": "164751"}]
+    assert prices.ft_match("BRK-B", found) == "65816" and prices.ft_match("SOXX", found) == "164751"
+    assert prices.ft_match("SMH", found) is None
+    j = {"Dates": ["2026-11-23T00:00:00", "2026-11-24T00:00:00"],
+         "Elements": [{"ComponentSeries": [{"Type": "Open", "Values": [347.87, 348.06]}, {"Type": "High", "Values": [352.6, 354.4]},
+                                           {"Type": "Low", "Values": [345.44, 345.88]}, {"Type": "Close", "Values": [349.08, 354.07]}]},
+                      {"ComponentSeries": [{"Type": "Volume", "Values": [58588703.0, 41270446.0]}]}]}
+    df = prices.parse_ft(j)
+    assert df["close"].iloc[-1] == 354.07 and df["volume"].iloc[0] == 58588703.0
+
+
+def test_not_listed_skips_a_source_without_switching_it_off():
+    br, good = prices.Breaker(limit=1), _bars("2024-01-01", [1.0] * 10)
+
+    def missing():
+        raise prices.NotListed("not on FT")
+    for _ in range(3):
+        _, _, used = prices.run_chain([("ft", missing, "splice"), ("yahoo", lambda: (good, []), "splice")], None, br,
+                                      today=dt.date(2024, 1, 12))
+        assert used == "yahoo"
+    assert br.ok("ft")                                          # still on for the tickers FT does carry
+
+
+def test_eia_coingecko_and_twse_openapi_parsers():
+    html = ("<td class='B6'>&nbsp;&nbsp;2026 Nov-17 to Nov-21</td> <td class='B3'>80.1</td> <td class='B3'>80.2</td>"
+            " <td class='B3'></td> <td class='B3'>80.4</td> <td class='B3'>80.5</td>")
+    e = prices.parse_eia_weekly(html)
+    assert list(e.index.strftime("%m-%d")) == ["11-17", "11-18", "11-20", "11-21"] and e["close"].iloc[-1] == 80.5
+    ms = lambda d: int(pd.Timestamp(d).timestamp() * 1000)  # noqa: E731
+    cg = prices.parse_coingecko({"prices": [[ms("2026-11-24"), 100.0], [ms("2026-11-25"), 110.0],
+                                            [ms("2026-11-25 13:05"), 120.0]]}, today=dt.date(2026, 11, 25))
+    assert list(cg.index.strftime("%m-%d")) == ["11-23", "11-24"] and cg["close"].iloc[-1] == 110.0  # live point dropped
+    tw = prices.parse_twse_open_index([{"Date": "1151124", "OpeningIndex": "39,000.1", "HighestIndex": "40,200.5",
+                                        "LowestIndex": "38,900.0", "ClosingIndex": "40,122.35"}])
+    assert tw.index[0] == pd.Timestamp("2026-11-24") and tw["close"].iloc[0] == 40122.35

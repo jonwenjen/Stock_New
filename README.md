@@ -146,9 +146,9 @@ tests/                 純函式與解析器的單元測試
 | 台股行情、三大法人、融資融券、本益比、月營收、EPS、董監持股 | 臺灣證券交易所（OpenAPI 與公開報表） |
 | 外資台指期未平倉 | 臺灣期貨交易所 OpenAPI；歷史走勢取自期交所三大法人下載專區 |
 | 全球金融壓力指數 | 美國財政部金融研究辦公室（OFR Financial Stress Index，33 個市場變數） |
-| 美股與指數行情 | Cboe 公開延遲行情；Cboe 拒絕時，個股與 ETF 改用 stockanalysis.com，再不行用 Yahoo Finance；指數改用 Yahoo，再不行用 FRED（只有收盤價、晚一天）。連續失敗 3 次的來源當次停用，網站「方法與來源」分頁會列出每個來源實際提供幾檔 |
-| 殖利率、匯率、油價、比特幣、那斯達克綜合指數 | FRED（聖路易聯邦準備銀行）。FRED 失敗或晚一天以上時，依序改用：10 年期殖利率→美國財政部官方殖利率曲線；美元／台幣→臺灣銀行牌告（即期買賣中價）、Yahoo；比特幣→Coinbase、Yahoo；原油→Yahoo 近月期貨（CL=F）；那斯達克→Yahoo。備援只補 FRED 之後的新日期，不改寫已存的歷史。Fed 廣義美元指數沒有免費的同一指數可替代，只用 FRED |
-| 台灣加權指數 | 證交所；失敗時以 Yahoo（^TWII）補上新日期 |
+| 美股與指數行情 | Cboe 公開延遲行情；Cboe 拒絕時，個股與 ETF 依序改用 stockanalysis.com、FT（金融時報行情 API）、Yahoo Finance；S&P 500 與道瓊依序改用 Yahoo、FT、FRED；VIX 改用 Yahoo、FRED（FT 沒有 VIX）。連續失敗 3 次的來源當次停用；某檔不在 FT 上時只跳過該檔，不算失敗。FT 的代號查一次後存在 `config/ft_ids.json`。網站「方法與來源」分頁會列出每個來源實際提供幾檔 |
+| 殖利率、匯率、油價、比特幣、那斯達克綜合指數 | FRED（聖路易聯邦準備銀行）。FRED 失敗或晚一天以上時，依序改用：10 年期殖利率→美國財政部官方殖利率曲線、FT；美元／台幣→臺灣銀行牌告（即期買賣中價）、FT、Yahoo；比特幣→Coinbase、CoinGecko、Yahoo；原油→EIA 現貨價（FRED 的原始來源）、FT 近月期貨、Yahoo 近月期貨；那斯達克→FT、Yahoo。備援只補新日期，不改寫已存的歷史；尚未收盤的當天一律不存。Fed 廣義美元指數沒有免費的同一指數可替代，只用 FRED |
+| 台灣加權指數 | 證交所；失敗時依序以證交所 OpenAPI（不同主機，當月 K 線）、Yahoo（^TWII）補上新日期 |
 | 美股 EPS 與營收 | SEC EDGAR XBRL |
 | 名人基金持股 | SEC EDGAR 13F-HR 季報，CUSIP 以 OpenFIGI 對應代號 |
 | 美國國會議員交易 | Quiver Quantitative 公開頁面（彙整自官方申報） |

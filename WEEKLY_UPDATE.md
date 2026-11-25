@@ -35,7 +35,7 @@
 6. 提交並推送。只提交資料，不要改程式。
 
    ```bash
-   git add docs/data docs/calendar.ics docs/feed.xml config/cusip_cache.json && git commit -m "data: weekly update $(date +%Y-%m-%d)" && git push origin main
+   git add docs/data docs/calendar.ics docs/feed.xml config/cusip_cache.json config/ft_ids.json && git commit -m "data: weekly update $(date +%Y-%m-%d)" && git push origin main
    ```
 
    推送因網路失敗時最多重試 4 次（間隔 2、4、8、16 秒）。若被拒絕是因為遠端較新，

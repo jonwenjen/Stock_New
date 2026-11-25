@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 import io
+import re
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -178,6 +179,10 @@ http.HOST_INTERVAL.setdefault("stockanalysis.com", 1.0)
 http.HOST_INTERVAL.setdefault("rate.bot.com.tw", 1.0)
 http.HOST_INTERVAL.setdefault("home.treasury.gov", 1.0)
 http.HOST_INTERVAL.setdefault("api.exchange.coinbase.com", 0.5)
+http.HOST_INTERVAL.setdefault("markets.ft.com", 1.0)
+http.HOST_INTERVAL.setdefault("www.eia.gov", 1.0)
+http.HOST_INTERVAL.setdefault("api.coingecko.com", 3.0)  # keyless tier: a few requests a minute
+http.HOST_INTERVAL.setdefault("openapi.twse.com.tw", 1.0)
 
 # Cboe index codes -> the same series elsewhere (used for US stocks' chain and VIX3M). Cboe's _DJX
 # is the Dow / 100 (build scales it by 100); the alternates publish the full level, never rescaled.
@@ -186,8 +191,13 @@ INDEX_ALT = {"_SPX": {"yahoo": "^GSPC", "fred": "SP500"},
              "_VIX": {"yahoo": "^VIX", "fred": "VIXCLS"},
              "_VIX3M": {"yahoo": "^VIX3M", "fred": "VXVCLS"}}
 SOURCE_LABEL = {"cboe": "Cboe", "stockanalysis": "stockanalysis.com", "yahoo": "Yahoo", "fred": "FRED",
-                "twse": "證交所", "treasury": "美國財政部", "bot": "臺灣銀行", "coinbase": "Coinbase"}
+                "twse": "證交所", "treasury": "美國財政部", "bot": "臺灣銀行", "coinbase": "Coinbase",
+                "ft": "FT", "eia": "EIA", "coingecko": "CoinGecko", "twse_open": "證交所 OpenAPI"}
 STALE_DAYS = 3  # a primary whose last bar is older than this (calendar days) is topped up from alternates
+
+
+class NotListed(Exception):
+    """The source has no such symbol: skip it for this series without counting a failure."""
 
 
 class Breaker:
@@ -340,6 +350,128 @@ def coinbase_daily(product: str = "BTC-USD") -> pd.DataFrame:
                                         params={"granularity": 86400}, retries=1))
 
 
+# ---- Financial Times markets data (charting API behind markets.ft.com; keyless, OHLC + volume) ----
+FT_US_EXCHANGES = {"NSQ", "NYQ", "NMQ", "PCQ", "ASQ", "BTQ", "NAQ", "NGQ"}
+FT_IDS: dict[str, str] = {}  # ticker -> FT "xid" ("" = not on FT); build loads and saves config/ft_ids.json
+
+
+def ft_match(ticker: str, securities: list[dict]) -> str | None:
+    """Pick the US listing of `ticker` from an FT search result. FT writes share classes with a
+    space ("BRK B:NYQ") and ETFs with a currency suffix ("SOXX:NMQ:USD")."""
+    want = ticker.upper().replace("-", "").replace(".", "")
+    for x in securities:
+        parts = (x.get("symbol") or "").split(":")
+        if len(parts) > 1 and parts[1] in FT_US_EXCHANGES and parts[0].replace(" ", "").replace(".", "").upper() == want:
+            return str(x["xid"])
+    return None
+
+
+def ft_id(ticker: str) -> str:
+    """FT's internal id for a US ticker, looked up once and cached in FT_IDS. Digits pass through."""
+    if ticker.isdigit():
+        return ticker
+    if ticker not in FT_IDS:
+        found = None
+        for q in dict.fromkeys((ticker.replace("-", "."), ticker.replace("-", " "))):
+            j = http.get_json("https://markets.ft.com/data/searchapi/searchsecurities", params={"query": q}, retries=1)
+            found = ft_match(ticker, ((j.get("data") or {}).get("security") or []))
+            if found:
+                break
+        FT_IDS[ticker] = found or ""
+    if not FT_IDS[ticker]:
+        raise NotListed("not on FT")
+    return FT_IDS[ticker]
+
+
+def parse_ft(j: dict) -> pd.DataFrame:
+    """FT chart-series reply -> daily frame (price element 'a' with Open/High/Low/Close, optional volume 'v')."""
+    dates = j.get("Dates") or []
+    if not dates:
+        raise RuntimeError("FT returned no dates")
+    cols = {}
+    for el in j.get("Elements") or []:
+        for comp in el.get("ComponentSeries") or []:
+            cols[comp["Type"].lower()] = comp.get("Values") or []
+    df = pd.DataFrame({c: cols.get(c, [None] * len(dates)) for c in COLS}, index=pd.to_datetime(dates))
+    df[COLS] = df[COLS].apply(pd.to_numeric, errors="coerce")
+    return _finish(df)
+
+
+def ft_daily(ticker_or_id: str, days: int = 1825, tz: str = "America/New_York",
+             close: dt.time = dt.time(16, 15)) -> pd.DataFrame:
+    xid = ft_id(ticker_or_id)
+    body = {"days": days, "dataNormalized": False, "dataPeriod": "Day", "dataInterval": 1, "realtime": False,
+            "yFormat": "0.###", "timeServiceFormat": "JSON", "returnDateType": "ISO8601",
+            "elements": [{"Label": "a", "Type": "price", "Symbol": xid, "OverlayIndicators": [], "Params": {}},
+                         {"Label": "v", "Type": "volume", "Symbol": xid, "OverlayIndicators": [], "Params": {}}]}
+    r = http.request("POST", "https://markets.ft.com/data/chartapi/series", json=body, retries=1, timeout=30)
+    return drop_unfinished(parse_ft(r.json()), tz, close)
+
+
+# ---- U.S. Energy Information Administration: WTI spot (Cushing), the series FRED's DCOILWTICO copies ----
+_EIA_ROW = re.compile(r"<td class='B6'>(?:&nbsp;)*\s*(\d{4})\s+([A-Za-z]{3})-\s*(\d{1,2}) to[^<]*</td>((?:\s*<td class='B3'>[^<]*</td>){5})")
+_EIA_CELL = re.compile(r"<td class='B3'>([^<]*)</td>")
+
+
+def parse_eia_weekly(html: str) -> pd.DataFrame:
+    """EIA daily-history page laid out as one row per week (Mon..Fri cells) -> close-only series."""
+    dates, vals = [], []
+    for year, mon, day, cells in _EIA_ROW.findall(html):
+        monday = pd.Timestamp(dt.datetime.strptime(f"{year} {mon} {day}", "%Y %b %d"))
+        for k, v in enumerate(_EIA_CELL.findall(cells)):
+            if v.strip():
+                dates.append(monday + pd.Timedelta(days=k))
+                vals.append(v.strip())
+    if not dates:
+        raise RuntimeError("EIA page had no prices")
+    return _close_only(dates, vals)
+
+
+def eia_daily(series: str = "RWTC") -> pd.DataFrame:
+    return parse_eia_weekly(http.get_text(f"https://www.eia.gov/dnav/pet/hist/{series}D.htm", retries=1))
+
+
+# ---- CoinGecko (keyless tier): daily bitcoin price ----
+def parse_coingecko(j: dict, today: dt.date | None = None) -> pd.DataFrame:
+    """market_chart 'prices' [[ms, price], ...]. A midnight-UTC point is the close of the day before;
+    the last point is the live price and is dropped."""
+    pts = [(pd.Timestamp(ms, unit="ms"), v) for ms, v in j.get("prices") or []]
+    pts = [(t.normalize() - pd.Timedelta(days=1), v) for t, v in pts if t == t.normalize()]
+    today = today or dt.datetime.now(dt.timezone.utc).date()
+    pts = [(t, v) for t, v in pts if t.date() < today]
+    if not pts:
+        raise RuntimeError("CoinGecko returned no daily prices")
+    return _close_only([t for t, _ in pts], [v for _, v in pts])
+
+
+def coingecko_daily(coin: str = "bitcoin", days: int = 365) -> pd.DataFrame:
+    return parse_coingecko(http.get_json(f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart",
+                                         params={"vs_currency": "usd", "days": days, "interval": "daily"}, retries=1))
+
+
+# ---- TWSE OpenAPI: TAIEX OHLC for the current month (a different host from www.twse.com.tw) ----
+def parse_twse_open_index(rows: list[dict]) -> pd.DataFrame:
+    out = []
+    for r in rows:
+        d = str(r.get("Date") or "")
+        if len(d) != 7:
+            continue
+        day = pd.Timestamp(f"{int(d[:3]) + 1911}-{d[3:5]}-{d[5:]}")
+        vals = [str(r.get(k, "")).replace(",", "") for k in ("OpeningIndex", "HighestIndex", "LowestIndex", "ClosingIndex")]
+        out.append((day, *vals))
+    if not out:
+        raise RuntimeError("TWSE OpenAPI returned no index rows")
+    df = pd.DataFrame(out, columns=["date", "open", "high", "low", "close"]).set_index("date")
+    df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].apply(pd.to_numeric, errors="coerce")
+    df["volume"] = 0.0
+    return _finish(df)
+
+
+def twse_open_taiex() -> pd.DataFrame:
+    return drop_unfinished(parse_twse_open_index(http.get_json("https://openapi.twse.com.tw/v1/indicesReport/MI_5MINS_HIST",
+                                                               retries=1)), "Asia/Taipei", dt.time(14, 0))
+
+
 def splice(old: pd.DataFrame | None, new: pd.DataFrame, append_only: bool = False) -> pd.DataFrame:
     """Join a fresh download onto the stored history.
 
@@ -384,6 +516,9 @@ def run_chain(steps: list[tuple], old: pd.DataFrame | None = None, breaker: Brea
             got, r = fetch()
             if got is None or len(got) < 5:
                 raise RuntimeError("too few rows")
+        except NotListed as e:  # the source simply does not carry this symbol
+            errors.append(f"{name}: {e}")
+            continue
         except Exception as e:  # noqa: BLE001 - try the next source
             breaker.failure(name)
             errors.append(f"{name}: {str(e)[:60]}")
@@ -413,9 +548,15 @@ FETCH = {  # source name -> callable(code, kind, scale, old) -> (frame, intraday
     "treasury": lambda code, kind, scale, old: (treasury_yield(code), []),
     "bot": lambda code, kind, scale, old: (bot_rate(code), []),
     "coinbase": lambda code, kind, scale, old: (coinbase_daily(code), []),
+    "ft": lambda code, kind, scale, old: (ft_daily(code, 400 if old is not None and len(old) >= 250 else 1825,
+                                                   *(("UTC", dt.time(23, 59, 59)) if kind in ("future", "fx") else ())), []),
+    "eia": lambda code, kind, scale, old: (eia_daily(code), []),
+    "coingecko": lambda code, kind, scale, old: (coingecko_daily(code), []),
+    "twse_open": lambda code, kind, scale, old: (twse_open_taiex(), []),
 }
 MODE = {"cboe": "full", "stockanalysis": "splice", "yahoo": "splice", "fred": "append",
-        "treasury": "append", "bot": "append", "coinbase": "append"}
+        "treasury": "append", "bot": "append", "coinbase": "append", "ft": "splice", "eia": "append",
+        "coingecko": "append", "twse_open": "append"}
 
 
 def series_steps(chain: list[dict], kind: str = "index", scale: float = 1.0,
@@ -429,7 +570,7 @@ def us_daily(ticker: str, kind: str = "stock", scale: float = 1.0, old: pd.DataF
              breaker: Breaker = BREAKER, fetchers: dict | None = None) -> tuple[pd.DataFrame, list, str]:
     """Daily history for a US stock, ETF or Cboe index code, trying each source in turn.
 
-    Stocks and ETFs: Cboe -> stockanalysis.com -> Yahoo. Cboe index codes ('_SPX'...): Cboe ->
+    Stocks and ETFs: Cboe -> stockanalysis.com -> FT -> Yahoo. Cboe index codes ('_SPX'...): Cboe ->
     Yahoo -> FRED (close only). `fetchers` ({source: () -> (frame, raw)}) replaces the network in tests.
     """
     alt = INDEX_ALT.get(ticker, {})
@@ -437,7 +578,7 @@ def us_daily(ticker: str, kind: str = "stock", scale: float = 1.0, old: pd.DataF
         chain = [{"source": "cboe", "code": ticker}, {"source": "yahoo", "code": alt.get("yahoo", ticker)}]
         chain += [{"source": "fred", "code": alt["fred"]}] if "fred" in alt else []
     else:
-        chain = [{"source": s, "code": ticker} for s in ("cboe", "stockanalysis", "yahoo")]
+        chain = [{"source": s, "code": ticker} for s in ("cboe", "stockanalysis", "ft", "yahoo")]
     steps = series_steps(chain, kind, scale, old)
     if fetchers:
         steps = [(n, fetchers[n], m) for n, _, m in steps]

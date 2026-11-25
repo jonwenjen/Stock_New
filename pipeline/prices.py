@@ -372,7 +372,10 @@ def ft_id(ticker: str) -> str:
         return ticker
     if ticker not in FT_IDS:
         found = None
-        for q in dict.fromkeys((ticker.replace("-", "."), ticker.replace("-", " "))):
+        base = ticker.replace("-", ".")
+        # A bare ticker ("ARM", "BAC") can be crowded out by other markets' listings; the
+        # exchange-qualified forms find the US one.
+        for q in dict.fromkeys((base, ticker.replace("-", " "), f"{base}:NSQ", f"{base}:NYQ")):
             j = http.get_json("https://markets.ft.com/data/searchapi/searchsecurities", params={"query": q}, retries=1)
             found = ft_match(ticker, ((j.get("data") or {}).get("security") or []))
             if found:

@@ -230,18 +230,35 @@ def parse_stockanalysis(j: dict) -> pd.DataFrame:
     return _finish(df)
 
 
+def drop_unfinished(df: pd.DataFrame, tz: str = "America/New_York", close: dt.time = dt.time(16, 15),
+                    now: dt.datetime | None = None) -> pd.DataFrame:
+    """Remove a bar dated today (in the market's own time zone) while that session is still open.
+
+    Cboe's feed is checked by session_complete(); the alternates publish the running session as
+    if it were a finished day, and a half-day bar must never be stored as a daily close.
+    """
+    now = now or dt.datetime.now(ZoneInfo(tz)).replace(tzinfo=None)
+    if len(df) and df.index[-1].date() >= now.date() and now.time() < close:
+        return df[df.index.date < now.date()]
+    return df
+
+
 def stockanalysis_daily(ticker: str, kind: str, years: int = 5) -> pd.DataFrame:
     j = http.get_json(f"https://stockanalysis.com/api/symbol/{stockanalysis_path(ticker, kind)}/history",
                       params={"period": "daily", "range": f"{years}Y"}, retries=1, timeout=30)
-    return parse_stockanalysis(j)
+    return drop_unfinished(parse_stockanalysis(j))
 
 
 def yahoo_series(symbol: str) -> pd.DataFrame:
-    """Daily bars from Yahoo's chart API (dates in the exchange's own time zone)."""
+    """Daily bars from Yahoo's chart API (dates in the exchange's own time zone), finished sessions only."""
     df = Yahoo.daily(symbol)
     if df is None:
         raise RuntimeError("Yahoo unavailable or throttled")
-    return df
+    if symbol.startswith("^TW") or symbol.endswith((".TW", ".TWO")):
+        return drop_unfinished(df, "Asia/Taipei", dt.time(14, 0))
+    if symbol.endswith(("=X", "=F", "-USD")):  # FX, futures, crypto: nearly round the clock, keep finished UTC days
+        return drop_unfinished(df, "UTC", dt.time(23, 59, 59))
+    return drop_unfinished(df)
 
 
 yahoo_daily_us = yahoo_series  # earlier name

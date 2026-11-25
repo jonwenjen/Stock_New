@@ -1612,3 +1612,13 @@ def test_avg_turnover_ranks_on_the_month_not_one_day():
     assert t["C"] == pytest.approx(9e8 / 20)
     same_day = {"A": {"value": 1e7, "date": days[-1]}}         # the snapshot's own day is not counted twice
     assert twse.avg_turnover(same_day, closes, lots)["A"] == pytest.approx((1e7 + 19 * 1e8) / 20)
+
+
+def test_drop_unfinished_keeps_only_closed_sessions():
+    df = _bars("2026-11-23", [1.0, 2.0, 3.0])                  # 11-23, 11-24, 11-25
+    open_now = dt.datetime(2026, 11, 25, 10, 4)                 # New York, mid-session
+    assert prices.drop_unfinished(df, now=open_now).index[-1] == pd.Timestamp("2026-11-24")
+    after = dt.datetime(2026, 11, 25, 16, 30)
+    assert prices.drop_unfinished(df, now=after).index[-1] == pd.Timestamp("2026-11-25")
+    next_morning = dt.datetime(2026, 11, 26, 9, 0)              # yesterday's bar is final
+    assert len(prices.drop_unfinished(df, now=next_morning)) == 3
